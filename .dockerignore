@@ -1,0 +1,26 @@
+# Dependencies and env
+node_modules
+frontend/node_modules
+venv
+.venv
+.env
+.env.*
+!.env.example
+
+# Git and IDE
+.git
+.gitignore
+.idea
+.vscode
+*.md
+!backend/scripts
+
+# Build output (we build inside Docker)
+frontend/dist
+
+# Local data (mount at runtime)
+data/
+
+# Misc
+*.log
+.DS_Store

@@ -1,0 +1,34 @@
+# TwynBook: single container (frontend + backend)
+# Uses .env in this folder for OPENAI_API_KEY, CHATTERBOX_BASE_URL, DITTO_API_URL, etc.
+# Build: docker compose build
+# Run:   docker compose up -d
+# App:   http://localhost:8087  (API at /api, frontend at /)
+#
+# WebRTC requires the server to advertise an IP the browser can reach. With bridge
+# networking the container advertises 172.x.x.x, which the client cannot reach, so ICE fails.
+# network_mode: host makes the app use the host's network stack so ICE candidates are
+# the host's real IP (e.g. 192.168.x.x or your public IP). App listens on host:8087.
+#
+# To reach Ditto/Chatterbox on the host from inside the container, use 127.0.0.1 when
+# using host network (same machine). In .env set e.g. DITTO_API_URL=http://127.0.0.1:8080.
+
+services:
+  app:
+    build: .
+    image: twynbook:latest
+    container_name: twynbook
+    runtime: runc
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/app/data
+      - STATIC_DIR=/app/static
+      # WebRTC media server is same process at /webrtc; backend pushes segments here
+      - MEDIA_SERVER_WS_URL=ws://localhost:8087/webrtc
+    volumes:
+      - twynbook-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  twynbook-data:
