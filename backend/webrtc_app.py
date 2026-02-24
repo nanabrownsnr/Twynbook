@@ -1,250 +1,322 @@
 """
-WebRTC media server mounted at /webrtc (same process as TwynBook).
-Browser: /webrtc/signaling. Backend pushes segments to /webrtc/push.
+WebRTC media server with CONTINUOUS session support and LAST-FRAME filler logic.
+This ensures the stream NEVER breaks, even between clips.
 """
 import asyncio
 import io
 import json
 import logging
 import uuid
+import time
 from fractions import Fraction
 
 import av
-from av import VideoFrame
+from av import VideoFrame, AudioFrame
+from av.audio.resampler import AudioResampler
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 try:
     from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamError, MediaStreamTrack
 except ImportError:
-    try:
-        from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
-        MediaStreamError = Exception
-    except ImportError:
-        from aiortc import RTCPeerConnection, RTCSessionDescription
-        from aiortc.mediastreams import MediaStreamTrack
-        MediaStreamError = Exception
+    from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc.mediastreams import MediaStreamTrack
+    MediaStreamError = Exception
 from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 
 log = logging.getLogger("webrtc")
 sessions: dict = {}
-
 
 class QueueVideoTrack(MediaStreamTrack):
     kind = "video"
 
     def __init__(self):
         super().__init__()
-        self._queue: asyncio.Queue[VideoFrame | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[VideoFrame | None] = asyncio.Queue(maxsize=1000)
         self._closed = False
+        self._pts = 0
+        self._start_time = None
+        self._last_frame = None
 
     def put_frame(self, frame: VideoFrame | None):
-        if self._closed:
+        if self._closed: return
+        # In continuous mode, we DON'T put None for EOS into the queue unless the WHOLE session is ending.
+        # We handle individual clips by just letting the queue run empty (and using filler).
+        if frame is None:
+            log.info("QueueVideoTrack: Clip ended (using filler until next clip)")
             return
+            
         try:
+            if self._queue.full(): self._queue.get_nowait()
             self._queue.put_nowait(frame)
-        except asyncio.QueueFull:
-            pass
+        except: pass
 
     async def recv(self):
-        if self._closed:
-            raise MediaStreamError
+        if self._closed: raise MediaStreamError
+        
+        frame = None
         try:
-            frame = await asyncio.wait_for(self._queue.get(), timeout=30.0)
+            # We use a VERY short timeout for the queue so we can switch to filler instantly
+            frame = await asyncio.wait_for(self._queue.get(), timeout=0.01)
         except asyncio.TimeoutError:
-            frame = VideoFrame(width=640, height=480, format="yuv420p")
-            frame.pts = 0
-            frame.time_base = Fraction(1, 25)
-        if frame is None:
+            # Underflow! Use filler (last frame)
+            if self._last_frame:
+                frame = self._last_frame
+            else:
+                # If we've NEVER had a frame, we must wait for the FIRST one
+                try:
+                    frame = await asyncio.wait_for(self._queue.get(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    raise MediaStreamError
+
+        if frame is None: 
+            # This only happens if we explicitly put None (signaling total session end)
             self._closed = True
             raise MediaStreamError
-        pts, time_base = await self.next_timestamp()
-        frame.pts = pts
-        frame.time_base = time_base
-        return frame
 
-    def close(self):
-        self._closed = True
-        self.put_frame(None)
+        self._last_frame = frame
 
+        # --- REAL-TIME PACING ---
+        if self._start_time is None:
+            self._start_time = time.monotonic()
+        
+        expected_time = self._start_time + (self._pts / 90000.0)
+        now = time.monotonic()
+        if expected_time > now:
+            await asyncio.sleep(expected_time - now)
+        
+        # We MUST copy the frame or at least reset its PTS/time_base for EVERY delivery
+        new_frame = VideoFrame.from_ndarray(frame.to_ndarray(), format=frame.format.name)
+        new_frame.pts = self._pts
+        new_frame.time_base = Fraction(1, 90000)
+        self._pts += 3600 
+        return new_frame
 
-def decode_fmp4_to_frames(init_segment: bytes, media_segment: bytes) -> list:
-    frames = []
+class QueueAudioTrack(MediaStreamTrack):
+    kind = "audio"
+
+    def __init__(self):
+        super().__init__()
+        self._queue: asyncio.Queue[AudioFrame | None] = asyncio.Queue(maxsize=1000)
+        self._closed = False
+        self._pts = 0
+        self._resampler = AudioResampler(format="s16", layout="stereo", rate=48000)
+        self._resampled_buffer = []
+        self._start_time = None
+
+    def put_frame(self, frame: AudioFrame | None):
+        if self._closed: return
+        if frame is None: return
+        try:
+            if self._queue.full(): self._queue.get_nowait()
+            self._queue.put_nowait(frame)
+        except: pass
+
+    async def recv(self):
+        if self._closed: raise MediaStreamError
+        
+        if not self._resampled_buffer:
+            try:
+                # Short timeout for audio too
+                frame = await asyncio.wait_for(self._queue.get(), timeout=0.01)
+                resampled = self._resampler.resample(frame)
+                for f in resampled:
+                    self._resampled_buffer.append(f)
+            except asyncio.TimeoutError:
+                # Underflow! Send 20ms of silence (960 samples @ 48kHz)
+                silence_frame = AudioFrame(format="s16", layout="stereo", samples=960)
+                for plane in silence_frame.planes:
+                    plane.update(b"\x00" * plane.buffer_size)
+                silence_frame.sample_rate = 48000
+                self._resampled_buffer.append(silence_frame)
+
+        f = self._resampled_buffer.pop(0)
+
+        # --- REAL-TIME PACING ---
+        if self._start_time is None:
+            self._start_time = time.monotonic()
+        
+        expected_time = self._start_time + (self._pts / 48000.0)
+        now = time.monotonic()
+        if expected_time > now:
+            await asyncio.sleep(expected_time - now)
+
+        f.pts = self._pts
+        f.time_base = Fraction(1, 48000)
+        self._pts += f.samples
+        return f
+
+def decode_fmp4_to_frames(init_segment: bytes, media_segment: bytes):
+    v_frames, a_frames = [], []
     try:
-        data = init_segment + media_segment
-        with av.open(io.BytesIO(data), format="mp4") as container:
+        with av.open(io.BytesIO(init_segment + media_segment), format="mp4") as container:
             for packet in container.demux():
                 if packet.stream.type == "video":
-                    for frame in packet.decode():
-                        img = frame.reformat(format="rgb24")
-                        vf = VideoFrame.from_ndarray(img.to_ndarray(), format="rgb24")
-                        vf.pts = frame.pts
-                        vf.time_base = frame.time_base
-                        frames.append(vf)
+                    v_frames.extend(packet.decode())
+                elif packet.stream.type == "audio":
+                    a_frames.extend(packet.decode())
     except Exception as e:
-        log.warning("decode_fmp4_to_frames failed: %s", e)
-    return frames
+        log.warning("Decode failed: %s", e)
+    return v_frames, a_frames
 
-
-app = FastAPI(title="TwynBook WebRTC")
-
+app = FastAPI()
 
 @app.websocket("/signaling")
 async def signaling(websocket: WebSocket):
     await websocket.accept()
-    log.info("WebRTC signaling: connection accepted")
     session_id = None
     try:
         while True:
-            raw = await websocket.receive_text()
-            msg = json.loads(raw)
+            msg = json.loads(await websocket.receive_text())
             action = msg.get("action")
-            log.info("WebRTC signaling: action=%s session_id=%s", action, msg.get("session_id") or session_id)
-
             if action == "create_session":
                 session_id = str(uuid.uuid4())
-                config = RTCConfiguration(iceServers=[RTCIceServer(urls="stun:stun.l.google.com:19302")])
-                pc = RTCPeerConnection(configuration=config)
-                track = QueueVideoTrack()
-                pc.addTrack(track)
-                sessions[session_id] = {
-                    "pc": pc,
-                    "track": track,
-                    "init": None,
-                    "lock": asyncio.Lock(),
-                }
-
+                pc = RTCPeerConnection(RTCConfiguration([RTCIceServer("stun:stun.l.google.com:19302")]))
+                v_track, a_track = QueueVideoTrack(), QueueAudioTrack()
+                pc.addTrack(v_track); pc.addTrack(a_track)
+                sessions[session_id] = {"pc":pc, "v_track":v_track, "a_track":a_track, "init":None, "lock":asyncio.Lock()}
+                
                 @pc.on("connectionstatechange")
                 async def _on_state(_sid=session_id, _pc=pc):
                     if _pc.connectionState in ("failed", "closed", "disconnected"):
                         sessions.pop(_sid, None)
-                        try:
-                            await _pc.close()
-                        except Exception:
-                            pass
+                        await _pc.close()
 
                 offer = await pc.createOffer()
                 await pc.setLocalDescription(offer)
-                log.info("WebRTC signaling: session created session_id=%s sending offer", session_id)
-                await websocket.send_json({
-                    "session_id": session_id,
-                    "offer": {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp},
-                })
-                continue
-
-            if action == "answer" and session_id:
-                sid = msg.get("session_id") or session_id
-                answer = msg.get("answer")
-                if sid in sessions and answer:
-                    pc = sessions[sid]["pc"]
-                    await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type=answer["type"]))
-                    log.info("WebRTC signaling: set remote description (answer) sid=%s", sid)
-                continue
-
-            if action == "ice" and session_id:
-                sid = msg.get("session_id") or session_id
-                candidate = msg.get("candidate")
-                if sid not in sessions:
-                    log.warning("WebRTC signaling: ICE for unknown session %s", sid)
-                    continue
-                pc = sessions[sid]["pc"]
-                if not candidate:
-                    log.info("WebRTC signaling: null candidate (end-of-candidates) sid=%s", sid)
-                    await pc.addIceCandidate(None)
-                    continue
-
-                cand_str = candidate.get("candidate")
-                if not cand_str or cand_str.strip() == "":
-                    log.info("WebRTC signaling: empty candidate (end-of-candidates) sid=%s", sid)
-                    await pc.addIceCandidate(None)
-                else:
-                    log.info("WebRTC signaling: adding candidate sid=%s: %s", sid, cand_str[:50])
-                    from aiortc import RTCIceCandidate
-                    # Browser candidate looks like "candidate:..." or just the part after.
-                    # rtc_cand = RTCIceCandidate(
-                    #     sdpMid=candidate.get("sdpMid"),
-                    #     sdpMLineIndex=candidate.get("sdpMLineIndex"),
-                    #     sdp=cand_str
-                    # )
-                    # Using more robust parsing if available
+                await websocket.send_json({"session_id": session_id, "offer": {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp}})
+            elif action == "answer" and session_id in sessions:
+                await sessions[session_id]["pc"].setRemoteDescription(RTCSessionDescription(sdp=msg["answer"]["sdp"], type=msg["answer"]["type"]))
+            elif action == "ice" and session_id in sessions:
+                cand = msg.get("candidate")
+                if cand and cand.get("candidate"):
                     try:
                         from aiortc.sdp import candidate_from_sdp
-                        # Strip "candidate:" if present
-                        if cand_str.startswith("candidate:"):
-                            cand_part = cand_str[10:].strip()
-                        else:
-                            cand_part = cand_str.strip()
-                        rtc_cand = candidate_from_sdp(cand_part)
-                        rtc_cand.sdpMid = candidate.get("sdpMid")
-                        rtc_cand.sdpMLineIndex = candidate.get("sdpMLineIndex")
-                        await pc.addIceCandidate(rtc_cand)
-                    except Exception as ce:
-                        log.warning("ICE candidate parse failure: %s", ce)
-                continue
-    except WebSocketDisconnect:
-        log.info("WebRTC signaling: client disconnected session_id=%s", session_id)
-    except Exception as e:
-        log.exception("WebRTC signaling error: %s", e)
+                        clean = cand["candidate"][10:] if cand["candidate"].startswith("candidate:") else cand["candidate"]
+                        rtc_cand = candidate_from_sdp(clean.strip())
+                        rtc_cand.sdpMid, rtc_cand.sdpMLineIndex = cand.get("sdpMid"), cand.get("sdpMLineIndex")
+                        await sessions[session_id]["pc"].addIceCandidate(rtc_cand)
+                    except: pass
+    except: pass
     finally:
-        if session_id and session_id in sessions:
-            log.info("WebRTC signaling: cleaning up session_id=%s", session_id)
-            try:
-                await sessions[session_id]["pc"].close()
-            except Exception:
-                pass
+        if session_id in sessions:
+            await sessions[session_id]["pc"].close()
             sessions.pop(session_id, None)
-
 
 @app.websocket("/push")
 async def push(websocket: WebSocket, session_id: str = ""):
     await websocket.accept()
-    session_id = session_id or (websocket.query_params.get("session_id") or "")
-    log.info("WebRTC push: accepted session_id=%s in_sessions=%s", session_id, session_id in sessions)
+    session_id = session_id or websocket.query_params.get("session_id")
     if not session_id or session_id not in sessions:
-        log.warning("WebRTC push: invalid or unknown session_id=%s closing", session_id)
-        await websocket.close(code=4000)
-        return
+        await websocket.close(code=4000); return
     entry = sessions[session_id]
-    segment_count = 0
     try:
         while True:
-            try:
-                message = await websocket.receive()
-            except RuntimeError as e:
-                if "disconnect" in str(e).lower():
-                    log.info("WebRTC push: receive disconnect RuntimeError, breaking session_id=%s", session_id)
-                    break
-                raise
-            if message.get("type") == "websocket.disconnect":
-                log.info("WebRTC push: websocket.disconnect session_id=%s", session_id)
-                break
-            if "bytes" in message:
-                segment = message["bytes"]
-                segment_count += 1
-                if segment_count <= 2 or segment_count % 20 == 0:
-                    log.info("WebRTC push: received segment #%s len=%s session_id=%s", segment_count, len(segment), session_id)
-                if len(segment) == 0:
-                    entry["track"].put_frame(None)
-                    continue
-                async with entry["lock"]:
-                    if entry["init"] is None:
-                        entry["init"] = segment
-                        continue
-                    frames = decode_fmp4_to_frames(entry["init"], segment)
-                    for f in frames:
-                        entry["track"].put_frame(f)
-            if "text" in message:
-                data = json.loads(message["text"])
-                if data.get("end"):
-                    entry["track"].put_frame(None)
-    except WebSocketDisconnect:
-        log.info("WebRTC push: WebSocketDisconnect session_id=%s segment_count=%s", session_id, segment_count)
-    except Exception as e:
-        log.exception("WebRTC push error session_id=%s segment_count=%s: %s", session_id, segment_count, e)
-    finally:
-        log.info("WebRTC push: finally session_id=%s segment_count=%s putting EOS", session_id, segment_count)
-        entry["track"].put_frame(None)
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect": break
+            if "bytes" in msg:
+                segment = msg["bytes"]
+                # Detect init segment (ftyp/moov) vs media segment
+                if len(segment) > 8 and segment[4:8] in (b"ftyp", b"moov"):
+                    entry["init"] = segment; continue
+                if entry["init"]:
+                    async with entry["lock"]:
+                        v, a = decode_fmp4_to_frames(entry["init"], segment)
+                        for f in v: entry["v_track"].put_frame(f)
+                        for f in a: entry["a_track"].put_frame(f)
+            if "text" in msg:
+                pass
+    except: pass
 
+@app.websocket("/mse")
+async def mse(websocket: WebSocket, session_id: str = ""):
+    """Consumes the continuous track frames and outputs a single fMP4 stream over WebSocket."""
+    await websocket.accept()
+    session_id = session_id or websocket.query_params.get("session_id")
+    if not session_id or session_id not in sessions:
+        await websocket.close(code=4000); return
+    
+    entry = sessions[session_id]
+    v_track = entry["v_track"]
+    a_track = entry["a_track"]
+
+    output_buffer = io.BytesIO()
+    # fMP4 flags: frag_keyframe (clip-based), empty_moov (for starting instantly), default_base_moof
+    container = av.open(output_buffer, mode="w", format="mp4")
+    
+    # We use stable codecs for MSE compatibility
+    v_stream = container.add_stream("libx264", rate=25)
+    v_stream.width = 720
+    v_stream.height = 1280
+    v_stream.pix_fmt = "yuv420p"
+    v_stream.options = {
+        "preset": "ultrafast",
+        "tune": "zerolatency",
+        "profile": "baseline",
+        "level": "3.1",
+        "x264-params": "keyint=25:min-keyint=25:scenecut=0"
+    }
+
+    a_stream = container.add_stream("aac", rate=48000)
+    a_stream.channels = 2
+    a_stream.format = "fltp"
+
+    container.mux_ex(movflags="frag_keyframe+empty_moov+default_base_moof")
+    
+    # Send the initial header (ftyp + moov)
+    initial_header = output_buffer.getvalue()
+    if initial_header:
+        await websocket.send_bytes(initial_header)
+        output_buffer.seek(0)
+        output_buffer.truncate()
+
+    async def get_video():
+        while True: yield await v_track.recv()
+    async def get_audio():
+        while True: yield await a_track.recv()
+
+    v_gen = get_video()
+    a_gen = get_audio()
+    
+    # We mux in a loop, alternating between video and audio to keep interleaving tight
+    try:
+        v_task = asyncio.create_task(v_gen.__anext__())
+        a_task = asyncio.create_task(a_gen.__anext__())
+        
+        while True:
+            done, pending = await asyncio.wait([v_task, a_task], return_when=asyncio.FIRST_COMPLETED)
+            
+            if v_task in done:
+                frame = v_task.result()
+                for packet in v_stream.encode(frame):
+                    container.mux(packet)
+                v_task = asyncio.create_task(v_gen.__anext__())
+            
+            if a_task in done:
+                frame = a_task.result()
+                for packet in a_stream.encode(frame):
+                    container.mux(packet)
+                a_task = asyncio.create_task(a_gen.__anext__())
+
+            # Check if any fragments were written to the buffer
+            chunk = output_buffer.getvalue()
+            if chunk:
+                await websocket.send_bytes(chunk)
+                output_buffer.seek(0)
+                output_buffer.truncate()
+                
+    except Exception as e:
+        log.warning("MSE stream session %s ended: %s", session_id, e)
+    finally:
+        try:
+            # Final flush
+            for packet in v_stream.encode(): container.mux(packet)
+            for packet in a_stream.encode(): container.mux(packet)
+            container.close()
+            chunk = output_buffer.getvalue()
+            if chunk: await websocket.send_bytes(chunk)
+        except: pass
+        if v_task: v_task.cancel()
+        if a_task: a_task.cancel()
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "sessions": len(sessions)}
+def health(): return {"status": "ok", "sessions": len(sessions)}

@@ -26,12 +26,6 @@ function chatStreamWebSocketUrl(personaId) {
   return token ? `${proto}//${host}${path}?token=${encodeURIComponent(token)}` : `${proto}//${host}${path}`
 }
 
-function mediaServerSignalingUrl() {
-  const base = getMediaServerWsBase()
-  if (!base) return null
-  const b = base.replace(/\/$/, '')
-  return `${b}/signaling`
-}
 
 export default function Conversation() {
   const { personaId } = useParams()
@@ -52,19 +46,13 @@ export default function Conversation() {
   const gotFirstClipRef = useRef(false)
   const lastClipLongFallbackRef = useRef(null)
   const RECOVERY_SEC = 90
-  // Chat WebSocket lives in ref so it is NOT recreated on re-render (e.g. when setShowReply(true) fires)
   const chatWsRef = useRef(null)
-  const signalingWsRef = useRef(null)
-  // When true, WebRTC ontrack has set srcObject — skip the blob-URL useEffect so it won't clobber the stream.
-  const webrtcActiveRef = useRef(false)
-  // Phase 2 MSE: per-clip MediaSource state and segment queues
-  const mseRef = useRef({
-    byIndex: {},       // index -> { mediaSource, sourceBuffer, blobUrl, segmentQueue, appending }
-    revoke: () => { },
-  })
+  const mseRef = useRef({ byIndex: {}, revoke: () => { } })
+  const stallTimeoutRef = useRef(null)
   const replyPlayingUrl = replyState.current
-  const isStreaming = sending || ((replyState.current != null || replyState.queue.length > 0) && !replyState.streamDone)
-  const isGenerating = sending && !replyState.current && replyState.queue.length === 0
+  const isSpeaking = showReply || sending
+  const isStreaming = sending || !replyState.streamDone
+  const isGenerating = sending && !gotFirstClipRef.current
 
   // When clip ended before next was queued, queue gets filled later — advance so we don't stay frozen
   useEffect(() => {
@@ -95,40 +83,15 @@ export default function Conversation() {
   const prevUrlRef = useRef(null)
   useEffect(() => {
     const v = replyVideoRef.current
-    if (!v) return
-    if (!replyPlayingUrl) {
-      prevUrlRef.current = null
-      return
-    }
-    // When WebRTC ontrack has set srcObject, don't overwrite it with a blob-URL src.
-    if (webrtcActiveRef.current) {
-      console.info('[reply] skipping src switch — WebRTC srcObject is active')
-      return
-    }
-    const prevUrl = prevUrlRef.current
-    prevUrlRef.current = replyPlayingUrl
+    if (!v || !replyPlayingUrl) return
+
     v.muted = true
     v.src = replyPlayingUrl
-    // Ensure clip switch starts playback even if no further MSE updateend fires.
-    try {
-      v.load()
-    } catch (_) { }
-    console.info('[reply] switch src', {
-      from: prevUrl,
-      to: replyPlayingUrl,
-      paused: v.paused,
-      readyState: v.readyState,
+    try { v.load() } catch (_) { }
+
+    v.play().catch((err) => {
+      console.warn('[reply] play() failed (likely autoplay policy):', err)
     })
-    v.play()
-      .then(() => {
-        console.info('[reply] play() resolved after src switch', {
-          src: replyPlayingUrl,
-          readyState: v.readyState,
-        })
-      })
-      .catch((err) => {
-        console.warn('[reply] play() failed after src switch', err)
-      })
   }, [replyPlayingUrl])
 
   function transitionToIdle() {
@@ -136,36 +99,105 @@ export default function Conversation() {
       clearTimeout(lastClipLongFallbackRef.current)
       lastClipLongFallbackRef.current = null
     }
-    // Clear WebRTC active flag and detach srcObject so the video element is clean for next use.
-    webrtcActiveRef.current = false
-    const rv = replyVideoRef.current
-    if (rv && rv.srcObject) {
-      rv.srcObject = null
-    }
+    setShowReply(false)
     clearReplyPendingRef.current = true
     idleVideoRef.current?.play().catch(() => {
       clearReplyPendingRef.current = false
-      setShowReply(false)
     })
-    // 1) Hide reply layer immediately so idle video shows (no 900ms wait on a possibly black frame)
-    setShowReply(false)
+
     if (clearReplyPendingRef.current) clearReplyPendingRef.current = false
     // 2) After the reply-layer fade-out transition (~350ms), clear state and revoke blob URLs.
     //    Doing this after the fade prevents a black flash from the reply video when its blob is revoked.
     const FADE_MS = 400
     clearReplyTimeoutRef.current = setTimeout(() => {
       clearReplyTimeoutRef.current = null
-      setReplyState({ current: null, queue: [], streamDone: false })
-      const revoke = mseRef.current.revoke
-      if (revoke) setTimeout(revoke, 100)
-      setSending(false)
+      // Only clear if we haven't started a NEW message in the meantime
+      setSending(s => {
+        if (!s) {
+          setReplyState({ current: null, queue: [], streamDone: false })
+          const revoke = mseRef.current.revoke
+          if (revoke) setTimeout(revoke, 100)
+        }
+        return s
+      })
     }, FADE_MS)
   }
 
+  // --- Utility functions for Streaming (moved to component scope for accessibility) ---
+  const CODECS = 'video/mp4; codecs="avc1.42401E,mp4a.40.2"'
+
+
+  function handleStreamEvent(event, data) {
+    if (event === 'video_start') {
+      gotFirstClipRef.current = true
+      if (longWaitTimeoutRef.current) { clearTimeout(longWaitTimeoutRef.current); longWaitTimeoutRef.current = null }
+      // We have interaction credit from Send button, so we can unmute
+      if (replyVideoRef.current) {
+        try { replyVideoRef.current.muted = false } catch (_) { }
+      }
+    } else if (event === 'done') {
+      setReplyState((prev) => ({ ...prev, streamDone: true }))
+      setTimeout(() => transitionToIdle(), 2000)
+    } else if (event === 'error') {
+      setStreamError(data.error || 'Stream failed')
+      setShowReply(false)
+      setSending(false)
+    }
+  }
+
+  function handleBinaryChunk(chunk) {
+    const { sb, queue, appending, pending } = mseRef.current
+    if (!sb) {
+      if (pending) pending.push(chunk)
+      return
+    }
+    if (appending[0] || queue.length > 0) {
+      queue.push(chunk)
+    } else {
+      appending[0] = true
+      try {
+        sb.appendBuffer(chunk)
+        // Explicitly check if we can resume playback after appending new data
+        const v = replyVideoRef.current
+        if (v && v.paused && gotFirstClipRef.current) {
+          v.play().catch(() => { })
+        }
+      } catch (err) {
+        console.error('[MSE] append error', err)
+        appending[0] = false
+      }
+    }
+  }
+
+  function runMSEFlow(text) {
+    if (chatWsRef.current) { try { chatWsRef.current.close() } catch (_) { } }
+    const wsUrl = chatStreamWebSocketUrl(personaId)
+    const ws = new WebSocket(wsUrl)
+    ws.binaryType = 'arraybuffer'
+    chatWsRef.current = ws
+    ws.onopen = () => {
+      const payload = { message: text }
+      ws.send(JSON.stringify(payload))
+    }
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        try {
+          const msg = JSON.parse(ev.data)
+          handleStreamEvent(msg.event, msg.data || {})
+        } catch (_) { }
+      } else if (ev.data instanceof ArrayBuffer) {
+        handleBinaryChunk(ev.data)
+      }
+    }
+    ws.onclose = () => { chatWsRef.current = null }
+  }
+
   const sendMessage = (e) => {
-    e.preventDefault()
+    if (e) e.preventDefault()
     const text = input.trim()
     if (!text || sending || !personaId) return
+
+    // 1) Cleanup previous response state
     if (clearReplyTimeoutRef.current) {
       clearTimeout(clearReplyTimeoutRef.current)
       clearReplyTimeoutRef.current = null
@@ -174,353 +206,83 @@ export default function Conversation() {
       clearTimeout(longWaitTimeoutRef.current)
       longWaitTimeoutRef.current = null
     }
+
     setInput('')
     setSending(true)
     setStreamError(null)
     gotFirstClipRef.current = false
-    webrtcActiveRef.current = false
-    setReplyState({ current: null, queue: [], streamDone: false })
+
+    // To prevent black flash: hide the speaking layer but KEEP the current src 
+    // until we actually have the first segment of the new one ready.
+    setShowReply(false)
+
+    // 2) Setup NEW MediaSource for this specific response
+    const ms = new MediaSource()
+    const blobUrl = URL.createObjectURL(ms)
+
+    // MSE State: chunks arriving before SourceBuffer is ready go into pending
+    const mseState = {
+      sb: null,
+      queue: [],
+      appending: [false],
+      pending: [], // Chunks arriving while ms is opening
+      revoke: () => { try { URL.revokeObjectURL(blobUrl) } catch (_) { } }
+    }
+    mseRef.current = mseState
+
+    ms.onsourceopen = () => {
+      console.info('[MSE] Source opened');
+      try {
+        const sb = ms.addSourceBuffer(CODECS)
+        sb.mode = 'sequence'
+        sb.onupdateend = () => {
+          mseState.appending[0] = false
+          if (mseState.queue.length > 0) {
+            mseState.appending[0] = true
+            sb.appendBuffer(mseState.queue.shift())
+          } else {
+            // Queue empty, check if we should be playing
+            const v = replyVideoRef.current
+            if (v && v.paused && gotFirstClipRef.current) {
+              v.play().catch(() => { })
+            }
+          }
+        }
+        mseState.sb = sb
+        // Push any chunks that arrived while we were opening
+        if (mseState.pending.length > 0) {
+          console.info('[MSE] Appending %d pending chunks', mseState.pending.length);
+          while (mseState.pending.length > 0) {
+            const chunk = mseState.pending.shift()
+            if (mseState.appending[0]) {
+              mseState.queue.push(chunk)
+            } else {
+              mseState.appending[0] = true
+              sb.appendBuffer(chunk)
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[MSE] addSourceBuffer failed', err)
+      }
+    }
+
+    // Update replyPlayingUrl which triggers the <video src={url}> useEffect
+    setReplyState((prev) => ({ ...prev, current: blobUrl, queue: [], streamDone: false }))
+
+    // Final safety timeout for "Thinking..." state
     longWaitTimeoutRef.current = setTimeout(() => {
       longWaitTimeoutRef.current = null
       if (gotFirstClipRef.current) return
       setStreamError('Response is taking too long. Please try again.')
-      setShowReply(false)
       setSending(false)
-      setReplyState((prev) => ({ ...prev, streamDone: true }))
+      transitionToIdle()
     }, RECOVERY_SEC * 1000)
-    const revokeNow = mseRef.current.revoke
-    mseRef.current = { byIndex: {}, revoke: () => { } }
-    if (revokeNow) setTimeout(revokeNow, 150)
 
-    const CODECS = 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"'
-    const blobUrlsToRevoke = []
-
-    // One continuous MSE for whole reply (Phase 1)
-    function getOrCreateContinuousMSE() {
-      const key = 0
-      if (mseRef.current.byIndex[key]) return mseRef.current.byIndex[key]
-      const mediaSource = new MediaSource()
-      const blobUrl = URL.createObjectURL(mediaSource)
-      blobUrlsToRevoke.push(blobUrl)
-      const segmentQueue = []
-      let appending = false
-      let pendingEndOfStream = false
-      const entry = { mediaSource, blobUrl, segmentQueue, setPendingEndOfStream: (v) => { pendingEndOfStream = v }, tryAppend: () => { } }
-      mseRef.current.byIndex[key] = entry
-      mediaSource.addEventListener('sourceopen', () => {
-        try {
-          const sb = mediaSource.addSourceBuffer(CODECS)
-          entry.sourceBuffer = sb
-          entry.tryAppend = function () {
-            if (mediaSource.readyState !== 'open') return
-            if (appending || segmentQueue.length === 0) {
-              if (segmentQueue.length === 0 && pendingEndOfStream && !appending && mediaSource.readyState === 'open' && !sb.updating) {
-                try { mediaSource.endOfStream() } catch (err) { console.warn('MSE endOfStream error', err) }
-              }
-              return
-            }
-            const buf = segmentQueue.shift()
-            if (!buf) return
-            appending = true
-            try { sb.appendBuffer(buf) } catch (err) { appending = false; console.warn('MSE appendBuffer error', err) }
-          }
-          sb.addEventListener('updateend', () => {
-            appending = false
-            const v = replyVideoRef.current
-            if (v && v.paused && v.src && v.src.startsWith('blob:')) {
-              let bufferedAhead = 0
-              try { if (v.buffered && v.buffered.length > 0) bufferedAhead = Math.max(0, v.buffered.end(v.buffered.length - 1) - (v.currentTime || 0)) } catch (_) { }
-              if (bufferedAhead >= 0.75 || pendingEndOfStream) v.play().catch(() => { })
-            }
-            entry.tryAppend()
-          })
-          entry.tryAppend()
-        } catch (e) { console.warn('MSE sourceopen error', e) }
-      })
-      return entry
-    }
-
-    function appendToContinuous(data) {
-      const entry = mseRef.current.byIndex[0]
-      if (!entry) return
-      const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data
-      entry.segmentQueue.push(bytes)
-      if (entry.tryAppend) entry.tryAppend()
-    }
-
-    function handleStreamEvent(event, data) {
-      if (event === 'started' || event === 'video_start' || event === 'done' || event === 'error') {
-        console.info('[TwynBook] handleStreamEvent (MSE)', event, data)
-      }
-      // Never close or end stream on "started". Only "done" or "error" mean stream end.
-      if (event === 'video_start') {
-        gotFirstClipRef.current = true
-        if (longWaitTimeoutRef.current) { clearTimeout(longWaitTimeoutRef.current); longWaitTimeoutRef.current = null }
-        const { blobUrl } = getOrCreateContinuousMSE()
-        setReplyState((prev) => (prev.current === null ? { ...prev, current: blobUrl } : prev))
-      } else if (event === 'video_segment' && data.base64) {
-        const binary = atob(data.base64)
-        const bytes = new Uint8Array(binary.length)
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-        appendToContinuous(bytes)
-      } else if (event === 'clip') { /* continuous: no per-clip endOfStream */ } else if (event === 'done') {
-        setReplyState((prev) => ({ ...prev, streamDone: true }))
-        if (lastClipLongFallbackRef.current) { clearTimeout(lastClipLongFallbackRef.current); lastClipLongFallbackRef.current = null }
-        const entry = mseRef.current.byIndex[0]
-        if (entry?.setPendingEndOfStream) { entry.setPendingEndOfStream(true); entry.tryAppend?.() }
-        lastClipLongFallbackRef.current = setTimeout(() => {
-          lastClipLongFallbackRef.current = null
-          setReplyState((prev) => (prev.current != null && prev.queue.length === 0 && prev.streamDone ? (transitionToIdle(), prev) : prev))
-        }, 30000)
-      } else if (event === 'error') {
-        setStreamError(data.error || 'Clip failed')
-        setReplyState((prev) => ({ ...prev, current: null, queue: [], streamDone: true }))
-        setShowReply(false)
-        setSending(false)
-      }
-    }
-
-    function finishStream() {
-      mseRef.current.revoke = () => blobUrlsToRevoke.forEach((u) => URL.revokeObjectURL(u))
-      if (longWaitTimeoutRef.current) { clearTimeout(longWaitTimeoutRef.current); longWaitTimeoutRef.current = null }
-    }
-
-    function tryWebRTCFirst() {
-      return new Promise((resolve) => {
-        const url = mediaServerSignalingUrl()
-        console.info('[TwynBook] tryWebRTCFirst url=', url)
-        if (!url) {
-          console.info('[TwynBook] tryWebRTCFirst no url, using MSE')
-          resolve(null)
-          return
-        }
-        const ws = new WebSocket(url)
-        const t = setTimeout(() => { console.info('[TwynBook] tryWebRTCFirst 3s timeout'); ws.close(); resolve(null) }, 3000)
-        ws.onopen = () => { console.info('[TwynBook] signaling WS open'); ws.send(JSON.stringify({ action: 'create_session' })) }
-        ws.onmessage = (ev) => {
-          try {
-            const msg = JSON.parse(ev.data)
-            if (msg.session_id && msg.offer) {
-              clearTimeout(t)
-              console.info('[TwynBook] tryWebRTCFirst got session_id=', msg.session_id)
-              resolve({ session_id: msg.session_id, offer: msg.offer, ws })
-              return
-            }
-          } catch (_) { }
-        }
-        ws.onerror = () => { console.info('[TwynBook] signaling WS error'); clearTimeout(t); resolve(null) }
-        ws.onclose = () => { console.info('[TwynBook] signaling WS close'); resolve(null) }
-      })
-    }
-
-    function runWebRTCChat(webrtc, msgText) {
-      console.info('[TwynBook] runWebRTCChat session_id=', webrtc.session_id)
-      if (chatWsRef.current) {
-        try { chatWsRef.current.close() } catch (_) { }
-        chatWsRef.current = null
-      }
-      signalingWsRef.current = webrtc.ws
-      const { session_id, offer, ws: signalingWs } = webrtc
-      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
-      pc.ontrack = (e) => {
-        console.info('[TwynBook] WebRTC ontrack streams=', e.streams?.length)
-        const v = replyVideoRef.current
-        if (v && e.streams?.[0]) {
-          // Mark WebRTC as active so the blob-URL useEffect won't overwrite srcObject.
-          webrtcActiveRef.current = true
-          v.srcObject = e.streams[0]
-          setShowReply(true)
-          v.play().catch(() => { })
-        }
-      }
-      pc.setRemoteDescription(new RTCSessionDescription(offer))
-        .then(() => pc.createAnswer())
-        .then((answer) => pc.setLocalDescription(answer))
-        .then(() => {
-          console.info('[TwynBook] WebRTC sent answer')
-          signalingWs.send(JSON.stringify({ action: 'answer', session_id, answer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } }))
-        })
-        .catch((err) => {
-          console.info('[TwynBook] WebRTC setRemoteDescription/answer failed', err)
-          setStreamError(err?.message || 'WebRTC failed')
-          setReplyState({ current: null, queue: [], streamDone: true })
-          setSending(false)
-        })
-      pc.onicecandidate = (e) => {
-        if (e.candidate) signalingWs.send(JSON.stringify({ action: 'ice', session_id, candidate: e.candidate }))
-      }
-
-      let webrtcFallbackDone = false
-      function fallbackToMSE() {
-        if (webrtcFallbackDone) return
-        webrtcFallbackDone = true
-        console.info('[TwynBook] WebRTC ICE failed -> fallback to MSE, closing chat + signaling WS')
-        webrtcActiveRef.current = false
-        if (chatWsRef.current) { try { chatWsRef.current.close() } catch (_) { } chatWsRef.current = null }
-        if (signalingWsRef.current) { try { signalingWsRef.current.close() } catch (_) { } signalingWsRef.current = null }
-        runMSEFlow()
-      }
-      pc.oniceconnectionstatechange = () => {
-        console.info('[TwynBook] WebRTC iceConnectionState=', pc.iceConnectionState)
-        if (pc.iceConnectionState === 'failed') fallbackToMSE()
-      }
-
-      const chatWsUrl = chatStreamWebSocketUrl(personaId)
-      const chatWs = new WebSocket(chatWsUrl)
-      chatWsRef.current = chatWs
-      console.info('[TwynBook] Chat WS (WebRTC) connecting url=', chatWsUrl)
-      chatWs.onopen = () => {
-        const payload = { message: msgText, webrtc_session_id: session_id }
-        console.info('[TwynBook] Chat WS (WebRTC) open, SENDING:', JSON.stringify(payload))
-        console.info('[TwynBook] payload.message length=', typeof payload.message === 'string' ? payload.message.length : 'not-string', 'first50=', typeof payload.message === 'string' ? payload.message.slice(0, 50) : payload.message)
-        chatWs.send(JSON.stringify(payload))
-      }
-      chatWs.onmessage = (ev) => {
-        if (typeof ev.data !== 'string') return
-        try {
-          const msg = JSON.parse(ev.data)
-          const event = msg.event
-          const data = msg.data || {}
-          if (event === 'started' || event === 'video_start' || event === 'done' || event === 'error') {
-            console.info('[TwynBook] Chat WS (WebRTC) event=', event, data)
-          }
-          // Never close or end stream on "started". "started" is stream beginning; total may be 0.
-          // Only "done" or "error" mean stream end. Never use !data.total (0 is falsy in JS).
-          if (event === 'video_start') {
-            gotFirstClipRef.current = true
-            if (longWaitTimeoutRef.current) { clearTimeout(longWaitTimeoutRef.current); longWaitTimeoutRef.current = null }
-          } else if (event === 'keepalive') {
-            // Connection alive; keepalive resets long-wait so we don't show "taking too long" while backend is working
-            if (longWaitTimeoutRef.current) {
-              clearTimeout(longWaitTimeoutRef.current)
-              longWaitTimeoutRef.current = setTimeout(() => {
-                longWaitTimeoutRef.current = null
-                if (gotFirstClipRef.current) return
-                setStreamError('Response is taking too long. Please try again.')
-                setShowReply(false)
-                setSending(false)
-                setReplyState((prev) => ({ ...prev, streamDone: true }))
-              }, RECOVERY_SEC * 1000)
-            }
-          } else if (event === 'done') {
-            setReplyState((prev) => ({ ...prev, streamDone: true }))
-            if (lastClipLongFallbackRef.current) { clearTimeout(lastClipLongFallbackRef.current); lastClipLongFallbackRef.current = null }
-            setTimeout(() => transitionToIdle(), 2000)
-          } else if (event === 'error') {
-            setStreamError(data.error || 'Clip failed')
-            setReplyState((prev) => ({ ...prev, current: null, queue: [], streamDone: true }))
-            setShowReply(false)
-            setSending(false)
-          }
-        } catch (_) { }
-      }
-      chatWs.onerror = () => { setStreamError('Connection error'); setReplyState({ current: null, queue: [], streamDone: true }); setSending(false) }
-      chatWs.onclose = (e) => {
-        console.log('WS CLOSED BY:', e.code, e.reason || '(none)')
-        console.info('[TwynBook] Chat WS (WebRTC) closed', { code: e.code, reason: e.reason || '(none)', clean: e.wasClean })
-        chatWsRef.current = null
-        finishStream()
-        if (signalingWsRef.current) { try { signalingWsRef.current.close() } catch (_) { } signalingWsRef.current = null }
-      }
-    }
-
-    let sseFallbackRun = false
-
-    function runMSEFlow() {
-      console.info('[TwynBook] runMSEFlow starting (no webrtc_session_id)')
-      if (chatWsRef.current) {
-        try { chatWsRef.current.close() } catch (_) { }
-        chatWsRef.current = null
-      }
-      const wsUrl = chatStreamWebSocketUrl(personaId)
-      const ws = new WebSocket(wsUrl)
-      chatWsRef.current = ws
-      const wsTimeout = setTimeout(() => {
-        if (ws.readyState === WebSocket.CONNECTING) { console.info('[TwynBook] MSE WS still connecting after 5s, fallback to SSE'); ws.close(); if (!sseFallbackRun) { sseFallbackRun = true; runSSEFallback() } }
-      }, 5000)
-      ws.onopen = () => {
-        clearTimeout(wsTimeout)
-        const payload = { message: text }
-        console.info('[TwynBook] MSE WS open, SENDING:', JSON.stringify(payload))
-        console.info('[TwynBook] payload.message length=', typeof text === 'string' ? text.length : 'n/a')
-        ws.send(JSON.stringify(payload))
-      }
-      ws.onmessage = (ev) => {
-        if (typeof ev.data === 'string') {
-          try { const msg = JSON.parse(ev.data); handleStreamEvent(msg.event, msg.data || {}) } catch (_) { }
-        } else {
-          if (ev.data instanceof ArrayBuffer) appendToContinuous(ev.data)
-          else if (ev.data?.arrayBuffer) ev.data.arrayBuffer().then((ab) => appendToContinuous(ab))
-        }
-      }
-      ws.onerror = () => {
-        clearTimeout(wsTimeout)
-        if ((ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) && !sseFallbackRun) { sseFallbackRun = true; runSSEFallback() }
-      }
-      ws.onclose = (e) => {
-        clearTimeout(wsTimeout)
-        console.log('WS CLOSED BY:', e.code, e.reason || '(none)')
-        console.info('[TwynBook] MSE WS closed', { code: e.code, reason: e.reason || '(none)', clean: e.wasClean })
-        chatWsRef.current = null
-        if (!sseFallbackRun && !e.wasClean && !gotFirstClipRef.current) { sseFallbackRun = true; runSSEFallback() }
-        else if (!sseFallbackRun) finishStream()
-      }
-
-      function runSSEFallback() {
-        const form = new FormData()
-        form.set('message', text)
-        apiFetch(`${API}/personas/${personaId}/chat`, { method: 'POST', body: form })
-          .then(async (response) => {
-            if (!response.ok) {
-              const t = await response.text()
-              let msg = t
-              try { const j = JSON.parse(t); if (j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail) } catch (_) { }
-              throw new Error(msg)
-            }
-            const reader = response.body.getReader()
-            const decoder = new TextDecoder('utf-8', { fatal: false })
-            let buffer = ''
-            try {
-              while (true) {
-                const { done, value } = await reader.read()
-                if (done) break
-                if (value?.length) buffer += decoder.decode(value, { stream: true })
-                const parts = buffer.split('\n\n')
-                buffer = parts.pop() || ''
-                for (const part of parts) {
-                  if (!part.trim()) continue
-                  const eventMatch = part.match(/event:\s*(\S+)/)
-                  const dataLine = part.match(/data:\s*([\s\S]*)/)
-                  const event = eventMatch ? eventMatch[1].trim() : 'message'
-                  let data = {}
-                  if (dataLine) try { data = JSON.parse(dataLine[1].trim()) } catch (_) { }
-                  handleStreamEvent(event, data)
-                }
-              }
-            } catch (streamErr) {
-              const msg = streamErr?.message || String(streamErr)
-              setStreamError(msg.includes('input stream') ? 'Connection interrupted. Try again.' : msg)
-              setReplyState((prev) => ({ ...prev, current: null, queue: [], streamDone: true }))
-              setShowReply(false)
-              setSending(false)
-            }
-            finishStream()
-          })
-          .catch((err) => {
-            setStreamError(err?.message || 'Request failed')
-            setReplyState({ current: null, queue: [], streamDone: true })
-            setShowReply(false)
-            setSending(false)
-            finishStream()
-          })
-      }
-    }
-
-    Promise.resolve(tryWebRTCFirst()).then((webrtc) => {
-      if (webrtc) runWebRTCChat(webrtc, text)
-      else runMSEFlow()
-    }).catch(() => runMSEFlow())
+    runMSEFlow(text)
   }
+
+
 
   const handleReplyEnded = () => {
     setReplyState((prev) => {
@@ -571,7 +333,7 @@ export default function Conversation() {
       </header>
       <div className="video-wrap" aria-hidden="true">
         {isGenerating && (
-          <div className="streaming-status generating">Generating reply…</div>
+          <div className="streaming-status generating">Thinking...</div>
         )}
         {isStreaming && !isGenerating && replyState.queue.length > 0 && (
           <div className="streaming-status next">Next clip ready</div>
@@ -606,25 +368,90 @@ export default function Conversation() {
           playsInline
           preload="auto"
           className={`video-layer reply-layer${!showReply ? ' reply-hiding' : ''}`}
-          style={{ opacity: showReply ? 1 : 0, pointerEvents: 'none' }}
+          style={{
+            opacity: showReply ? 1 : 0,
+            pointerEvents: 'none',
+            // Kill transition instantly when starting a new message to avoid black flash
+            transition: isGenerating ? 'none' : undefined
+          }}
           onPlaying={() => {
+            if (stallTimeoutRef.current) {
+              clearTimeout(stallTimeoutRef.current);
+              stallTimeoutRef.current = null;
+            }
+            if (longWaitTimeoutRef.current) {
+              clearTimeout(longWaitTimeoutRef.current);
+              longWaitTimeoutRef.current = null;
+            }
             console.info('[reply] onPlaying', {
               src: replyVideoRef.current?.src,
               readyState: replyVideoRef.current?.readyState,
             })
             setShowReply(true)
-            const v = replyVideoRef.current
-            if (v) {
-              try { v.muted = false } catch (_) { }
+          }}
+          onCanPlay={() => {
+            // Some browsers need this to recover from a deep stall
+            if (replyVideoRef.current && replyVideoRef.current.readyState >= 2) {
+              if (stallTimeoutRef.current) {
+                clearTimeout(stallTimeoutRef.current);
+                stallTimeoutRef.current = null;
+              }
+              if (longWaitTimeoutRef.current) {
+                clearTimeout(longWaitTimeoutRef.current);
+                longWaitTimeoutRef.current = null;
+              }
+              setShowReply(true);
             }
+          }}
+          onCanPlayThrough={() => {
+            if (stallTimeoutRef.current) {
+              clearTimeout(stallTimeoutRef.current);
+              stallTimeoutRef.current = null;
+            }
+            if (longWaitTimeoutRef.current) {
+              clearTimeout(longWaitTimeoutRef.current);
+              longWaitTimeoutRef.current = null;
+            }
+            setShowReply(true);
           }}
           onTimeUpdate={() => {
             if (!showReply && replyVideoRef.current && !replyVideoRef.current.paused) {
               setShowReply(true)
-              try { replyVideoRef.current.muted = false } catch (_) { }
             }
           }}
           onEnded={handleReplyEnded}
+          onWaiting={() => {
+            console.info('[reply] waiting...');
+            // Fade back to idle if we stall FOR LONG, to avoid black screen
+            // but ignore short micro-stalls during buffer transitions.
+            if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
+            stallTimeoutRef.current = setTimeout(() => {
+              console.warn('[reply] long stall detected, returning to idle');
+              setShowReply(false);
+              stallTimeoutRef.current = null;
+
+              // HEURISTIC: If we've been waiting for > 10s and still no playback,
+              // something is wrong with the MSE buffer or connection.
+              // We should at least release the UI lock so the user can try again.
+              if (sending && !gotFirstClipRef.current) {
+                // We're still in "Thinking..." state, let the longWaitTimeout handle it
+              } else if (sending) {
+                // We were speaking but got stuck. 
+              }
+            }, 500);
+
+            // Separate safety timer to unlock the UI if we're completely frozen
+            if (longWaitTimeoutRef.current) clearTimeout(longWaitTimeoutRef.current);
+            longWaitTimeoutRef.current = setTimeout(() => {
+              console.error('[reply] Safety timeout: unlocking UI due to persistent freeze');
+              setSending(false);
+              transitionToIdle();
+            }, 10000); // 10s of cumulative waiting = stuck
+          }}
+          onStalled={() => {
+            console.warn('[reply] stalled');
+            setShowReply(false);
+          }}
           onError={(e) => {
             if (!replyVideoRef.current?.src) return
             console.warn('[reply] video error', {
@@ -660,7 +487,7 @@ export default function Conversation() {
         .video-wrap { position: relative; z-index: 0; flex: 1; min-height: 0; width: 100%; background: #000; overflow: hidden; pointer-events: none; }
         .video-wrap .video-layer { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transition: opacity 0.35s ease-out; pointer-events: none; }
         .video-wrap .video-layer.poster-fallback { z-index: 0; }
-        .video-wrap .video-layer.reply-layer { z-index: 1; transition: none; }
+        .video-wrap .video-layer.reply-layer { z-index: 1; transition: opacity 0.3s ease-in-out; }
         .video-wrap .video-layer.reply-layer.reply-hiding { transition: opacity 0.35s ease-out; }
         .conv-bottom { position: relative; z-index: 20; flex-shrink: 0; background: rgba(0,0,0,0.9); border-top: 1px solid rgba(255,255,255,0.1); }
         .input-form { display: flex; gap: 0.5rem; padding: 0.75rem 1rem; width: 100%; }

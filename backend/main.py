@@ -12,6 +12,7 @@ import re
 import subprocess
 import tempfile
 import time
+import struct
 import uuid
 import wave
 from datetime import datetime, timezone, timedelta
@@ -35,9 +36,10 @@ from openai import OpenAI
 
 # Chatterbox TTS has a 1000-character limit per request
 TTS_MAX_CHARS = 1000
-# First clip uses 1 sentence for low TTB; subsequent clips use 3; it’s ready quickly; subsequent clips use 3 for smoother pacing
-FIRST_CLIP_SENTENCES = 1
-SENTENCES_PER_CLIP = 1
+# FIRST_CLIP_SENTENCES = 2 provides a solid buffer to prevent early stalling.
+# SENTENCES_PER_CLIP = 2 balances throughput with stability.
+FIRST_CLIP_SENTENCES = 2
+SENTENCES_PER_CLIP = 2
 
 
 def _chunk_by_sentences(text: str, max_chars: int = TTS_MAX_CHARS) -> list[str]:
@@ -46,7 +48,8 @@ def _chunk_by_sentences(text: str, max_chars: int = TTS_MAX_CHARS) -> list[str]:
         return []
     # Split on . ! ? followed by space/newline, or on double newline (paragraph), or single newline
     normalized = text.strip().replace("\r\n", "\n")
-    raw = re.split(r"(?<=[.!?])\s+|\n\s*\n|\n", normalized)
+    # Split on . ? followed by space or end of string, or on newlines
+    raw = re.split(r"(?<=[.?])(?:\s+|$)|(?:\s*\n\s*)+", normalized)
     chunks = []
     current = []
     current_len = 0
@@ -210,6 +213,7 @@ except Exception as e:
     log.warning("WebRTC app not mounted (aiortc/av may be missing): %s", e)
     webrtc_app = None
     MEDIA_SERVER_WS_URL = ""
+webrtc_managers = {}
 
 # Knowledge base: per-persona documents and embeddings (scoped by persona ownership)
 KB_DIR = DATA_DIR / "kb"
@@ -1614,13 +1618,17 @@ async def ditto_stream_generate(
 
         full_mp4 = b"".join(video_chunks)
         if not full_mp4:
-            raise RuntimeError("Ditto stream: no video data received")
-        with open(output_path, "wb") as f:
-            f.write(full_mp4)
-        log.info("Ditto stream: wrote %s (%s bytes, %s chunks)", output_path, len(full_mp4), len(video_chunks))
+            log.warning("Ditto stream: no video data received for %s", output_path)
+        else:
+            with open(output_path, "wb") as f:
+                f.write(full_mp4)
+            log.info("Ditto stream: wrote %s (%s bytes, %s chunks)", output_path, len(full_mp4), len(video_chunks))
     except Exception as e:
-        log.exception("Ditto stream failed for %s: %s", output_path, e)
+        log.exception("Ditto stream failed for %s", output_path)
         raise
+    finally:
+        if segment_queue is not None:
+            segment_queue.put_nowait(None)
 
 
 def ditto_generate_post(image_id: str, audio_wav_bytes: bytes, output_path: str) -> None:
@@ -1665,41 +1673,59 @@ def _stream_ollama_sentences_sync(
     """
     url = f"{ollama_url.rstrip('/')}/api/chat"
     payload = {"model": ollama_model, "messages": messages, "stream": True}
+    content = ""
+    emitted_up_to = 0
+    t0 = time.monotonic()
     try:
-        with httpx.Client(timeout=60.0) as client:
-            with client.stream("POST", url, json=payload) as resp:
+        with httpx.Client(timeout=60.0) as client_http:
+            log.info("Ollama: starting stream for %s messages", len(messages))
+            with client_http.stream("POST", url, json=payload) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
+                    if not line: continue
+                    clean_line = line.strip()
+                    if clean_line.startswith("data:"): clean_line = clean_line[5:].strip()
+                    if not clean_line or clean_line == "[DONE]": continue
+
                     try:
-                        data = json.loads(line[5:].strip())
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    msg = data.get("message") if isinstance(data.get("message"), dict) else {}
-                    delta = (msg.get("content") or "") if isinstance(msg.get("content"), str) else ""
+                        data = json.loads(clean_line)
+                    except: continue
+                    
+                    msg = data.get("message")
+                    delta = ""
+                    if isinstance(msg, dict):
+                        delta = msg.get("content") or ""
+                    elif "choices" in data:
+                        choices = data.get("choices")
+                        if choices: delta = choices[0].get("delta", {}).get("content") or ""
+
                     if not delta:
-                        if data.get("done"):
-                            break
+                        if data.get("done"): break
                         continue
+                    
                     content += delta
-                    parts = _chunk_by_sentences(content)
-                    complete_parts = parts[:-1] if len(parts) > 1 else []
-                    if parts and parts[-1].strip() and parts[-1].strip()[-1] in ".!?":
-                        complete_parts = parts
-                    complete_text = " ".join(complete_parts)
-                    if len(complete_text) > emitted_up_to:
-                        new_sentences = _chunk_by_sentences(complete_text[emitted_up_to:])
-                        for s in new_sentences:
+                    # Yield sentences as they form: match punctuation followed by space/newline or end of string
+                    matches = list(re.finditer(r"(?<=[.?])(?:\s+|$)|(?:\s*\n\s*)+", content[emitted_up_to:]))
+                    if matches:
+                        last_match = matches[-1]
+                        block = content[emitted_up_to : emitted_up_to + last_match.end()]
+                        for s in _chunk_by_sentences(block):
                             s = s.strip()
                             if s:
+                                log.info("Ollama: sentence yielded (+%.2fs): %s", time.monotonic()-t0, s[:40])
                                 asyncio.run_coroutine_threadsafe(sentence_queue.put(s), loop).result()
-                        emitted_up_to = len(complete_text)
-                    if data.get("done"):
-                        break
+                        emitted_up_to += last_match.end()
+                    
+                    if data.get("done"): break
+        
+        # Flush
+        remaining = content[emitted_up_to:].strip()
+        if remaining:
+            log.info("Ollama: final sentence yielded (+%.2fs): %s", time.monotonic()-t0, remaining[:40])
+            asyncio.run_coroutine_threadsafe(sentence_queue.put(remaining), loop).result()
+        log.info("Ollama: finished in %.2fs, total_len=%d", time.monotonic()-t0, len(content))
     except Exception as e:
-        log.error("Ollama worker failed: %s", e)
-        # We don't raise as we need to put None below
+        log.exception("Ollama: worker failed: %s", e)
     finally:
         asyncio.run_coroutine_threadsafe(sentence_queue.put(None), loop).result()
     return content.strip()
@@ -1718,44 +1744,43 @@ def _stream_openai_sentences_sync(
     Returns the full assistant text.
     """
     content = ""
+    emitted_up_to = 0
+    t0 = time.monotonic()
     try:
-        # stream=True: tokens arrive incrementally; we push complete sentences to sentence_queue as they form
-        print(f"DEBUG: OpenAI worker starting stream for {len(messages)} messages", flush=True)
-        resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, stream=True)
-        emitted_up_to = 0  # character offset of already-queued text
-        for chunk in resp:
-            if not chunk or not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta.content
-            if delta is None:
-                continue
-            content += delta
-            # Check whether any new complete sentences have formed
-            parts = _chunk_by_sentences(content)
-            # parts[-1] is the in-progress (incomplete) sentence unless the last char ends with punctuation
-            complete_parts = parts[:-1] if len(parts) > 1 else []
-            # Also flush the last part if it ends with sentence-ending punctuation
-            if parts and parts[-1].strip() and parts[-1].strip()[-1] in ".!?":
-                complete_parts = parts
-            complete_text = " ".join(complete_parts)
-            if len(complete_text) > emitted_up_to:
-                new_sentences = _chunk_by_sentences(complete_text[emitted_up_to:])
-                for s in new_sentences:
-                    s = s.strip()
-                    if s:
-                        asyncio.run_coroutine_threadsafe(sentence_queue.put(s), loop).result()
-                emitted_up_to = len(complete_text)
+        log.info("LLM: starting stream for %s messages", len(messages))
+        # Support both Ollama and OpenAI patterns
+        if client:
+            resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, stream=True)
+            for chunk in resp:
+                if not chunk or not chunk.choices: continue
+                delta = chunk.choices[0].delta.content
+                if delta is None: continue
+                content += delta
+                
+                # Yield sentences as they form: match punctuation followed by space/newline or end of string
+                matches = list(re.finditer(r"(?<=[.?])(?:\s+|$)|(?:\s*\n\s*)+", content[emitted_up_to:]))
+                if matches:
+                    last_match = matches[-1]
+                    sentence_block = content[emitted_up_to : emitted_up_to + last_match.end()]
+                    for s in _chunk_by_sentences(sentence_block):
+                        s = s.strip()
+                        if s:
+                            log.info("LLM: sentence yielded (+%.2fs): %s", time.monotonic() - t0, s[:40])
+                            asyncio.run_coroutine_threadsafe(sentence_queue.put(s), loop).result()
+                    emitted_up_to += last_match.end()
+        else:
+            # Placeholder if we used another direct client; currently chat_stream_ws uses 'client'
+            pass
 
-        # Flush any remaining text as a final sentence
-        remaining = content[emitted_up_to:].strip() if len(content) > emitted_up_to else ""
+        # Final flush
+        remaining = content[emitted_up_to:].strip()
         if remaining:
+            log.info("LLM: final sentence yielded (+%.2fs): %s", time.monotonic() - t0, remaining[:40])
             asyncio.run_coroutine_threadsafe(sentence_queue.put(remaining), loop).result()
-        print(f"DEBUG: OpenAI worker finished, content_len={len(content)}", flush=True)
+        log.info("LLM: finished in %.2fs, total_len=%d", time.monotonic() - t0, len(content))
     except Exception as e:
-        print(f"ERROR: OpenAI worker failed: {e}", flush=True)
-        log.error("OpenAI worker failed: %s", e)
+        log.exception("LLM: worker failed: %s", e)
     finally:
-        # Signal end
         asyncio.run_coroutine_threadsafe(sentence_queue.put(None), loop).result()
     return content.strip()
 
@@ -1775,6 +1800,67 @@ async def _await_with_keepalive(coro_or_future, keepalive_interval: float = 4.0)
             yield ": keepalive\n\n"
     # Trigger any exception stored in the future so callers see it via fut.result()
     fut.result()
+
+
+# --- IDLE MOTION MANAGER ---
+class IdleMotionManager:
+    """Manages constant 'listening' video segments by feeding silence to Ditto."""
+    def __init__(self, media_ws_url, webrtc_session_id, image_id):
+        self.url = f"{media_ws_url}/push?session_id={webrtc_session_id}"
+        self.image_id = image_id
+        self.session_id = webrtc_session_id
+        self._active = False
+        self._task = None
+        # Pre-generate 1s of silence (16000 samples for 16kHz float32)
+        self._silence = struct.pack("<16000f", *([0.0] * 16000))
+
+    async def start(self):
+        if self._task: return
+        self._active = True
+        self._task = asyncio.create_task(self._run())
+        log.info("IdleMotion: Started for session %s", self.session_id)
+
+    async def stop(self):
+        self._active = False
+        if self._task:
+            self._task.cancel()
+            try: await self._task
+            except asyncio.CancelledError: pass
+            self._task = None
+        log.info("IdleMotion: Stopped for session %s", self.session_id)
+
+    async def _run(self):
+        try:
+            # Connect to Media Server's push endpoint
+            async with websockets.connect(self.url) as push_ws:
+                while self._active:
+                    # Generate 1 second of "idle" motion from silence
+                    s_queue = asyncio.Queue()
+                    c_path = f"/tmp/idle_{self.session_id}.mp4"
+                    
+                    # Start Ditto for silence
+                    ditto_fut = asyncio.ensure_future(
+                        ditto_stream_generate(self.image_id, self._silence, c_path, s_queue)
+                    )
+                    
+                    # Push segments from queue to media server
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(s_queue.get(), timeout=2.0)
+                        except asyncio.TimeoutError: break
+                        if chunk is None: break
+                        await push_ws.send(chunk)
+                    
+                    await ditto_fut
+                    # Small gap between heartbeat segments to avoid CPU spike
+                    await asyncio.sleep(0.1) 
+        except Exception as e:
+            if self._active:
+                log.exception("IdleMotion: Run failed for session %s: %s", self.session_id, e)
+
+# Global store for persistent idle managers
+webrtc_managers: dict[str, IdleMotionManager] = {}
+# --- END IDLE ---
 
 
 async def _run_chat_stream(ctx: dict):
@@ -1839,6 +1925,7 @@ async def _run_chat_stream(ctx: dict):
             )
 
     sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    openai_task: asyncio.Task | None = None
     if use_ollama:
         openai_task = asyncio.ensure_future(
             loop.run_in_executor(
@@ -1872,203 +1959,155 @@ async def _run_chat_stream(ctx: dict):
         )
         log.info("Chat timing: OpenAI stream started (stream=True)")
 
-    sentences: list[str] = []
-    clip_index = 0
-    buffer: list[str] = []
-    pending_sentence: str | None = None
-    stream_ended = False
-    next_tts_task: asyncio.Future | None = None
-    next_wav: bytes | None = None
+    async def prefetch_clip(idx, text_to_prefetch):
+        """Prepare TTS and start Ditto generation for a clip index."""
+        try:
+            log.info("Prefetch: clip %s (%s chars)", idx, len(text_to_prefetch))
+            # 1. TTS
+            t_tts0 = time.monotonic()
+            wav_data = await loop.run_in_executor(None, _chatterbox_tts_wav, voice_id, text_to_prefetch)
+            log.info("Prefetch: TTS done in %.2fs for clip %s", time.monotonic() - t_tts0, idx)
+            if not wav_data or len(wav_data) < 44:
+                return {"error": "Invalid WAV"}
+            
+            # 2. Conversion
+            audio_f32_data = _wav_to_16k_float32_mono(wav_data)
+            if not audio_f32_data or len(audio_f32_data) < 6400:
+                return {"error": "Audio too short"}
+            
+            # 3. Ditto Start
+            c_path = str(DATA_DIR / f"reply_{persona_id}_{reply_id}_{idx}.mp4")
+            s_queue = asyncio.Queue()
+            d_fut = asyncio.ensure_future(
+                ditto_stream_generate(image_id, audio_f32_data, c_path, s_queue)
+            )
+            return {
+                "index": idx,
+                "text": text_to_prefetch,
+                "wav": wav_data,
+                "audio_f32": audio_f32_data,
+                "path": c_path,
+                "segment_queue": s_queue,
+                "ditto_fut": d_fut,
+            }
+        except Exception as pre_err:
+            log.exception("Prefetch failed for clip %s: %s", idx, pre_err)
+            return {"error": str(pre_err)}
 
-    try:
-        while True:
-            sentences_per_this_clip = FIRST_CLIP_SENTENCES if clip_index == 0 else SENTENCES_PER_CLIP
-            while len(buffer) < sentences_per_this_clip and not stream_ended:
-                s: str | None = None
-                if pending_sentence is not None:
-                    s = pending_sentence
-                    pending_sentence = None
-                else:
-                    try:
-                        # Wait for at most 30s for the first/next sentence
-                        s = await asyncio.wait_for(sentence_queue.get(), timeout=30.0)
-                    except asyncio.TimeoutError:
-                        print("DEBUG: Chat pipeline: sentence_queue timeout (30s)", flush=True)
-                        s = None
+    sentences_log: list[str] = []
+    clip_index = 0
+    stream_ended = False
+
+    async def get_next_bundle():
+        nonlocal stream_ended
+        bundle = []
+        needed = FIRST_CLIP_SENTENCES if clip_index == 0 else SENTENCES_PER_CLIP
+        while len(bundle) < needed and not stream_ended:
+            try:
+                s = await asyncio.wait_for(sentence_queue.get(), timeout=30.0)
                 if s is None:
                     stream_ended = True
                     break
-                candidate = " ".join(buffer + [s]) if buffer else s
-                if len(candidate) > TTS_MAX_CHARS:
-                    if buffer:
-                        pending_sentence = s
-                        break
-                    buffer.append(s)
-                    break
-                buffer.append(s)
-
-            if not buffer:
+                bundle.append(s)
+                sentences_log.append(s)
+            except asyncio.TimeoutError:
                 break
+        return " ".join(bundle) if bundle else None
 
-            if clip_index == 0:
-                t_first_text = time.monotonic()
-                log.info(
-                    "Chat pipeline: first sentence at +%.3fs (request +%.3fs) buffer_len=%s",
-                    t_first_text - t_start, t_first_text - t_request, len(buffer),
-                )
+    FIRST_CLIP_SENTENCES = 1
+    
+    async def get_and_prefetch(idx):
+        bundle = await get_next_bundle()
+        if not bundle:
+            return None
+        return await prefetch_clip(idx, bundle)
 
-            chunk_text = " ".join(buffer)
+    # Start preparing the first clip immediately
+    prefetch_task = asyncio.create_task(get_and_prefetch(0))
+    
+    try:
+        while True:
+            # Wait for the current clip's pre-generation to finish (if not already done)
+            clip_data = await prefetch_task
+            if not clip_data:
+                break
+            
             i = clip_index
             clip_index += 1
-            clip_path = str(DATA_DIR / f"reply_{persona_id}_{reply_id}_{i}.mp4")
-            sentences.extend(buffer)
-            log.info("Chat: clip %s (%s sentences): %r…", i, len(buffer), chunk_text[:50])
-
-            next_group: list[str] = []
-            if pending_sentence is not None:
-                next_group.append(pending_sentence)
-                pending_sentence = None
-            while len(next_group) < SENTENCES_PER_CLIP:
-                try:
-                    s = sentence_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if s is None:
-                    break
-                c2 = " ".join(next_group + [s]) if next_group else s
-                if len(c2) > TTS_MAX_CHARS:
-                    if next_group:
-                        pending_sentence = s
-                        break
-                    next_group.append(s)
-                    break
-                next_group.append(s)
-            if next_group:
-                next_tts_task = loop.run_in_executor(
-                    None, _chatterbox_tts_wav, voice_id, " ".join(next_group)
-                )
-                log.info("Chat: pre-fetching TTS for clip %s (%s sentences)", i + 1, len(next_group))
-
-            if next_wav is not None:
-                wav = next_wav
-                next_wav = None
-                log.info("Chat: clip %s using pre-fetched TTS wav (%s bytes)", i, len(wav))
-            else:
-                if next_tts_task is not None:
-                    try:
-                        async for _ in _await_with_keepalive(next_tts_task, keepalive_interval=1.0):
-                            yield ("keepalive",)
-                        wav = next_tts_task.result()
-                        log.info("Chat: clip %s TTS done (%s bytes)", i, len(wav))
-                    except Exception as e:
-                        log.exception("TTS failed for clip %s: %s", i, e)
-                        yield ("event", "error", {"index": i, "error": str(e)})
-                        next_tts_task = None
-                        buffer = next_group
-                        continue
-                    next_tts_task = None
-                else:
-                    tts_fut = loop.run_in_executor(None, _chatterbox_tts_wav, voice_id, chunk_text)
-                    try:
-                        async for _ in _await_with_keepalive(tts_fut, keepalive_interval=1.0):
-                            yield ("keepalive",)
-                        wav = tts_fut.result()
-                        log.info("Chat: clip %s TTS done (%s bytes)", i, len(wav))
-                    except Exception as e:
-                        log.exception("TTS failed for clip %s: %s", i, e)
-                        yield ("event", "error", {"index": i, "error": str(e)})
-                        buffer = next_group
-                        continue
-
-            if not wav or len(wav) < 44:
-                log.error("Chat: clip %s invalid WAV len=%s", i, len(wav) if wav else 0)
-                yield ("event", "error", {"index": i, "error": "No audio for clip"})
-                buffer = next_group
-                continue
-            try:
-                audio_f32 = _wav_to_16k_float32_mono(wav)
-            except Exception as e:
-                log.exception("WAV conversion failed clip %s: %s", i, e)
-                yield ("event", "error", {"index": i, "error": str(e)})
-                buffer = next_group
-                continue
-            if not audio_f32 or len(audio_f32) < 6400:
-                log.error("Chat: clip %s audio too short (%s bytes float32)", i, len(audio_f32) if audio_f32 else 0)
-                yield ("event", "error", {"index": i, "error": "Audio too short"})
-                buffer = next_group
-                continue
-
-            log.info("Chat: clip %s → Ditto (%s float32 bytes)", i, len(audio_f32))
-            segment_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-            ditto_fut = asyncio.ensure_future(
-                ditto_stream_generate(image_id, audio_f32, clip_path, segment_queue)
-            )
-            log.info("Chat pipeline: clip %s yielding video_start then waiting for Ditto segments", i)
-            yield ("event", "video_start", {"index": i})
+            current_text = clip_data["text"]
+            
+            # IMMEDIATELY start preparing the NEXT clip while we stream this one
+            prefetch_task = asyncio.create_task(get_and_prefetch(i + 1))
+            
+            if "error" in clip_data:
+                log.error("Clip %s failed: %s", i, clip_data["error"])
+                yield ("event", "error", {"index": i, "error": clip_data["error"]})
+                break
+            
+            # Yield binary data for the current clip
+            seq_queue = clip_data["segment_queue"]
+            ditto_fut = clip_data["ditto_fut"]
+            
             segment_count = 0
             while True:
                 try:
-                    chunk = await asyncio.wait_for(segment_queue.get(), timeout=1.0)
+                    # Shorter timeout during binary yield to keep connection alive
+                    chunk = await asyncio.wait_for(seq_queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     yield ("keepalive",)
-                    log.debug("Chat pipeline: clip %s segment_queue timeout, yielded keepalive", i)
                     continue
+                
                 if chunk is None:
-                    log.info("Chat: clip %s segments done (%s segments received)", i, segment_count)
                     break
+                
+                if segment_count == 0:
+                    log.info("Pipeline: emitting video_start for clip %s at +%.2fs", i, time.monotonic() - t_start)
+                    yield ("event", "video_start", {"index": i})
+                
                 segment_count += 1
-                if segment_count == 1:
-                    log.info("Chat: clip %s first segment received (%s bytes)", i, len(chunk))
                 yield ("binary", i, chunk)
-            try:
-                await ditto_fut
-            except Exception as e:
-                log.exception("Clip %s Ditto failed: %s", i, e)
-                yield ("event", "error", {"index": i, "error": str(e)})
-                buffer = next_group
-                continue
-            if next_tts_task is not None:
-                try:
-                    async for _ in _await_with_keepalive(next_tts_task, keepalive_interval=1.0):
-                        yield ("keepalive",)
-                    next_wav = next_tts_task.result()
-                    next_tts_task = None
-                except Exception:
-                    next_wav = None
-                    next_tts_task = None
+            
+            # Wait for render cleanup
+            try: await ditto_fut
+            except: pass
+            
+            log.info("Pipeline: clip %s finished yielding (%s segments)", i, segment_count)
+            yield ("event", "clip", {"index": i, "text": current_text, "streaming": True})
 
-            url = f"/api/personas/{persona_id}/reply/{reply_id}/{i}"
-            log.info("Chat: emitting clip %s", i)
-            yield ("event", "clip", {"index": i, "url": url, "text": chunk_text, "streaming": True})
-            buffer = next_group
-
-    except Exception as e:
-        log.exception("stream_clips error: %s", e)
-        yield ("event", "error", {"error": str(e)})
     finally:
+        # Cleanup both pipeline tasks
+        if prefetch_task:
+            prefetch_task.cancel()
+            try: await prefetch_task
+            except: pass
+
         if openai_task and not openai_task.done():
             openai_task.cancel()
+        
+        # Ensure we always try to save whatever we got
+        try:
+            full_text = ""
+            if openai_task and not openai_task.cancelled():
+                full_text = await openai_task
+            
+            if not full_text:
+                full_text = " ".join(sentences_log)
+            
+            log.info("AI Text: %s...", full_text[:60].replace("\n", " "))
+            p["conversation"] = p.get("conversation", []) + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": full_text},
+            ]
+            personas = load_personas()
+            for idx, x in enumerate(personas):
+                if x.get("id") == persona_id:
+                    personas[idx] = p
+                    break
+            save_personas(personas)
+        except Exception as save_err:
+            log.error("Failed to finalize conversation state: %s", save_err)
 
-    try:
-        full_text = await openai_task
-        print(f"DEBUG: Chat pipeline: Assistant response: {full_text[:100]}...", flush=True)
-    except Exception as e:
-        print(f"ERROR: Chat pipeline: Assistant task failed: {e}", flush=True)
-        full_text = " ".join(sentences)
-    if not full_text:
-        full_text = " ".join(sentences)
-    p["conversation"] = p.get("conversation", []) + [
-        {"role": "user", "content": message},
-        {"role": "assistant", "content": full_text},
-    ]
-    personas = load_personas()
-    for idx, x in enumerate(personas):
-        if x.get("id") == persona_id:
-            personas[idx] = p
-            break
-    loop.run_in_executor(None, lambda: save_personas(personas))
-    print(f"DEBUG: Chat pipeline: finished clip_index={clip_index} yielding done", flush=True)
-    log.info("Chat pipeline: done clip_index=%s yielding done event", clip_index)
+    log.info("Chat pipeline: finished reply_id=%s with %s clips", reply_id, clip_index)
     yield ("event", "done", {"reply_id": reply_id, "total": clip_index})
 
 
@@ -2118,7 +2157,9 @@ async def chat(persona_id: str, message: str = Form(...), current_user: dict = D
     if rag_context:
         system_content = system_content + "\n\nUse the following information when relevant to the user's question:\n" + rag_context
 
-    messages = [{"role": "system", "content": system_content}]
+    messages = [
+        {"role": "system", "content": system_content + "\n\nIMPORTANT: Do NOT use exclamation marks (!) in your response. Use only periods (.) and question marks (?) for punctuation."},
+    ]
     for m in p.get("conversation", []):
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": message})
@@ -2180,26 +2221,27 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
             pass
         await websocket.close()
         return
-    # Receive first message: { "message": "...", optional "webrtc_session_id": "..." }
+
     try:
         raw = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
-        log.info("Chat WS: first message raw_len=%s keys=%s", len(raw), list(json.loads(raw).keys()) if raw else "n/a")
         msg = json.loads(raw)
         message = (msg.get("message") or "").strip()
         webrtc_session_id = (msg.get("webrtc_session_id") or "").strip() or None
-        log.info("Chat WS: parsed message_len=%s webrtc_session_id=%s", len(message), webrtc_session_id or "(none)")
-    except asyncio.TimeoutError:
-        await websocket.send_json({"event": "error", "data": {"error": "No message received"}})
-        await websocket.close()
-        return
     except Exception as e:
-        await websocket.send_json({"event": "error", "data": {"error": str(e)}})
+        try:
+            await websocket.send_json({"event": "error", "data": {"error": f"Invalid message: {e}"}})
+        except:
+            pass
         await websocket.close()
         return
+
     if not message:
-        log.warning("Chat WS: message empty or missing, sending error and closing")
-        await websocket.send_json({"event": "error", "data": {"error": "message is required"}})
-        await websocket.close()
+        log.info("Chat WS: Empty message (Initialization only) for session %s", webrtc_session_id)
+        try:
+            while True:
+                await websocket.receive_text()
+        except:
+            pass
         return
 
     p = get_persona(persona_id, current_user["id"])
@@ -2207,6 +2249,7 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
         await websocket.send_json({"event": "error", "data": {"error": "Persona not found"}})
         await websocket.close()
         return
+
     ws_use_ollama = bool(OLLAMA_URL)
     if not ws_use_ollama and not OPENAI_API_KEY:
         await websocket.send_json({"event": "error", "data": {"error": "Set OLLAMA_URL or OPENAI_API_KEY for chat"}})
@@ -2230,7 +2273,9 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
     rag_context = get_rag_context(persona_id, current_user["id"], message)
     if rag_context:
         system_content = system_content + "\n\nUse the following information when relevant to the user's question:\n" + rag_context
-    messages = [{"role": "system", "content": system_content}]
+    messages = [
+        {"role": "system", "content": system_content + "\n\nIMPORTANT: Do NOT use exclamation marks (!) in your response. Use only periods (.) and question marks (?) for punctuation."},
+    ]
     for m in p.get("conversation", []):
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": message})
@@ -2239,6 +2284,20 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
     voice_id, image_id = p["voice_id"], p["image_id"]
     reply_id = uuid.uuid4().hex
     t_request = time.monotonic()
+    p = get_persona(persona_id, current_user["id"])
+    if not p:
+        await websocket.send_json({"event": "error", "data": {"error": "Persona not found"}})
+        await websocket.close()
+        return
+
+    if not message:
+        log.info("Chat WS: Empty message (Initialization only)")
+        try:
+            while True:
+                await websocket.receive_text()
+        except: pass
+        return
+
     log.info(
         "Chat WS: request received persona_id=%s webrtc_session_id=%s use_ollama=%s",
         persona_id, webrtc_session_id or "(none)", ws_use_ollama,
@@ -2258,75 +2317,52 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
         "ollama_url": OLLAMA_URL if ws_use_ollama else "",
         "ollama_model": OLLAMA_MODEL,
     }
-
     push_ws = None
-    if webrtc_session_id and MEDIA_SERVER_WS_URL:
-        try:
-            log.info("Chat WS: connecting to push session_id=%s url=%s", webrtc_session_id, MEDIA_SERVER_WS_URL)
-            push_ws = await websockets.connect(
-                f"{MEDIA_SERVER_WS_URL}/push?session_id={webrtc_session_id}",
-                close_timeout=2,
-            )
-            log.info("Chat WS: push connected session_id=%s", webrtc_session_id)
-        except Exception as e:
-            log.error("Chat WS: media server push connect FAILED for session_id=%s: %s", webrtc_session_id, e)
-            await websocket.send_json({"event": "error", "data": {"error": f"WebRTC push failed: {e}"}})
-            await websocket.close()
-            return
-    else:
-        log.info("Chat WS: no push (webrtc_session_id=%s MEDIA_SERVER_WS_URL=%s)", webrtc_session_id or "(none)", MEDIA_SERVER_WS_URL or "(empty)")
 
     sent_count = 0
     keepalive_count = 0
     last_log_at = 0.0
     ws_send_lock = asyncio.Lock()
-    KEEPALIVE_INTERVAL = 5.0  # 5s is plenty to keep proxy happy
+    KEEPALIVE_INTERVAL = 5.0
 
     pipeline_queue: asyncio.Queue[tuple | None] = asyncio.Queue()
 
     async def pipeline_producer():
         """Run pipeline in separate task; put items in queue so main loop never blocks on LLM."""
         try:
-            print(f"DEBUG: Chat WS: producer starting for reply_id={reply_id}", flush=True)
+            log.info("Chat WS: producer starting for reply_id=%s", reply_id)
+            # Use the already defined ctx dictionary
             async for item in _run_chat_stream(ctx):
                 await pipeline_queue.put(item)
-            print(f"DEBUG: Chat WS: producer finished for reply_id={reply_id}", flush=True)
+            log.info("Chat WS: producer finished for reply_id=%s", reply_id)
         except Exception as e:
-            print(f"ERROR: Chat WS: producer CRASHED: {e}", flush=True)
             log.error("Chat WS: pipeline_producer CRASHED: %s", e, exc_info=True)
             await pipeline_queue.put(("event", "error", {"error": str(e)}))
         finally:
-            await pipeline_queue.put(None)  # sentinel: pipeline finished
+            await pipeline_queue.put(None)
 
     pipeline_task = asyncio.create_task(pipeline_producer(), name=f"chat_{reply_id}")
 
     async def ws_consumer():
-        """Optional: consume any client messages (like 'stop') or just detect disconnects."""
+        """Detect disconnects."""
         try:
             while True:
-                # We don't expect messages after the first one, but calling receive
-                # is how Starlette detects a disconnected client.
                 await websocket.receive_text()
-        except Exception:
-            pass
+        except: pass
 
     consumer_task = asyncio.create_task(ws_consumer())
 
     def _on_pipeline_done(t: asyncio.Task):
-        if t.cancelled():
-            log.info("Chat WS: pipeline task %s was CANCELLED", t.get_name())
-            return
+        if t.cancelled(): return
         exc = t.exception()
         if exc is not None:
-            log.error("Chat WS: pipeline task %s finished with exception: %s", t.get_name(), exc, exc_info=True)
-        else:
-            log.info("Chat WS: pipeline task %s finished NORMALLY", t.get_name())
+            log.error("Chat WS: pipeline task %s failed: %s", t.get_name(), exc)
 
     pipeline_task.add_done_callback(_on_pipeline_done)
 
+    # In continuous mode, we keep the loop alive for multiple user interactions
     try:
-        print(f"DEBUG: Chat WS: main loop entering for reply_id={reply_id}", flush=True)
-        log.info("Chat WS: entering main loop for reply_id=%s", reply_id)
+        log.info("Chat WS: entering main pipeline loop for reply_id=%s", reply_id)
         while True:
             try:
                 # Wait for items from the producer.
@@ -2358,18 +2394,8 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
                     await websocket.send_json({"event": item[1], "data": item[2]})
                 sent_count += 1
             elif kind == "binary":
-                if push_ws:
-                    try:
-                        await push_ws.send(item[2])
-                    except Exception as pe:
-                        log.error("Chat WS: push_ws.send FAILED: %s", pe)
-                        async with ws_send_lock:
-                            await websocket.send_json({"event": "error", "data": {"error": f"Push stream failed: {pe}"}})
-                        break
-                else:
-                    # Non-WebRTC mode: send segments over main WS
-                    async with ws_send_lock:
-                        await websocket.send_bytes(item[2])
+                async with ws_send_lock:
+                    await websocket.send_bytes(item[2])
                 sent_count += 1
             elif kind == "keepalive":
                 async with ws_send_lock:
@@ -2395,11 +2421,14 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
         except asyncio.CancelledError:
             pass
         print(f"DEBUG: Chat WS: finally for reply_id={reply_id}, sent_count={sent_count}", flush=True)
+
+        # No cleanup for idle_mgr needed here as we removed it
         if push_ws:
             try:
                 await push_ws.close()
-            except Exception:
+            except:
                 pass
+        
         try:
             await websocket.close()
         except Exception:
