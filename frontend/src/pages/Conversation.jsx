@@ -37,6 +37,7 @@ export default function Conversation() {
   const [replyState, setReplyState] = useState({ current: null, queue: [], streamDone: false })
   const [showReply, setShowReply] = useState(false)
   const [idleVideoError, setIdleVideoError] = useState(false)
+  const [idlePlaying, setIdlePlaying] = useState(false)
   const [streamError, setStreamError] = useState(null)
   const idleVideoRef = useRef(null)
   const replyVideoRef = useRef(null)
@@ -49,6 +50,7 @@ export default function Conversation() {
   const chatWsRef = useRef(null)
   const mseRef = useRef({ byIndex: {}, revoke: () => { } })
   const stallTimeoutRef = useRef(null)
+  const pendingNewClipRef = useRef(false)
   const replyPlayingUrl = replyState.current
   const isSpeaking = showReply || sending
   const isStreaming = sending || !replyState.streamDone
@@ -126,17 +128,28 @@ export default function Conversation() {
   // --- Utility functions for Streaming (moved to component scope for accessibility) ---
   const CODECS = 'video/mp4; codecs="avc1.42401E,mp4a.40.2"'
 
+  function resumeReplyPlayback() {
+    const v = replyVideoRef.current
+    setShowReply(true)
+    if (!v) return
+    if (v.paused || v.readyState < 2) {
+      v.play().catch(() => { })
+    }
+  }
+
 
   function handleStreamEvent(event, data) {
     if (event === 'video_start') {
       gotFirstClipRef.current = true
       if (longWaitTimeoutRef.current) { clearTimeout(longWaitTimeoutRef.current); longWaitTimeoutRef.current = null }
+      pendingNewClipRef.current = true
       // We have interaction credit from Send button, so we can unmute
       if (replyVideoRef.current) {
         try { replyVideoRef.current.muted = false } catch (_) { }
       }
     } else if (event === 'done') {
       setReplyState((prev) => ({ ...prev, streamDone: true }))
+      setSending(false)
       setTimeout(() => transitionToIdle(), 2000)
     } else if (event === 'error') {
       setStreamError(data.error || 'Stream failed')
@@ -151,17 +164,21 @@ export default function Conversation() {
       if (pending) pending.push(chunk)
       return
     }
+    if (pendingNewClipRef.current && !sb.updating) {
+      try {
+        const buffered = sb.buffered
+        const end = buffered.length > 0 ? buffered.end(buffered.length - 1) : 0
+        sb.timestampOffset = end
+      } catch (_) { }
+      pendingNewClipRef.current = false
+    }
     if (appending[0] || queue.length > 0) {
       queue.push(chunk)
     } else {
       appending[0] = true
       try {
         sb.appendBuffer(chunk)
-        // Explicitly check if we can resume playback after appending new data
-        const v = replyVideoRef.current
-        if (v && v.paused && gotFirstClipRef.current) {
-          v.play().catch(() => { })
-        }
+        resumeReplyPlayback()
       } catch (err) {
         console.error('[MSE] append error', err)
         appending[0] = false
@@ -215,6 +232,7 @@ export default function Conversation() {
     // To prevent black flash: hide the speaking layer but KEEP the current src 
     // until we actually have the first segment of the new one ready.
     setShowReply(false)
+    idleVideoRef.current?.play().catch(() => { })
 
     // 2) Setup NEW MediaSource for this specific response
     const ms = new MediaSource()
@@ -231,7 +249,6 @@ export default function Conversation() {
     mseRef.current = mseState
 
     ms.onsourceopen = () => {
-      console.info('[MSE] Source opened');
       try {
         const sb = ms.addSourceBuffer(CODECS)
         sb.mode = 'sequence'
@@ -239,19 +256,23 @@ export default function Conversation() {
           mseState.appending[0] = false
           if (mseState.queue.length > 0) {
             mseState.appending[0] = true
+            if (pendingNewClipRef.current && !sb.updating) {
+              try {
+                const buffered = sb.buffered
+                const end = buffered.length > 0 ? buffered.end(buffered.length - 1) : 0
+                sb.timestampOffset = end
+              } catch (_) { }
+              pendingNewClipRef.current = false
+            }
             sb.appendBuffer(mseState.queue.shift())
           } else {
             // Queue empty, check if we should be playing
-            const v = replyVideoRef.current
-            if (v && v.paused && gotFirstClipRef.current) {
-              v.play().catch(() => { })
-            }
+            resumeReplyPlayback()
           }
         }
         mseState.sb = sb
         // Push any chunks that arrived while we were opening
         if (mseState.pending.length > 0) {
-          console.info('[MSE] Appending %d pending chunks', mseState.pending.length);
           while (mseState.pending.length > 0) {
             const chunk = mseState.pending.shift()
             if (mseState.appending[0]) {
@@ -286,23 +307,15 @@ export default function Conversation() {
 
   const handleReplyEnded = () => {
     setReplyState((prev) => {
-      console.info('[reply] onEnded', {
-        current: prev.current,
-        queueLen: prev.queue.length,
-        streamDone: prev.streamDone,
-      })
       if (prev.queue.length > 0) {
         // Advance to next clip: keep reply layer visible, no gap/flash (next clip is preloaded)
-        console.info('[reply] advancing to next clip')
         return { ...prev, current: prev.queue[0], queue: prev.queue.slice(1) }
       }
       // No more clips in queue: only switch to idle when stream is done (avoids speak → idle → speak when clip 1 is still loading)
       if (!prev.streamDone) {
-        console.info('[reply] ended but waiting for stream to finish')
         return prev
       }
       // Stream done and no more clips — transition to idle (clears fallback timers)
-      console.info('[reply] transition to idle')
       transitionToIdle()
       return prev
     })
@@ -338,8 +351,13 @@ export default function Conversation() {
         {isStreaming && !isGenerating && replyState.queue.length > 0 && (
           <div className="streaming-status next">Next clip ready</div>
         )}
-        {idleVideoError && previewUrl && (
-          <img src={previewUrl} alt="" className="video-layer poster-fallback" style={{ opacity: showReply ? 0 : 1 }} />
+        {previewUrl && !showReply && (
+          <img
+            src={previewUrl}
+            alt=""
+            className="video-layer poster-fallback"
+            style={{ opacity: idlePlaying && !idleVideoError ? 0 : 1 }}
+          />
         )}
         <video
           ref={idleVideoRef}
@@ -351,13 +369,22 @@ export default function Conversation() {
           preload="auto"
           poster={previewUrl || undefined}
           className="video-layer"
-          style={{ opacity: showReply ? 0 : 1 }}
+          style={{ opacity: 1 }}
           onError={() => setIdleVideoError(true)}
           onPlaying={() => {
+            setIdlePlaying(true)
             if (clearReplyPendingRef.current) {
               clearReplyPendingRef.current = false
               setShowReply(false)
             }
+          }}
+          onPause={() => {
+            setIdlePlaying(false)
+            idleVideoRef.current?.play().catch(() => { })
+          }}
+          onWaiting={() => setIdlePlaying(false)}
+          onTimeUpdate={() => {
+            if (!idlePlaying) setIdlePlaying(true)
           }}
         />
         <video
@@ -383,10 +410,6 @@ export default function Conversation() {
               clearTimeout(longWaitTimeoutRef.current);
               longWaitTimeoutRef.current = null;
             }
-            console.info('[reply] onPlaying', {
-              src: replyVideoRef.current?.src,
-              readyState: replyVideoRef.current?.readyState,
-            })
             setShowReply(true)
           }}
           onCanPlay={() => {
@@ -421,36 +444,23 @@ export default function Conversation() {
           }}
           onEnded={handleReplyEnded}
           onWaiting={() => {
-            console.info('[reply] waiting...');
             // Fade back to idle if we stall FOR LONG, to avoid black screen
             // but ignore short micro-stalls during buffer transitions.
             if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
             stallTimeoutRef.current = setTimeout(() => {
-              console.warn('[reply] long stall detected, returning to idle');
-              setShowReply(false);
+              resumeReplyPlayback()
               stallTimeoutRef.current = null;
-
-              // HEURISTIC: If we've been waiting for > 10s and still no playback,
-              // something is wrong with the MSE buffer or connection.
-              // We should at least release the UI lock so the user can try again.
-              if (sending && !gotFirstClipRef.current) {
-                // We're still in "Thinking..." state, let the longWaitTimeout handle it
-              } else if (sending) {
-                // We were speaking but got stuck. 
-              }
             }, 500);
 
             // Separate safety timer to unlock the UI if we're completely frozen
             if (longWaitTimeoutRef.current) clearTimeout(longWaitTimeoutRef.current);
             longWaitTimeoutRef.current = setTimeout(() => {
-              console.error('[reply] Safety timeout: unlocking UI due to persistent freeze');
               setSending(false);
               transitionToIdle();
             }, 10000); // 10s of cumulative waiting = stuck
           }}
           onStalled={() => {
-            console.warn('[reply] stalled');
-            setShowReply(false);
+            resumeReplyPlayback()
           }}
           onError={(e) => {
             if (!replyVideoRef.current?.src) return
@@ -486,7 +496,7 @@ export default function Conversation() {
         .conv-header .edit-link { color: #a78bfa; font-size: 0.85rem; }
         .video-wrap { position: relative; z-index: 0; flex: 1; min-height: 0; width: 100%; background: #000; overflow: hidden; pointer-events: none; }
         .video-wrap .video-layer { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transition: opacity 0.35s ease-out; pointer-events: none; }
-        .video-wrap .video-layer.poster-fallback { z-index: 0; }
+        .video-wrap .video-layer.poster-fallback { z-index: 2; }
         .video-wrap .video-layer.reply-layer { z-index: 1; transition: opacity 0.3s ease-in-out; }
         .video-wrap .video-layer.reply-layer.reply-hiding { transition: opacity 0.35s ease-out; }
         .conv-bottom { position: relative; z-index: 20; flex-shrink: 0; background: rgba(0,0,0,0.9); border-top: 1px solid rgba(255,255,255,0.1); }
