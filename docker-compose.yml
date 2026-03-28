@@ -24,11 +24,97 @@ services:
     environment:
       - DATA_DIR=/app/data
       - STATIC_DIR=/app/static
+      - DITTO_STREAMING=1
+      - DITTO_API_URLS=http://127.0.0.1:8080
       # WebRTC media server is same process at /webrtc; backend pushes segments here
       - MEDIA_SERVER_WS_URL=ws://localhost:8087/webrtc
+      - STT_BASE_URL=http://127.0.0.1:8090
+      - TTS_PROVIDER=chatterbox
+      - COSYVOICE_USE_TRITON=0
+      - COSYVOICE_USE_CACHE=0
+      - COSYVOICE_BASE_URL=
+      - COSYVOICE_USE_REGISTERED_SPK=1
+      - COSYVOICE_USE_SFT=0
+      - COSYVOICE_SPEED=1.0
+      - COSYVOICE_USE_TRITON=0
+      - COSYVOICE_TRITON_URL=http://127.0.0.1:18001
+      - COSYVOICE_TRITON_MODEL=cosyvoice2
+      - COSYVOICE_TRITON_OFFLINE=0
+      - COSYVOICE_REF_TEXT_MODE=short
+      - COSYVOICE_USE_CACHE=0
+      - COSYVOICE_CACHE_ALL_ON_STARTUP=1
+      - COSYVOICE_CACHE_WARMUP_TEXT=Hello.
+      - MIN_VOICE_SECONDS=15
+      - MAX_VOICE_SECONDS=20
+      - MIN_SPEECH_RATIO=0.6
+      - AUDIO_GAIN=2.0
+      - AUDIO_PREFILL_MS=200
+      - AUDIO_CONTINUOUS=0
+      - AUDIO_CLIP_MIN_CHARS=0
+      - AUDIO_FIRST_CLIP_SENTENCES=1
+      - AUDIO_SENTENCES_PER_CLIP=1
+      - XTTS_BASE_URL=http://127.0.0.1:8002
+      - CHATTERBOX_BASE_URL=http://127.0.0.1:8000
+      - TURN_URL=turn:178.194.34.219:3478?transport=udp,turn:178.194.34.219:3478?transport=tcp
+      - TURN_USERNAME=twynbook
+      - TURN_PASSWORD=twynbook
+      - OLLAMA_URL=http://127.0.0.1:11434
+      - OLLAMA_MODEL=qwen2.5:3b
     volumes:
       - twynbook-data:/app/data
     restart: unless-stopped
 
+  stt-whisper:
+    build:
+      context: ./stt_service
+    image: stt-whisper:latest
+    container_name: stt-whisper
+    runtime: nvidia
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - STT_MODEL=small.en
+      - STT_DEVICE=cuda
+      - STT_COMPUTE_TYPE=float16
+      - STT_VAD_FILTER=false
+      - NVIDIA_VISIBLE_DEVICES=0
+
+  turn:
+    image: instrumentisto/coturn:latest
+    container_name: coturn
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - "--fingerprint"
+      - "--lt-cred-mech"
+      - "--realm=twynbook"
+      - "--user=twynbook:twynbook"
+      - "--external-ip=178.194.34.219"
+      - "--min-port=49152"
+      - "--max-port=49200"
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - mongodb-data:/data/db
+
+  chatterbox:
+    image: voice-cloning-chatterbox:latest
+    container_name: chatterbox-voice-cloning
+    runtime: nvidia
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - MONGODB_URI=mongodb://localhost:27017
+      - NVIDIA_VISIBLE_DEVICES=0
+    depends_on:
+      - mongodb
+    volumes:
+      - /home/nbrown/twynbook/backend/scripts:/voices
+
 volumes:
   twynbook-data:
+  mongodb-data:

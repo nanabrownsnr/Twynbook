@@ -19,6 +19,9 @@ export default function EditPersona() {
   const [documentsLoading, setDocumentsLoading] = useState(false)
   const [uploadingDoc, setUploadingDoc] = useState(false)
   const [docError, setDocError] = useState(null)
+  const [shareUrl, setShareUrl] = useState('')
+  const [shareLoading, setShareLoading] = useState(false)
+  const [shareError, setShareError] = useState(null)
 
   const listingType = (l) => l.listing_type || 'integration'
   const toolListings = purchases.filter((l) => listingType(l) === 'integration')
@@ -107,6 +110,22 @@ export default function EditPersona() {
       })
   }
 
+  const handleShare = () => {
+    if (!personaId) return
+    setShareLoading(true)
+    setShareError(null)
+    apiFetch(`${API}/personas/${personaId}/share`, { method: 'POST' })
+      .then((r) => (r.ok ? r.json() : r.text().then((t) => { throw new Error(t) })))
+      .then((d) => {
+        setShareUrl(d.url || '')
+        if (d.url && navigator.clipboard?.writeText) {
+          navigator.clipboard.writeText(d.url).catch(() => {})
+        }
+      })
+      .catch((e) => setShareError(e.message || 'Failed to create share link'))
+      .finally(() => setShareLoading(false))
+  }
+
   if (persona === null && personaId) {
     return (
       <div className="edit-page">
@@ -127,7 +146,12 @@ export default function EditPersona() {
     <div className="edit-page">
       <header>
         <Link to={`/persona/${personaId}`}>Back</Link>
-        <h1>Edit persona</h1>
+        <div className="edit-header-row">
+          <h1>Edit persona</h1>
+          <button type="button" className="edit-share-btn" onClick={handleShare} disabled={shareLoading}>
+            {shareLoading ? 'Sharing…' : 'Share'}
+          </button>
+        </div>
       </header>
       <form onSubmit={handleSubmit} className="edit-form">
         <label>
@@ -212,6 +236,14 @@ export default function EditPersona() {
         </div>
 
         {error && <p className="error">{error}</p>}
+        {shareUrl && (
+          <div className="edit-share-box">
+            <label>Share link</label>
+            <input type="text" readOnly value={shareUrl} onFocus={(e) => e.target.select()} />
+            <small>Anyone with this link can view and chat with your persona.</small>
+          </div>
+        )}
+        {shareError && <p className="error">{shareError}</p>}
         <button type="submit" disabled={saving}>
           {saving ? 'Saving…' : 'Save changes'}
         </button>
@@ -219,6 +251,10 @@ export default function EditPersona() {
       <style>{`
         .edit-page { padding: 2rem; max-width: 480px; margin: 0 auto; background: var(--bg-page); min-height: 100vh; }
         .edit-page header { margin-bottom: 1.5rem; }
+        .edit-header-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+        .edit-share-btn { padding: 0.45rem 0.9rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-card); color: var(--text-primary); font-weight: 600; cursor: pointer; }
+        .edit-share-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+        .edit-share-btn:disabled { opacity: 0.6; cursor: not-allowed; }
         .edit-page header a { display: inline-block; margin-bottom: 0.5rem; color: var(--primary); }
         .edit-page h1 { font-family: var(--font-heading); font-size: 1.5rem; font-weight: 600; margin: 0; color: var(--text-primary); }
         .edit-form label { display: block; margin-bottom: 1rem; color: var(--text-primary); }
@@ -228,6 +264,10 @@ export default function EditPersona() {
         .edit-form button[type="submit"]:hover:not(:disabled) { background: var(--primary-hover); }
         .edit-form button[type="submit"]:disabled { opacity: 0.6; cursor: not-allowed; }
         .edit-form .error { color: var(--error); margin-bottom: 0.5rem; }
+        .edit-share-box { margin: 0.75rem 0 1rem; padding: 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-card); }
+        .edit-share-box label { display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.35rem; }
+        .edit-share-box input { width: 100%; padding: 0.5rem 0.6rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-input); color: var(--text-primary); }
+        .edit-share-box small { display: block; margin-top: 0.35rem; color: var(--text-muted); }
         .edit-tools-section { margin-bottom: 1.25rem; }
         .edit-tools-title { font-size: 1rem; font-weight: 600; color: var(--text-primary); margin: 0 0 0.6rem; }
         .edit-tools-empty { font-size: 0.9rem; color: var(--text-secondary); display: flex; flex-direction: column; gap: 0.4rem; background: var(--bg-card); border: 1px dashed var(--border); border-radius: var(--radius); padding: 1rem; }

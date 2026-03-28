@@ -10,6 +10,7 @@ import Admin from './pages/Admin'
 import Payment from './pages/Payment'
 import Login from './pages/Login'
 import Signup from './pages/Signup'
+import PublicPersona from './pages/PublicPersona'
 import { getToken } from './auth'
 
 function ProtectedRoute({ children }) {
@@ -26,6 +27,7 @@ export default function App() {
       <Route path="/create" element={<ProtectedRoute><CreatePersona /></ProtectedRoute>} />
       <Route path="/creating" element={<ProtectedRoute><CreatingPersona /></ProtectedRoute>} />
       <Route path="/persona/:personaId" element={<ProtectedRoute><Conversation /></ProtectedRoute>} />
+      <Route path="/p/:shareId" element={<PublicPersona />} />
       <Route path="/persona/:personaId/edit" element={<ProtectedRoute><EditPersona /></ProtectedRoute>} />
       <Route path="/marketplace" element={<ProtectedRoute><Marketplace /></ProtectedRoute>} />
       <Route path="/admin" element={<ProtectedRoute><Admin /></ProtectedRoute>} />

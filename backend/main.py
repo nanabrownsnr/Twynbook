@@ -5,20 +5,25 @@ Endpoints: personas CRUD, create persona (face→Ditto, voice→Chatterbox, idle
 import asyncio
 import base64
 import io
+import itertools
 import json
 import logging
 import os
 import re
 import subprocess
+import threading
 import tempfile
 import time
 import struct
 import uuid
+import secrets
 import wave
+from fractions import Fraction
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import httpx
+import numpy as np
 import jwt
 import websockets
 import bcrypt
@@ -28,6 +33,26 @@ from pydantic import BaseModel
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
+
+try:
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+    from aiortc.mediastreams import MediaStreamTrack
+    from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
+    from aiortc.sdp import candidate_from_sdp
+except Exception:
+    RTCPeerConnection = None
+    RTCSessionDescription = None
+    RTCIceCandidate = None
+    MediaStreamTrack = None
+    RTCConfiguration = None
+    RTCIceServer = None
+    candidate_from_sdp = None
+try:
+    from av.audio.resampler import AudioResampler
+    from av import AudioFrame
+except Exception:
+    AudioResampler = None
+    AudioFrame = None
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -35,21 +60,78 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
 # Chatterbox TTS has a 1000-character limit per request
-TTS_MAX_CHARS = 1000
-# FIRST_CLIP_SENTENCES = 2 provides a solid buffer to prevent early stalling.
-# SENTENCES_PER_CLIP = 2 balances throughput with stability.
+TTS_MAX_CHARS = 240
+# Voice sample requirements for persona creation (seconds)
+MIN_VOICE_SECONDS = int(os.environ.get("MIN_VOICE_SECONDS", "15"))
+MAX_VOICE_SECONDS = int(os.environ.get("MAX_VOICE_SECONDS", "20"))
+MIN_SPEECH_RATIO = float(os.environ.get("MIN_SPEECH_RATIO", "0.6"))
+# FIRST_CLIP_SENTENCES provides a solid buffer to prevent early stalling.
 FIRST_CLIP_SENTENCES = 2
 SENTENCES_PER_CLIP = 2
+# Audio-mode sentence grouping (reduce TTS gaps between clips).
+AUDIO_FIRST_CLIP_SENTENCES = int(os.environ.get("AUDIO_FIRST_CLIP_SENTENCES", "1"))
+AUDIO_SENTENCES_PER_CLIP = int(os.environ.get("AUDIO_SENTENCES_PER_CLIP", "1"))
+# Audio-mode continuous chunking (no sentence boundaries)
+AUDIO_CONTINUOUS = os.environ.get("AUDIO_CONTINUOUS", "0").lower() in ("1", "true", "yes", "on")
+AUDIO_CHUNK_CHARS = int(os.environ.get("AUDIO_CHUNK_CHARS", "60"))
+# Audio-mode prompt truncation (keep last N messages, excluding system)
+AUDIO_HISTORY_MAX = int(os.environ.get("AUDIO_HISTORY_MAX", "6"))
+# Video / typed WebSocket chat: max messages to send to the LLM (0 = no trim — full persona conversation).
+CHAT_HISTORY_MAX = int(os.environ.get("CHAT_HISTORY_MAX", "0"))
+# Audio-mode max chars per clip (optional; when unset, keep full sentence).
+AUDIO_CLIP_MAX_CHARS = int(os.environ.get("AUDIO_CLIP_MAX_CHARS", "240"))
+# TTS provider selection for audio mode
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "chatterbox").strip().lower()
+COSYVOICE_BASE_URL = os.environ.get("COSYVOICE_BASE_URL", "").strip()
+COSYVOICE_SPEED = float(os.environ.get("COSYVOICE_SPEED", "1.15"))
+COSYVOICE_PROMPT_MAX_CHARS = int(os.environ.get("COSYVOICE_PROMPT_MAX_CHARS", "200"))
+COSYVOICE_USE_SFT = os.environ.get("COSYVOICE_USE_SFT", "0").strip() == "1"
+COSYVOICE_USE_REGISTERED_SPK = os.environ.get("COSYVOICE_USE_REGISTERED_SPK", "1").strip().lower() in ("1", "true", "yes", "on")
+COSYVOICE_USE_TRITON = os.environ.get("COSYVOICE_USE_TRITON", "0").strip().lower() in ("1", "true", "yes", "on")
+COSYVOICE_TRITON_URL = os.environ.get("COSYVOICE_TRITON_URL", "").strip()
+COSYVOICE_TRITON_MODEL = (os.environ.get("COSYVOICE_TRITON_MODEL", "cosyvoice2") or "cosyvoice2").strip()
+COSYVOICE_TRITON_OFFLINE = os.environ.get("COSYVOICE_TRITON_OFFLINE", "0").strip().lower() in ("1", "true", "yes", "on")
+COSYVOICE_REF_TEXT_MODE = os.environ.get("COSYVOICE_REF_TEXT_MODE", "short").strip().lower()
+COSYVOICE_USE_CACHE = os.environ.get("COSYVOICE_USE_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
+COSYVOICE_CACHE_ALL_ON_STARTUP = os.environ.get("COSYVOICE_CACHE_ALL_ON_STARTUP", "0").strip().lower() in ("1", "true", "yes", "on")
+COSYVOICE_CACHE_WARMUP_TEXT = os.environ.get("COSYVOICE_CACHE_WARMUP_TEXT", "Hello.").strip()
+XTTS_BASE_URL = os.environ.get("XTTS_BASE_URL", "").strip().rstrip("/")
+F5_TTS_BASE_URL = os.environ.get("F5_TTS_BASE_URL", "").strip().rstrip("/")
+QWEN3_TTS_BASE_URL = os.environ.get("QWEN3_TTS_BASE_URL", "").strip().rstrip("/")
+XTTS_LANGUAGE = os.environ.get("XTTS_LANGUAGE", "en").strip()
+# Add a small silence pad to smooth starts/ends of video clips (video mode only).
+DITTO_SILENCE_PRE_MS = int(os.environ.get("DITTO_SILENCE_PRE_MS", "120"))
+DITTO_SILENCE_POST_MS = int(os.environ.get("DITTO_SILENCE_POST_MS", "180"))
+# Optional clip length caps (set env to enable). When unset, no hard max is enforced.
+FIRST_CLIP_MAX_CHARS = int(os.environ["FIRST_CLIP_MAX_CHARS"]) if os.environ.get("FIRST_CLIP_MAX_CHARS") else None
+CLIP_MAX_CHARS = int(os.environ["CLIP_MAX_CHARS"]) if os.environ.get("CLIP_MAX_CHARS") else None
+# Dynamic sentence grouping: if under min chars, append another sentence (up to max sentences).
+CLIP_MIN_CHARS = int(os.environ.get("CLIP_MIN_CHARS", "120"))
+AUDIO_CLIP_MIN_CHARS = int(os.environ.get("AUDIO_CLIP_MIN_CHARS", "120"))
+
+# TURN / ICE
+TURN_URL = os.environ.get("TURN_URL", "").strip()
+TURN_USERNAME = os.environ.get("TURN_USERNAME", "").strip()
+TURN_PASSWORD = os.environ.get("TURN_PASSWORD", "").strip()
+
+# Sentence boundary regexes
+SENTENCE_BOUNDARY_PERIOD_RE = re.compile(r"(?<!\d)\.(?:\s+|$)")
+# Audio: split on period/question mark only (not between digits).
+SENTENCE_BOUNDARY_AUDIO_RE = re.compile(r"(?<!\d)[.?](?:\s*|$)")
+SENTENCE_SPLIT_PERIOD_RE = re.compile(r"(?<!\d)\.\s+")
+SENTENCE_SPLIT_AUDIO_RE = re.compile(r"(?<!\d)[.?]\s*")
+
+# In-process CosyVoice Triton speaker cache tracking (voice_id -> cached)
+COSYVOICE_SPK_CACHE: set[str] = set()
 
 
-def _chunk_by_sentences(text: str, max_chars: int = TTS_MAX_CHARS) -> list[str]:
-    """Split text into chunks by sentence or newline, each chunk <= max_chars."""
+def _chunk_by_sentences(text: str, max_chars: int = TTS_MAX_CHARS, split_re: re.Pattern | None = None) -> list[str]:
+    """Split text into chunks by sentence boundaries (ignore numbered lists)."""
     if not (text or "").strip():
         return []
-    # Split on . ! ? followed by space/newline, or on double newline (paragraph), or single newline
     normalized = text.strip().replace("\r\n", "\n")
-    # Split on . ? followed by space or end of string, or on newlines
-    raw = re.split(r"(?<=[.?])(?:\s+|$)|(?:\s*\n\s*)+", normalized)
+    split_re = split_re or SENTENCE_SPLIT_PERIOD_RE
+    raw = re.split(split_re, normalized)
     chunks = []
     current = []
     current_len = 0
@@ -83,6 +165,247 @@ def _chunk_by_sentences(text: str, max_chars: int = TTS_MAX_CHARS) -> list[str]:
                 out.append(c[i : i + max_chars])
     return out
 
+
+def _trim_messages_for_audio(messages: list[dict], max_messages: int) -> list[dict]:
+    """Keep system + last N messages to reduce prompt size in audio mode."""
+    if max_messages <= 0:
+        return messages
+    if len(messages) <= 1 + max_messages:
+        return messages
+    system = messages[0]
+    tail = messages[-max_messages:]
+    return [system] + tail
+
+
+def _get_ice_servers() -> list:
+    servers = [RTCIceServer("stun:stun.l.google.com:19302")]
+    if TURN_URL and TURN_USERNAME and TURN_PASSWORD:
+        urls = [u.strip() for u in TURN_URL.split(",") if u.strip()]
+        if urls:
+            servers.append(RTCIceServer(urls=urls, username=TURN_USERNAME, credential=TURN_PASSWORD))
+    return servers
+
+
+def _pcm16_to_wav_bytes(samples: np.ndarray, sample_rate: int = 16000) -> bytes:
+    """Convert int16 mono PCM samples to WAV bytes."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(samples.tobytes())
+    return buf.getvalue()
+
+
+class _AudioVADBuffer:
+    """Simple energy-based VAD and chunker for low-latency audio capture.
+
+    Two-tier emission:
+      - Normal: silence >= silence_ms AND speech >= min_ms  (full sentences)
+      - Fallback: silence >= long_silence_ms AND speech >= noise_min_ms  (short words like "hey")
+    """
+    def __init__(self, sample_rate: int = 16000, rms_threshold: float = 0.006,
+                 silence_ms: int = 700, min_ms: int = 800,
+                 long_silence_ms: int = 1500, noise_min_ms: int = 400,
+                 max_ms: int = 8000):
+        self.sample_rate = sample_rate
+        self.rms_threshold = rms_threshold
+        self.silence_ms = silence_ms
+        self.min_ms = min_ms
+        self.long_silence_ms = long_silence_ms
+        self.noise_min_ms = noise_min_ms
+        self.max_ms = max_ms
+        self._buf = []
+        self._speech_ms = 0
+        self._silence_ms = 0
+
+    def _ms_from_samples(self, n: int) -> int:
+        return int((n / float(self.sample_rate)) * 1000)
+
+    def push(self, samples: np.ndarray) -> list[np.ndarray]:
+        """Push int16 mono samples. Returns list of completed utterances."""
+        if samples.size == 0:
+            return []
+        rms = float(np.sqrt(np.mean((samples.astype(np.float32) / 32768.0) ** 2)))
+        is_speech = rms >= self.rms_threshold
+        segs = []
+        ms = self._ms_from_samples(samples.size)
+
+        if is_speech:
+            self._speech_ms += ms
+            self._silence_ms = 0
+            self._buf.append(samples)
+            if self._speech_ms >= self.max_ms:
+                seg = np.concatenate(self._buf, axis=0)
+                self._reset()
+                segs.append(seg)
+        else:
+            if self._buf:
+                self._silence_ms += ms
+                normal = self._silence_ms >= self.silence_ms and self._speech_ms >= self.min_ms
+                fallback = self._silence_ms >= self.long_silence_ms and self._speech_ms >= self.noise_min_ms
+                if normal or fallback:
+                    seg = np.concatenate(self._buf, axis=0)
+                    self._reset()
+                    segs.append(seg)
+        return segs
+
+    def _reset(self):
+        self._buf = []
+        self._speech_ms = 0
+        self._silence_ms = 0
+
+
+class _OutgoingAudioTrack(MediaStreamTrack):
+    """Outgoing WebRTC audio track fed by float32 16k mono chunks."""
+    kind = "audio"
+
+    def __init__(self):
+        super().__init__()
+        self._queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=6000)
+        self._closed = False
+        self._pts = 0
+        self._resampler = AudioResampler(format="s16", layout="mono", rate=48000)
+        self._resampled_buffer: list[AudioFrame] = []
+        self._start_time = None
+        self._sample_buf = np.zeros(0, dtype=np.float32)
+        self._drop_count = 0
+        self._silence_count = 0
+        self._speaking = False
+        self._last_audio_ts = None
+        self._speaking_ended_at = 0.0
+
+    def put_f32_16k(self, data: bytes) -> None:
+        if self._closed or not data:
+            return
+        arr = np.frombuffer(data, dtype=np.float32)
+        if arr.size == 0:
+            return
+        self._last_audio_ts = time.monotonic()
+        if self._sample_buf.size:
+            arr = np.concatenate([self._sample_buf, arr])
+        frame_len = 320  # 20ms @ 16k
+        offset = 0
+        while offset + frame_len <= arr.size:
+            chunk = arr[offset : offset + frame_len]
+            offset += frame_len
+            frame = AudioFrame.from_ndarray(chunk.reshape(1, -1), format="flt", layout="mono")
+            frame.sample_rate = 16000
+            try:
+                if self._queue.full():
+                    self._drop_count += 1
+                    if self._drop_count % 50 == 0:
+                        log.warning("RTC audio: outbound queue full, dropped=%s", self._drop_count)
+                    self._queue.get_nowait()
+                self._queue.put_nowait(frame)
+            except Exception:
+                break
+        self._sample_buf = arr[offset:]
+
+    def flush(self) -> None:
+        """Pad and enqueue any leftover samples so tails don't get truncated."""
+        if self._closed:
+            return
+        if self._sample_buf.size == 0:
+            return
+        frame_len = 320  # 20ms @ 16k
+        pad = frame_len - self._sample_buf.size
+        if pad <= 0:
+            return
+        chunk = np.concatenate([self._sample_buf, np.zeros(pad, dtype=np.float32)])
+        self._sample_buf = np.zeros(0, dtype=np.float32)
+        frame = AudioFrame.from_ndarray(chunk.reshape(1, -1), format="flt", layout="mono")
+        frame.sample_rate = 16000
+        try:
+            if self._queue.full():
+                self._queue.get_nowait()
+            self._queue.put_nowait(frame)
+        except Exception:
+            pass
+
+    def set_speaking(self, is_speaking: bool) -> None:
+        self._speaking = is_speaking
+        if not is_speaking:
+            self._last_audio_ts = None
+            self._speaking_ended_at = time.monotonic()
+
+    async def recv(self) -> AudioFrame:
+        if self._closed:
+            raise Exception("Track closed")
+
+        if not self._resampled_buffer:
+            try:
+                # Allow longer waits while speaking to avoid "choppy" audio when TTS
+                # yields in bursts.
+                timeout = 2.0 if self._speaking else 0.02
+                frame = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+                resampled = self._resampler.resample(frame)
+                if not isinstance(resampled, list):
+                    resampled = [resampled]
+                for f in resampled:
+                    self._resampled_buffer.append(f)
+            except asyncio.TimeoutError:
+                if self._speaking and self._last_audio_ts:
+                    gap = time.monotonic() - self._last_audio_ts
+                    if gap < 2.5:
+                        # Wait a bit longer instead of injecting silence during short TTS stalls
+                        return await self.recv()
+                # 20ms silence @ 48k
+                self._silence_count += 1
+                if self._silence_count % 100 == 0:
+                    log.info("RTC audio: inserted silence frames=%s", self._silence_count)
+                silence = AudioFrame(format="s16", layout="mono", samples=960)
+                for plane in silence.planes:
+                    plane.update(b"\x00" * plane.buffer_size)
+                silence.sample_rate = 48000
+                self._resampled_buffer.append(silence)
+
+        f = self._resampled_buffer.pop(0)
+
+        if self._start_time is None:
+            self._start_time = time.monotonic()
+        expected_time = self._start_time + (self._pts / 48000.0)
+        now = time.monotonic()
+        if expected_time > now:
+            await asyncio.sleep(expected_time - now)
+
+        f.pts = self._pts
+        f.time_base = Fraction(1, 48000)
+        self._pts += f.samples
+        return f
+
+async def _stt_transcribe_wav(wav_bytes: bytes) -> str:
+    if not STT_BASE_URL:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{STT_BASE_URL}/transcribe",
+                files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return (data.get("text") or "").strip()
+    except Exception as e:
+        log.warning("STT error: %s", e)
+        return ""
+
+
+def _stt_transcribe_wav_sync(wav_bytes: bytes) -> str:
+    if not STT_BASE_URL:
+        return ""
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(
+                f"{STT_BASE_URL}/transcribe",
+                files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return (data.get("text") or "").strip()
+    except Exception as e:
+        log.warning("STT error (sync): %s", e)
+        return ""
 
 def _video_response(request: Request, path: Path, media_type: str = "video/mp4") -> Response:
     """Serve a video file with Range request support so browsers can stream/seek."""
@@ -175,6 +498,17 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="TwynBook API", version="0.1.0")
+
+
+@app.get("/api/webrtc/ice")
+def get_webrtc_ice():
+    """Expose ICE config for the frontend."""
+    servers = [{"urls": "stun:stun.l.google.com:19302"}]
+    if TURN_URL and TURN_USERNAME and TURN_PASSWORD:
+        urls = [u.strip() for u in TURN_URL.split(",") if u.strip()]
+        if urls:
+            servers.append({"urls": urls, "username": TURN_USERNAME, "credential": TURN_PASSWORD})
+    return {"iceServers": servers}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -201,7 +535,13 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OLLAMA_URL = (os.environ.get("OLLAMA_URL", "") or "").strip().rstrip("/")  # e.g. http://ollama:11434
 OLLAMA_MODEL = (os.environ.get("OLLAMA_MODEL", "") or "llama3.2:3b").strip() or "llama3.2:3b"
 CHATTERBOX_BASE_URL = (os.environ.get("CHATTERBOX_BASE_URL", "http://85.4.52.192:8000")).rstrip("/")
+STT_BASE_URL = (os.environ.get("STT_BASE_URL", "") or "").strip().rstrip("/")
 DITTO_API_URL = (os.environ.get("DITTO_API_URL", "http://localhost:8080")).rstrip("/")
+DITTO_API_URLS = [
+    u.strip().rstrip("/")
+    for u in (os.environ.get("DITTO_API_URLS", "") or "").split(",")
+    if u.strip()
+]
 
 # WebRTC media server (signaling + push) on same process at /webrtc; optional so app starts if aiortc/av fail
 MEDIA_SERVER_WS_URL = (os.environ.get("MEDIA_SERVER_WS_URL", "ws://localhost:8087/webrtc")).rstrip("/")
@@ -218,6 +558,56 @@ webrtc_managers = {}
 # Knowledge base: per-persona documents and embeddings (scoped by persona ownership)
 KB_DIR = DATA_DIR / "kb"
 KB_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ollama_warmup():
+    if not OLLAMA_URL:
+        return
+    url = f"{OLLAMA_URL}/v1/chat/completions"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Say hi."},
+        ],
+        "stream": False,
+    }
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(url, json=payload)
+            resp.raise_for_status()
+        log.info("Ollama warmup completed for model=%s", OLLAMA_MODEL)
+    except Exception as e:
+        log.warning("Ollama warmup failed for model=%s: %s", OLLAMA_MODEL, e)
+
+
+@app.on_event("startup")
+async def _startup_warmup():
+    if not OLLAMA_URL:
+        return
+    # Warm up in background so startup isn't blocked.
+    threading.Thread(target=_ollama_warmup, daemon=True).start()
+
+    # Cache CosyVoice speakers on startup (best effort, non-blocking)
+    if TTS_PROVIDER == "cosyvoice":
+        if COSYVOICE_USE_TRITON and COSYVOICE_USE_CACHE and COSYVOICE_CACHE_ALL_ON_STARTUP:
+            threading.Thread(target=lambda: _cosyvoice_cache_all_personas(), daemon=True).start()
+        elif not COSYVOICE_USE_TRITON:
+            def _cosyvoice_cache_all():
+                try:
+                    personas = load_personas()
+                    for p in personas:
+                        voice_wav_path = (p.get("voice_wav_path") or "").strip()
+                        voice_ref_text = (p.get("voice_ref_text") or "").strip()
+                        if not voice_wav_path or not Path(voice_wav_path).is_file():
+                            continue
+                        if not voice_ref_text:
+                            log.warning("CosyVoice cache skipped (missing voice_ref_text) persona_id=%s", p.get("id"))
+                            continue
+                        _cosyvoice_register_speaker(p.get("voice_id") or p["id"], str(voice_wav_path), voice_ref_text)
+                except Exception as e:
+                    log.warning("CosyVoice startup cache failed: %s", e)
+            threading.Thread(target=_cosyvoice_cache_all, daemon=True).start()
 RAG_EMBED_MODEL = "text-embedding-3-small"
 RAG_CHUNK_TOKENS = 500
 RAG_OVERLAP_TOKENS = 50
@@ -355,18 +745,53 @@ def get_rag_context(persona_id: str, user_id: str, query: str) -> str:
     return "\n\n".join(t for _, t in top)
 
 
-def _ditto_streaming_url() -> str:
-    """WebSocket base URL for Ditto streaming (same host/port as REST API, path /stream). From env or derived from DITTO_API_URL."""
-    url = os.environ.get("DITTO_STREAMING_URL", "").strip()
-    if url:
+def _to_ws_base(url: str) -> str:
+    if url.startswith("wss://") or url.startswith("ws://"):
         return url.rstrip("/")
-    # Derive: same host and port as REST API, only change scheme (e.g. http://ditto-api:8080 -> ws://ditto-api:8080)
-    base = DITTO_API_URL
-    if base.startswith("https://"):
-        base = "wss://" + base[8:]
-    elif base.startswith("http://"):
-        base = "ws://" + base[7:]
-    return base.rstrip("/")
+    if url.startswith("https://"):
+        return "wss://" + url[8:].rstrip("/")
+    if url.startswith("http://"):
+        return "ws://" + url[7:].rstrip("/")
+    return url.rstrip("/")
+
+
+def _to_http_base(url: str) -> str:
+    if url.startswith("http://") or url.startswith("https://"):
+        return url.rstrip("/")
+    if url.startswith("ws://"):
+        return "http://" + url[5:].rstrip("/")
+    if url.startswith("wss://"):
+        return "https://" + url[6:].rstrip("/")
+    return url.rstrip("/")
+
+
+def _ditto_streaming_bases() -> list[str]:
+    """WebSocket base URLs for Ditto streaming. Honors DITTO_STREAMING_URL or DITTO_API_URLS."""
+    stream_override = os.environ.get("DITTO_STREAMING_URL", "").strip()
+    if stream_override:
+        return [_to_ws_base(stream_override)]
+    bases = DITTO_API_URLS[:] if DITTO_API_URLS else [DITTO_API_URL]
+    return [_to_ws_base(b) for b in bases]
+
+
+def _ditto_http_bases() -> list[str]:
+    """HTTP base URLs for Ditto /generate. Uses DITTO_API_URLS or DITTO_API_URL."""
+    bases = DITTO_API_URLS[:] if DITTO_API_URLS else [DITTO_API_URL]
+    return [_to_http_base(b) for b in bases]
+
+
+_DITTO_WS_BASES = _ditto_streaming_bases()
+_DITTO_WS_LOCKS = [asyncio.Lock() for _ in _DITTO_WS_BASES]
+_DITTO_RR = itertools.count()
+_DITTO_HTTP_BASES = _ditto_http_bases()
+
+
+def _pick_ditto_worker() -> tuple[int, str]:
+    """Round-robin across Ditto WS bases."""
+    if not _DITTO_WS_BASES:
+        return 0, _to_ws_base(DITTO_API_URL)
+    idx = next(_DITTO_RR) % len(_DITTO_WS_BASES)
+    return idx, _DITTO_WS_BASES[idx]
 
 # In-memory creation status so frontend can show "creating" vs "failed" (persona_id -> "creating" or {"status": "failed", "error": "..."})
 creation_status: dict = {}
@@ -389,6 +814,15 @@ def get_persona(persona_id: str, user_id: str | None = None) -> dict | None:
         if p.get("id") == persona_id:
             if user_id is not None and p.get("user_id") != user_id:
                 return None
+            return p
+    return None
+
+
+def get_persona_by_share_id(share_id: str) -> dict | None:
+    if not share_id:
+        return None
+    for p in load_personas():
+        if p.get("share_id") == share_id:
             return p
     return None
 
@@ -823,6 +1257,10 @@ async def create_avatar_listing(
     content_type = (voice.content_type or "").lower()
     if "wav" not in content_type:
         voice_bytes = _audio_to_wav(voice_bytes, content_type)
+    try:
+        voice_bytes = _trim_voice_wav(voice_bytes, max_seconds=MAX_VOICE_SECONDS, min_seconds=MIN_VOICE_SECONDS)
+    except Exception as e:
+        raise HTTPException(400, str(e)) from e
     # Use a temp name for Ditto/Chatterbox (avatar name is for marketplace only)
     ditto_name = name or "Avatar"
     try:
@@ -832,10 +1270,30 @@ async def create_avatar_listing(
         log.exception("Avatar listing: Ditto failed: %s", e)
         raise HTTPException(502, f"Ditto failed: {e}") from e
     try:
-        voice_id = _chatterbox_clone_voice(voice_bytes, ditto_name)
+        if TTS_PROVIDER == "cosyvoice":
+            voice_id = image_id
+            log.info("Avatar listing: cosyvoice voice OK image_id=%s", image_id)
+        elif TTS_PROVIDER == "qwen3":
+            voice_id = TTS_PROVIDER
+            log.info("Avatar listing: qwen3 voice OK image_id=%s", image_id)
+        else:
+            voice_id = _chatterbox_clone_voice(voice_bytes, ditto_name)
     except Exception as e:
-        log.exception("Avatar listing: Chatterbox failed: %s", e)
+        log.exception("Avatar listing: Voice clone failed: %s", e)
         raise HTTPException(502, f"Voice clone failed: {e}") from e
+    voice_wav_path = DATA_DIR / f"listing_voice_{image_id}.wav"
+    voice_ref_text = None
+    try:
+        voice_wav_path.write_bytes(voice_bytes)
+        voice_ref_text = _stt_transcribe_wav_sync(voice_bytes) or None
+    except Exception:
+        voice_wav_path = None
+    if TTS_PROVIDER == "cosyvoice" and voice_wav_path:
+        if COSYVOICE_USE_TRITON and COSYVOICE_USE_CACHE:
+            _cosyvoice_cache_speaker_triton(str(voice_id), str(voice_wav_path), voice_ref_text)
+        else:
+            if voice_ref_text:
+                _cosyvoice_register_speaker(voice_id, str(voice_wav_path), voice_ref_text)
     listing = {
         "id": uuid.uuid4().hex,
         "name": name,
@@ -847,6 +1305,8 @@ async def create_avatar_listing(
         "role_prompt": "",
         "image_id": image_id,
         "voice_id": voice_id,
+        "voice_wav_path": str(voice_wav_path) if voice_wav_path else None,
+        "voice_ref_text": voice_ref_text,
         "created_by": current_user["id"],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -933,6 +1393,86 @@ def get_persona_endpoint(persona_id: str, current_user: dict = Depends(get_curre
     if not p:
         raise HTTPException(404, "Persona not found")
     return p
+
+
+@app.post("/api/personas/{persona_id}/share")
+def create_share_link(persona_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """Create or return a shareable link for a persona owned by the user."""
+    p = get_persona(persona_id, current_user["id"])
+    if not p:
+        raise HTTPException(404, "Persona not found")
+    if not p.get("share_id"):
+        p["share_id"] = secrets.token_urlsafe(12)
+        personas = load_personas()
+        for i, x in enumerate(personas):
+            if x.get("id") == persona_id:
+                personas[i] = p
+                break
+        save_personas(personas)
+    base = str(request.base_url).rstrip("/")
+    return {"share_id": p["share_id"], "url": f"{base}/p/{p['share_id']}"}
+
+
+@app.get("/api/share/{share_id}")
+def get_shared_persona(share_id: str):
+    """Public: fetch limited persona info by share_id."""
+    p = get_persona_by_share_id(share_id)
+    if not p:
+        raise HTTPException(404, "Shared persona not found")
+    creator = get_user_by_id(p.get("user_id", "")) or {}
+    creator_name = (creator.get("name") or "").strip()
+    if not creator_name:
+        email = (creator.get("email") or "").strip()
+        if "@" in email:
+            creator_name = email.split("@", 1)[0]
+        else:
+            creator_name = "TwynBook user"
+    return {
+        "share_id": share_id,
+        "persona_id": p.get("id"),
+        "name": p.get("name", ""),
+        "system_prompt": p.get("system_prompt", ""),
+        "image_id": p.get("image_id", ""),
+        "preview_url": p.get("preview_url", ""),
+        "creator_name": creator_name,
+    }
+
+
+@app.get("/api/share/{share_id}/preview")
+def get_shared_preview(share_id: str):
+    """Public: proxy persona preview by share_id."""
+    p = get_persona_by_share_id(share_id)
+    if not p:
+        raise HTTPException(404, "Shared persona not found")
+    image_id = p.get("image_id")
+    if not image_id:
+        raise HTTPException(404, "No image_id")
+    url = f"{DITTO_API_URL}/personas/{image_id}/preview"
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            r = client.get(url)
+            r.raise_for_status()
+            return Response(content=r.content, media_type=r.headers.get("content-type", "image/png"))
+    except (httpx.ReadTimeout, httpx.ConnectTimeout):
+        raise HTTPException(504, "Preview request timed out")
+    except httpx.ConnectError:
+        raise HTTPException(502, "Ditto service unreachable")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(404, "Preview not available")
+        raise HTTPException(502, f"Ditto error: {e.response.text}")
+
+
+@app.get("/api/share/{share_id}/idle-video")
+def get_shared_idle_video(share_id: str, request: Request):
+    """Public: serve idle video for a shared persona."""
+    p = get_persona_by_share_id(share_id)
+    if not p:
+        raise HTTPException(404, "Shared persona not found")
+    path = p.get("idle_video_path")
+    if not path or not Path(path).is_file():
+        raise HTTPException(404, "Idle video not found")
+    return _video_response(request, Path(path), "video/mp4")
 
 
 @app.get("/api/marketplace/{listing_id}/preview")
@@ -1038,6 +1578,59 @@ def update_persona(persona_id: str, body: PersonaUpdate, current_user: dict = De
             break
     save_personas(personas)
     return p
+
+
+@app.post("/api/personas/{persona_id}/voice-wav")
+async def upload_persona_voice_wav(
+    persona_id: str,
+    voice: UploadFile = File(...),
+    voice_ref_text: str = Form(""),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upload/replace the persona voice WAV for XTTS (does not change chatterbox voice_id)."""
+    p = get_persona(persona_id, current_user["id"])
+    if not p:
+        raise HTTPException(404, "Persona not found")
+    voice_bytes = await voice.read()
+    if not voice_bytes:
+        raise HTTPException(400, "Empty voice file")
+    content_type = (voice.content_type or "").lower()
+    if "wav" not in content_type:
+        voice_bytes = _audio_to_wav(voice_bytes, content_type)
+    try:
+        voice_bytes = _trim_voice_wav(voice_bytes, max_seconds=MAX_VOICE_SECONDS, min_seconds=MIN_VOICE_SECONDS)
+    except Exception as e:
+        raise HTTPException(400, str(e)) from e
+    path = DATA_DIR / f"voice_{persona_id}.wav"
+    path.write_bytes(voice_bytes)
+    voice_ref_text = (voice_ref_text or "").strip() or (_stt_transcribe_wav_sync(voice_bytes) or None)
+    if TTS_PROVIDER == "cosyvoice":
+        try:
+            voice_ref_text = _stt_transcribe_wav_sync(voice_bytes) or None
+        except Exception as e:
+            voice_ref_text = None
+            log.warning("CosyVoice voice_ref_text STT failed: %s", e)
+        if not voice_ref_text:
+            raise HTTPException(400, "Voice reference transcription failed. Please re-record in a quiet environment and read the script clearly.")
+    personas = load_personas()
+    for i, item in enumerate(personas):
+        if item.get("id") == persona_id:
+            personas[i]["voice_wav_path"] = str(path)
+            personas[i]["voice_ref_text"] = voice_ref_text
+            p = personas[i]
+            break
+    save_personas(personas)
+    try:
+        _ensure_greeting_cached(p)
+    except Exception:
+        pass
+    if TTS_PROVIDER == "cosyvoice" and p.get("voice_wav_path"):
+        if COSYVOICE_USE_TRITON and COSYVOICE_USE_CACHE:
+            _cosyvoice_cache_speaker_triton(str(persona_id), str(p["voice_wav_path"]), p.get("voice_ref_text"))
+        else:
+            if p.get("voice_ref_text"):
+                _cosyvoice_register_speaker(str(persona_id), str(p["voice_wav_path"]), p.get("voice_ref_text"))
+    return {"ok": True, "voice_wav_path": str(path), "voice_ref_text": voice_ref_text}
 
 
 @app.post("/api/personas/{persona_id}/publish")
@@ -1256,6 +1849,61 @@ def _audio_to_wav_ffmpeg(data: bytes, ext: str) -> bytes:
                     pass
 
 
+def _trim_voice_wav(wav_bytes: bytes, max_seconds: float = 20.0, min_seconds: float = 15.0) -> bytes:
+    """Trim WAV to at most max_seconds, validate min_seconds and speech ratio."""
+    try:
+        with io.BytesIO(wav_bytes) as bio:
+            with wave.open(bio, "rb") as r:
+                params = r.getparams()
+                duration = params.nframes / params.framerate if params.framerate else 0.0
+                if duration < min_seconds:
+                    raise ValueError(f"Voice sample too short: {duration:.1f}s (min {min_seconds}s)")
+                max_frames = int(params.framerate * max_seconds)
+                if r.getnframes() <= max_frames:
+                    original = wav_bytes
+                else:
+                    frames = r.readframes(max_frames)
+                    out = io.BytesIO()
+                    with wave.open(out, "wb") as w:
+                        w.setparams(params)
+                        w.writeframes(frames)
+                    original = out.getvalue()
+                    log.info("Voice WAV trimmed: %.1fs -> %.1fs (%d -> %d bytes)", params.nframes / params.framerate, max_seconds, len(wav_bytes), len(original))
+
+        # Remove long silences and estimate speech ratio.
+        cleaned = original
+        speech_ratio = 1.0
+        try:
+            from pydub import AudioSegment, silence
+            seg = AudioSegment.from_file(io.BytesIO(original), format="wav")
+            nonsilent = silence.detect_nonsilent(seg, min_silence_len=200, silence_thresh=seg.dBFS - 16)
+            if nonsilent:
+                total_nonsilent = sum(end - start for start, end in nonsilent)
+                speech_ratio = total_nonsilent / max(1, len(seg))
+                # Concatenate nonsilent chunks to remove internal long pauses.
+                parts = [seg[start:end] for start, end in nonsilent]
+                seg = sum(parts)
+                buf = io.BytesIO()
+                seg.export(buf, format="wav")
+                cleaned = buf.getvalue()
+        except ImportError:
+            # Fallback: no silence detection available.
+            speech_ratio = 1.0
+            cleaned = original
+        except Exception as e:
+            log.warning("Voice WAV silence trim failed, using original: %s", e)
+            cleaned = original
+            speech_ratio = 1.0
+
+        if speech_ratio < MIN_SPEECH_RATIO:
+            raise ValueError(f"Voice sample too silent: speech ratio {speech_ratio:.2f} (min {MIN_SPEECH_RATIO})")
+
+        return cleaned
+    except Exception as e:
+        log.warning("_trim_voice_wav failed: %s", e)
+        raise
+
+
 def _audio_to_wav(data: bytes, content_type: str) -> bytes:
     """Convert browser-recorded audio (e.g. webm) to WAV for Chatterbox/Ditto."""
     content_type = (content_type or "").lower()
@@ -1278,6 +1926,1281 @@ def _audio_to_wav(data: bytes, content_type: str) -> bytes:
     except (FileNotFoundError, subprocess.CalledProcessError, OSError) as e:
         log.exception("ffmpeg conversion failed")
         raise HTTPException(400, "Could not convert voice to WAV. Rebuild the Docker image so the container includes ffmpeg (and optionally pydub).") from e
+
+
+def _start_tts_stream_to_audio_queue(voice_id: str, text: str, q: "asyncio.Queue[bytes | None]", loop: asyncio.AbstractEventLoop) -> None:
+    """Stream TTS audio into ffmpeg and push 16kHz float32 chunks into an asyncio queue."""
+    url = f"{CHATTERBOX_BASE_URL}/api/tts/stream"
+    params = {
+        "voice_id": voice_id,
+        "text": (text or "").strip()[:TTS_MAX_CHARS],
+        "format": "wav",
+    }
+    gain = float(os.environ.get("AUDIO_GAIN", "1.0") or 1.0)
+    t0 = time.monotonic()
+    # ffmpeg: wav (stdin) -> raw float32 16k mono (stdout)
+    proc = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    def _put(item: bytes | None):
+        fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
+        fut.result()
+
+    total_out = 0
+    total_in = 0
+    status_code = None
+    content_type = None
+
+    def _silence_f32_bytes(ms: int, sr: int = 16000) -> bytes:
+        if not ms or ms <= 0:
+            return b""
+        import numpy as np
+        n = int(sr * (ms / 1000.0))
+        if n <= 0:
+            return b""
+        return (np.zeros(n, dtype=np.float32)).tobytes()
+
+    def _read_stdout():
+        try:
+            while True:
+                data = proc.stdout.read(65536)
+                if not data:
+                    break
+                nonlocal total_out
+                total_out += len(data)
+                if gain != 1.0:
+                    try:
+                        arr = np.frombuffer(data, dtype=np.float32)
+                        if arr.size:
+                            arr = np.clip(arr * gain, -1.0, 1.0)
+                            data = arr.astype(np.float32, copy=False).tobytes()
+                    except Exception:
+                        pass
+                _put(data)
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+
+    try:
+        pre = _silence_f32_bytes(DITTO_SILENCE_PRE_MS)
+        if pre:
+            _put(pre)
+        with httpx.Client(timeout=60.0) as client:
+            with client.stream("GET", url, params=params) as r:
+                try:
+                    r.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    body = ""
+                    try:
+                        body = (e.response.text or "")[:800]
+                    except Exception:
+                        pass
+                    log.error(
+                        "Chatterbox TTS failed HTTP %s voice_id=%s text_len=%s body=%s",
+                        e.response.status_code,
+                        voice_id,
+                        len((text or "").strip()),
+                        body or "(no body)",
+                    )
+                    raise
+                status_code = r.status_code
+                content_type = r.headers.get("content-type")
+                for chunk in r.iter_bytes(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    total_in += len(chunk)
+                    if proc.stdin:
+                        proc.stdin.write(chunk)
+        if proc.stdin:
+            proc.stdin.close()
+        reader.join(timeout=5)
+        proc.wait(timeout=10)
+    finally:
+        try:
+            err = proc.stderr.read() if proc.stderr else b""
+            if err:
+                log.warning("TTS ffmpeg stderr: %s", err.decode("utf-8", "replace"))
+        except Exception:
+            pass
+        audio_seconds = total_out / float(16000 * 4) if total_out else 0.0
+        total_s = time.monotonic() - t0
+        rtf = (total_s / audio_seconds) if audio_seconds > 0 else None
+        rtf_str = f"{rtf:.2f}" if rtf is not None else "n/a"
+        log.info(
+            "TTS stream stats: status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s audio_s=%.2f total_s=%.2f rtf=%s",
+            status_code, content_type, total_in, total_out, len((text or "").strip()),
+            audio_seconds, total_s, rtf_str,
+        )
+        # If streaming returned nothing, fallback to non-stream TTS (download/wav)
+        if total_out == 0:
+            try:
+                log.warning("TTS stream produced no audio; falling back to download/wav")
+                wav = _chatterbox_tts_wav(voice_id, text)
+                f32 = _wav_to_16k_float32_mono(wav)
+                if f32:
+                    _put(f32)
+            except Exception:
+                pass
+        post = _silence_f32_bytes(DITTO_SILENCE_POST_MS)
+        if post:
+            _put(post)
+        _put(None)
+
+
+def _start_xtts_stream_to_audio_queue(voice_wav_path: str, text: str, q: "asyncio.Queue[bytes | None]", loop: asyncio.AbstractEventLoop) -> None:
+    """Stream XTTS raw float32 audio and resample to 16k mono f32le."""
+    if not XTTS_BASE_URL:
+        return
+    path = Path(voice_wav_path)
+    if not path.is_file():
+        return
+
+    def _put(item: bytes | None):
+        fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
+        fut.result()
+
+    # Default XTTS sample rate is 24k; override if header says otherwise.
+    proc = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    total_out = 0
+    total_in = 0
+    status_code = None
+    content_type = None
+    sr = 24000
+
+    def _read_stdout():
+        try:
+            while True:
+                data = proc.stdout.read(65536)
+                if not data:
+                    break
+                nonlocal total_out
+                total_out += len(data)
+                _put(data)
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            with open(path, "rb") as f:
+                files = {"speaker_wav": (path.name, f, "audio/wav")}
+                data = {"text": (text or "").strip()[:TTS_MAX_CHARS], "language": XTTS_LANGUAGE}
+                with client.stream("POST", f"{XTTS_BASE_URL}/api/tts/stream_raw", data=data, files=files) as r:
+                    status_code = r.status_code
+                    content_type = r.headers.get("content-type")
+                    sr_hdr = r.headers.get("x-sample-rate", "")
+                    try:
+                        if sr_hdr:
+                            sr = int(sr_hdr)
+                    except Exception:
+                        sr = 24000
+                    # If sample rate differs, restart ffmpeg with correct input rate.
+                    if sr != 24000:
+                        try:
+                            if proc.stdin:
+                                proc.stdin.close()
+                        except Exception:
+                            pass
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        proc = subprocess.Popen(
+                            ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        )
+                    r.raise_for_status()
+                    for chunk in r.iter_bytes(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        total_in += len(chunk)
+                        if proc.stdin:
+                            proc.stdin.write(chunk)
+    except Exception as e:
+        log.warning("XTTS stream error: %s", e)
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        reader.join(timeout=5)
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        _put(None)
+
+    log.info(
+        "XTTS stream stats: status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s",
+        status_code, content_type, total_in, total_out, len((text or "").strip()),
+    )
+
+
+def _start_f5_stream_to_audio_queue(
+    voice_wav_path: str,
+    voice_ref_text: str | None,
+    text: str,
+    q: "asyncio.Queue[bytes | None]",
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Stream F5-TTS raw float32 audio and resample to 16k mono f32le."""
+    if not F5_TTS_BASE_URL:
+        return
+    path = Path(voice_wav_path)
+    if not path.is_file():
+        return
+
+    def _put(item: bytes | None):
+        fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
+        fut.result()
+
+    proc = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    total_out = 0
+    total_in = 0
+    status_code = None
+    content_type = None
+    sr = 24000
+
+    def _read_stdout():
+        try:
+            while True:
+                data = proc.stdout.read(65536)
+                if not data:
+                    break
+                nonlocal total_out
+                total_out += len(data)
+                _put(data)
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            with open(path, "rb") as f:
+                files = {"speaker_wav": (path.name, f, "audio/wav")}
+                data = {
+                    "text": (text or "").strip()[:TTS_MAX_CHARS],
+                    "ref_text": (voice_ref_text or "").strip(),
+                }
+                with client.stream("POST", f"{F5_TTS_BASE_URL}/api/tts/stream_raw", data=data, files=files) as r:
+                    status_code = r.status_code
+                    content_type = r.headers.get("content-type")
+                    sr_hdr = r.headers.get("x-sample-rate", "")
+                    try:
+                        if sr_hdr:
+                            sr = int(sr_hdr)
+                    except Exception:
+                        sr = 24000
+                    if sr != 24000:
+                        try:
+                            if proc.stdin:
+                                proc.stdin.close()
+                        except Exception:
+                            pass
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        proc = subprocess.Popen(
+                            ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        )
+                    r.raise_for_status()
+                    for chunk in r.iter_bytes(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        total_in += len(chunk)
+                        if proc.stdin:
+                            proc.stdin.write(chunk)
+    except Exception as e:
+        log.warning("F5-TTS stream error: %s", e)
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        reader.join(timeout=5)
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        _put(None)
+
+    log.info(
+        "F5-TTS stream stats: status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s",
+        status_code, content_type, total_in, total_out, len((text or "").strip()),
+    )
+
+
+def _start_qwen3_stream_to_audio_queue(
+    voice_wav_path: str,
+    voice_ref_text: str | None,
+    text: str,
+    q: "asyncio.Queue[bytes | None]",
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Stream Qwen3-TTS raw float32 audio and resample to 16k mono f32le."""
+    if not QWEN3_TTS_BASE_URL:
+        return
+    path = Path(voice_wav_path)
+    if not path.is_file():
+        return
+    t0 = time.monotonic()
+
+    def _put(item: bytes | None):
+        fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
+        fut.result()
+
+    proc = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    total_out = 0
+    total_in = 0
+    status_code = None
+    content_type = None
+    sr = 24000
+    first_chunk_at = None
+
+    def _read_stdout():
+        try:
+            while True:
+                data = proc.stdout.read(65536)
+                if not data:
+                    break
+                nonlocal total_out
+                total_out += len(data)
+                _put(data)
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            with open(path, "rb") as f:
+                files = {"speaker_wav": (path.name, f, "audio/wav")}
+                data = {
+                    "text": (text or "").strip()[:TTS_MAX_CHARS],
+                    "ref_text": (voice_ref_text or "").strip() or (text or "").strip()[:TTS_MAX_CHARS],
+                    "language": "English",
+                }
+                with client.stream("POST", f"{QWEN3_TTS_BASE_URL}/api/tts/stream_raw", data=data, files=files) as r:
+                    status_code = r.status_code
+                    content_type = r.headers.get("content-type")
+                    sr_hdr = r.headers.get("x-sample-rate", "")
+                    try:
+                        if sr_hdr:
+                            sr = int(sr_hdr)
+                    except Exception:
+                        sr = 24000
+                    if sr != 24000:
+                        try:
+                            if proc.stdin:
+                                proc.stdin.close()
+                        except Exception:
+                            pass
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        proc = subprocess.Popen(
+                            ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        )
+                    r.raise_for_status()
+                    for chunk in r.iter_bytes(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        if first_chunk_at is None:
+                            first_chunk_at = time.monotonic()
+                            log.info("Qwen3-TTS first_chunk at +%.2fs", first_chunk_at - t0)
+                        total_in += len(chunk)
+                        if proc.stdin:
+                            proc.stdin.write(chunk)
+    except Exception as e:
+        log.warning("Qwen3-TTS stream error: %s", e)
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        reader.join(timeout=5)
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        _put(None)
+
+    log.info(
+        "Qwen3-TTS stream stats: status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s",
+        status_code, content_type, total_in, total_out, len((text or "").strip()),
+    )
+    log.info("Qwen3-TTS stream done total=+%.2fs", time.monotonic() - t0)
+
+
+def _resample_to_f32_16k(audio: np.ndarray, sr_in: int) -> bytes:
+    """Resample audio to 16 kHz and return normalized float32 bytes."""
+    from scipy.signal import resample
+
+    # Normalize if int16
+    if audio.dtype == np.int16:
+        audio = audio.astype(np.float32) / 32768.0
+    elif audio.dtype != np.float32:
+        audio = audio.astype(np.float32)
+
+    if sr_in != 16000:
+        n_out = int(round(len(audio) * 16000 / sr_in))
+        audio = resample(audio, n_out).astype(np.float32)
+    return audio.astype(np.float32, copy=False).tobytes()
+
+
+def _start_cosyvoice_triton_to_audio_queue(
+    voice_id: str | None,
+    voice_wav_path: str,
+    voice_ref_text: str | None,
+    text: str,
+    q: "asyncio.Queue[bytes | None]",
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Call Triton gRPC streaming for CosyVoice2 and stream f32le 16k audio to queue."""
+    if not COSYVOICE_TRITON_URL:
+        return
+    path = Path(voice_wav_path)
+    if not path.is_file():
+        return
+
+    def _put(item: bytes | None):
+        nonlocal first_chunk_at
+        if item and first_chunk_at is None:
+            first_chunk_at = time.monotonic()
+            log.info("CosyVoice Triton: first_audio_chunk at +%.2fs", first_chunk_at - t0)
+        fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
+        fut.result()
+
+    use_ref = True
+    if COSYVOICE_USE_CACHE and voice_id:
+        use_ref = voice_id not in COSYVOICE_SPK_CACHE
+    if COSYVOICE_USE_CACHE and voice_id:
+        log.info("CosyVoice Triton: cache %s for spk_id=%s", "MISS" if use_ref else "HIT", voice_id)
+
+    ref_f32 = None
+    ref_text = ""
+    if use_ref:
+        try:
+            with open(path, "rb") as f:
+                wav_bytes = f.read()
+        except OSError:
+            return
+
+        # Triton expects 16k float32 mono reference audio.
+        try:
+            ref_f32 = np.frombuffer(_wav_to_16k_float32_mono(wav_bytes), dtype=np.float32)
+        except Exception as e:
+            log.warning("CosyVoice Triton: ref wav load failed: %s", e)
+            return
+
+        ref_text = (voice_ref_text or "").strip()
+        if not ref_text:
+            try:
+                ref_text = _stt_transcribe_wav_sync(wav_bytes) or ""
+                if ref_text:
+                    log.info("CosyVoice Triton: derived ref_text from STT (%d chars)", len(ref_text))
+            except Exception as e:
+                log.warning("CosyVoice Triton: STT ref_text failed: %s", e)
+        # On cache MISS we must provide a real prompt text to build a good speaker cache.
+        # We keep it short to reduce leakage.
+        if COSYVOICE_REF_TEXT_MODE in ("none", "off", "false", "0"):
+            ref_text = ""
+        elif COSYVOICE_REF_TEXT_MODE in ("short", "first"):
+            # Keep a short prompt to avoid leakage into outputs.
+            # Use first sentence or first 80 chars.
+            m = re.split(r"(?<=[.!?])\\s+", ref_text) if ref_text else []
+            ref_text = (m[0] if m else ref_text)[:80]
+        if COSYVOICE_PROMPT_MAX_CHARS > 0:
+            ref_text = ref_text[:COSYVOICE_PROMPT_MAX_CHARS]
+
+    import tritonclient.grpc as grpcclient
+    from tritonclient.grpc import InferInput, InferRequestedOutput
+
+    server = COSYVOICE_TRITON_URL
+    if server.startswith("http://"):
+        server = server[len("http://") :]
+    if server.startswith("https://"):
+        server = server[len("https://") :]
+
+    out_bytes_total = 0
+    done = threading.Event()
+    t0 = time.monotonic()
+    first_chunk_at: float | None = None
+
+    try:
+        client = grpcclient.InferenceServerClient(server, verbose=False)
+        log.info(
+            "CosyVoice Triton: %s request to %s model=%s text_len=%s",
+            "offline" if COSYVOICE_TRITON_OFFLINE else "streaming",
+            server,
+            COSYVOICE_TRITON_MODEL,
+            len((text or "").strip()),
+        )
+
+        inputs = []
+        if use_ref and ref_f32 is not None:
+            i_ref = InferInput("reference_wav", [1, ref_f32.shape[0]], "FP32")
+            i_ref.set_data_from_numpy(ref_f32.reshape(1, -1))
+            inputs.append(i_ref)
+
+            i_len = InferInput("reference_wav_len", [1, 1], "INT32")
+            i_len.set_data_from_numpy(np.array([[int(ref_f32.shape[0])]], dtype=np.int32))
+            inputs.append(i_len)
+
+            i_ref_text = InferInput("reference_text", [1, 1], "BYTES")
+            i_ref_text.set_data_from_numpy(np.array([[ref_text.encode("utf-8")]], dtype=object))
+            inputs.append(i_ref_text)
+
+        # Only send speaker_id on cache HIT to avoid confusing Triton on first-time reference runs.
+        if COSYVOICE_USE_CACHE and voice_id and not use_ref:
+            i_spk = InferInput("speaker_id", [1, 1], "BYTES")
+            i_spk.set_data_from_numpy(np.array([[str(voice_id).encode("utf-8")]], dtype=object))
+            inputs.append(i_spk)
+
+        target_text = (text or "").strip()[:TTS_MAX_CHARS]
+        i_tgt_text = InferInput("target_text", [1, 1], "BYTES")
+        i_tgt_text.set_data_from_numpy(np.array([[target_text.encode("utf-8")]], dtype=object))
+        inputs.append(i_tgt_text)
+
+        outputs = [InferRequestedOutput("waveform")]
+
+        if COSYVOICE_TRITON_OFFLINE:
+            result = client.infer(
+                model_name=COSYVOICE_TRITON_MODEL,
+                inputs=inputs,
+                outputs=outputs,
+            )
+            log.info("CosyVoice Triton offline: audio_shape=%s dtype=%s min=%.3f max=%.3f", audio.shape, audio.dtype, np.min(audio) if audio.size else 0, np.max(audio) if audio.size else 0)
+            audio = audio.reshape(-1)
+            out_bytes = _resample_to_f32_16k(audio, 24000)
+            out_bytes_total += len(out_bytes)
+            chunk = 65536
+            for i in range(0, len(out_bytes), chunk):
+                _put(out_bytes[i : i + chunk])
+            _put(None)
+            log.info(
+                "CosyVoice Triton offline stats: in_ref_samples=%s out_bytes=%s text_len=%s total_s=%.2f",
+                ref_f32.shape[0] if ref_f32 is not None else 0, out_bytes_total, len((text or "").strip()), time.monotonic() - t0,
+            )
+            if COSYVOICE_USE_CACHE and use_ref and voice_id:
+                COSYVOICE_SPK_CACHE.add(str(voice_id))
+            done.set()
+            return
+
+        def _cb(result, error):
+            nonlocal out_bytes_total
+            if error:
+                log.warning("CosyVoice Triton stream error: %s", error)
+                done.set()
+                return
+            try:
+                params = result.get_response().parameters
+                final = bool(params.get("triton_final_response").bool_param) if params else False
+            except Exception:
+                final = False
+            try:
+                audio = result.as_numpy("waveform")
+                if audio is not None:
+                    if out_bytes_total == 0:
+                        log.info("CosyVoice Triton stream: first_chunk_shape=%s dtype=%s min=%.3f max=%.3f", audio.shape, audio.dtype, np.min(audio) if audio.size else 0, np.max(audio) if audio.size else 0)
+                    audio = audio.reshape(-1)
+                    out_bytes = _resample_to_f32_16k(audio, 24000)
+                    out_bytes_total += len(out_bytes)
+                    chunk = 65536
+                    for i in range(0, len(out_bytes), chunk):
+                        _put(out_bytes[i : i + chunk])
+            except Exception as e:
+                if final:
+                    log.warning("CosyVoice Triton final response had no waveform: %s", e)
+                    done.set()
+                    return
+                log.warning("CosyVoice Triton response parse error: %s", e)
+                done.set()
+                return
+
+            if final:
+                done.set()
+
+        log.info("CosyVoice Triton: start_stream")
+        client.start_stream(callback=_cb, stream_timeout=60)
+        log.info("CosyVoice Triton: async_stream_infer")
+        client.async_stream_infer(
+            model_name=COSYVOICE_TRITON_MODEL,
+            inputs=inputs,
+            outputs=outputs,
+            enable_empty_final_response=True,
+        )
+        done.wait(timeout=60)
+        log.info("CosyVoice Triton: done_wait finished (set=%s)", done.is_set())
+        client.stop_stream()
+
+        _put(None)
+        log.info(
+            "CosyVoice Triton stats: in_ref_samples=%s out_bytes=%s text_len=%s total_s=%.2f",
+            ref_f32.shape[0] if ref_f32 is not None else 0, out_bytes_total, len((text or "").strip()), time.monotonic() - t0,
+        )
+        if COSYVOICE_USE_CACHE and use_ref and voice_id:
+            COSYVOICE_SPK_CACHE.add(str(voice_id))
+    except Exception as e:
+        log.warning("CosyVoice Triton infer error: %s", e)
+        return
+    finally:
+        if not done.is_set():
+            log.warning("CosyVoice Triton: timed out waiting for final response after %.2fs", time.monotonic() - t0)
+
+
+def _start_cosyvoice_stream_to_audio_queue(
+    voice_wav_path: str,
+    voice_ref_text: str | None,
+    text: str,
+    spk_id: str | None,
+    q: "asyncio.Queue[bytes | None]",
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Stream CosyVoice raw int16 audio and resample to 16k mono f32le."""
+    if COSYVOICE_USE_TRITON and COSYVOICE_TRITON_URL:
+        _start_cosyvoice_triton_to_audio_queue(spk_id, voice_wav_path, voice_ref_text, text, q, loop)
+        return
+    if not COSYVOICE_BASE_URL:
+        return
+    path = Path(voice_wav_path)
+    if not path.is_file():
+        return
+
+    def _put(item: bytes | None):
+        fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
+        fut.result()
+
+    # CosyVoice returns raw int16 at 24kHz (CosyVoice2 sample_rate=24000)
+    proc = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    total_out = 0
+    total_in = 0
+    status_code = None
+    content_type = None
+
+    def _read_stdout():
+        try:
+            while True:
+                data = proc.stdout.read(65536)
+                if not data:
+                    break
+                nonlocal total_out
+                total_out += len(data)
+                _put(data)
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            with open(path, "rb") as f:
+                files = {"prompt_wav": (path.name, f, "audio/wav")}
+                prompt_text = (voice_ref_text or "").strip() or (text or "").strip()[:TTS_MAX_CHARS]
+                if COSYVOICE_PROMPT_MAX_CHARS > 0:
+                    prompt_text = prompt_text[:COSYVOICE_PROMPT_MAX_CHARS]
+                if COSYVOICE_USE_SFT and spk_id and spk_id != "qwen3":
+                    data = {
+                        "tts_text": (text or "").strip()[:TTS_MAX_CHARS],
+                        "spk_id": spk_id,
+                        "speed": str(COSYVOICE_SPEED),
+                    }
+                    with client.stream("POST", f"{COSYVOICE_BASE_URL}/inference_sft", data=data) as r:
+                        status_code = r.status_code
+                        content_type = r.headers.get("content-type")
+                        r.raise_for_status()
+                        for chunk in r.iter_bytes(chunk_size=8192):
+                            if not chunk:
+                                continue
+                            total_in += len(chunk)
+                            if proc.stdin:
+                                proc.stdin.write(chunk)
+                else:
+                    data = {
+                        "tts_text": (text or "").strip()[:TTS_MAX_CHARS],
+                        "speed": str(COSYVOICE_SPEED),
+                    }
+                    if spk_id:
+                        data["spk_id"] = spk_id
+                    # Prefer registered speaker to avoid re-sending prompt audio each time.
+                    if COSYVOICE_USE_REGISTERED_SPK and spk_id:
+                        data["prompt_text"] = ""
+                        try:
+                            with client.stream("POST", f"{COSYVOICE_BASE_URL}/inference_zero_shot", data=data) as r:
+                                status_code = r.status_code
+                                content_type = r.headers.get("content-type")
+                                r.raise_for_status()
+                                for chunk in r.iter_bytes(chunk_size=8192):
+                                    if not chunk:
+                                        continue
+                                    total_in += len(chunk)
+                                    if proc.stdin:
+                                        proc.stdin.write(chunk)
+                            r = None
+                        except Exception:
+                            # Fall back to zero-shot with prompt_wav if server doesn't have cached spk_id.
+                            data["prompt_text"] = prompt_text
+                            with client.stream("POST", f"{COSYVOICE_BASE_URL}/inference_zero_shot", data=data, files=files) as r:
+                                status_code = r.status_code
+                                content_type = r.headers.get("content-type")
+                                r.raise_for_status()
+                                for chunk in r.iter_bytes(chunk_size=8192):
+                                    if not chunk:
+                                        continue
+                                    total_in += len(chunk)
+                                    if proc.stdin:
+                                        proc.stdin.write(chunk)
+                    else:
+                        data["prompt_text"] = prompt_text
+                        with client.stream("POST", f"{COSYVOICE_BASE_URL}/inference_zero_shot", data=data, files=files) as r:
+                            status_code = r.status_code
+                            content_type = r.headers.get("content-type")
+                            r.raise_for_status()
+                            for chunk in r.iter_bytes(chunk_size=8192):
+                                if not chunk:
+                                    continue
+                                total_in += len(chunk)
+                                if proc.stdin:
+                                    proc.stdin.write(chunk)
+    except Exception as e:
+        log.warning("CosyVoice stream error: %s", e)
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        reader.join(timeout=5)
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        _put(None)
+
+    log.info(
+        "CosyVoice stream stats: status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s",
+        status_code, content_type, total_in, total_out, len((text or "").strip()),
+    )
+
+
+def _cosyvoice_register_speaker(spk_id: str, voice_wav_path: str, voice_ref_text: str | None) -> None:
+    if not COSYVOICE_BASE_URL:
+        return
+    path = Path(voice_wav_path)
+    if not path.is_file():
+        return
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            if COSYVOICE_USE_SFT:
+                with open(path, "rb") as f:
+                    files = {"prompt_wav": (path.name, f, "audio/wav")}
+                    data = {"spk_id": spk_id}
+                    r = client.post(f"{COSYVOICE_BASE_URL}/register_sft_spk", data=data, files=files)
+                    if r.status_code >= 400:
+                        log.warning("CosyVoice register_sft_spk failed status=%s body=%s", r.status_code, r.text[:200])
+            prompt_text = (voice_ref_text or "").strip()
+            if prompt_text:
+                if COSYVOICE_PROMPT_MAX_CHARS > 0:
+                    prompt_text = prompt_text[:COSYVOICE_PROMPT_MAX_CHARS]
+                with open(path, "rb") as f:
+                    files = {"prompt_wav": (path.name, f, "audio/wav")}
+                    data = {"prompt_text": prompt_text, "spk_id": spk_id}
+                    r = client.post(f"{COSYVOICE_BASE_URL}/register_spk", data=data, files=files)
+                    if r.status_code >= 400:
+                        log.warning("CosyVoice register_spk failed status=%s body=%s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.warning("CosyVoice register_spk error: %s", e)
+
+
+def _cosyvoice_cache_speaker_triton(spk_id: str, voice_wav_path: str, voice_ref_text: str | None = None) -> bool:
+    """Warm CosyVoice2 Triton cache for a speaker (stores spk2info on server)."""
+    if not (COSYVOICE_USE_TRITON and COSYVOICE_TRITON_URL and COSYVOICE_USE_CACHE):
+        return False
+    if not spk_id or spk_id in COSYVOICE_SPK_CACHE:
+        return True
+    path = Path(voice_wav_path)
+    if not path.is_file():
+        return False
+
+    try:
+        wav_bytes = path.read_bytes()
+        ref_f32 = np.frombuffer(_wav_to_16k_float32_mono(wav_bytes), dtype=np.float32)
+    except Exception as e:
+        log.warning("CosyVoice cache: ref wav load failed for spk_id=%s: %s", spk_id, e)
+        return False
+
+    # Always provide ref_text to build a high-quality cached speaker.
+    ref_text = (voice_ref_text or "").strip()
+    if not ref_text:
+        try:
+            ref_text = _stt_transcribe_wav_sync(wav_bytes) or ""
+            if ref_text:
+                log.info("CosyVoice cache: derived ref_text from STT (%d chars)", len(ref_text))
+        except Exception as e:
+            log.warning("CosyVoice cache: STT ref_text failed: %s", e)
+    if COSYVOICE_REF_TEXT_MODE in ("none", "off", "false", "0"):
+        ref_text = ""
+    elif COSYVOICE_REF_TEXT_MODE in ("short", "first"):
+        m = re.split(r"(?<=[.!?])\\s+", ref_text) if ref_text else []
+        ref_text = (m[0] if m else ref_text)[:80]
+    if COSYVOICE_PROMPT_MAX_CHARS > 0:
+        ref_text = ref_text[:COSYVOICE_PROMPT_MAX_CHARS]
+
+    import tritonclient.grpc as grpcclient
+    from tritonclient.grpc import InferInput
+
+    server = COSYVOICE_TRITON_URL
+    if server.startswith("http://"):
+        server = server[len("http://") :]
+    if server.startswith("https://"):
+        server = server[len("https://") :]
+
+    try:
+        client = grpcclient.InferenceServerClient(server, verbose=False)
+        inputs = []
+        i_ref = InferInput("reference_wav", [1, ref_f32.shape[0]], "FP32")
+        i_ref.set_data_from_numpy(ref_f32.reshape(1, -1))
+        inputs.append(i_ref)
+
+        i_len = InferInput("reference_wav_len", [1, 1], "INT32")
+        i_len.set_data_from_numpy(np.array([[int(ref_f32.shape[0])]], dtype=np.int32))
+        inputs.append(i_len)
+
+        if ref_text:
+            i_ref_text = InferInput("reference_text", [1, 1], "BYTES")
+            i_ref_text.set_data_from_numpy(np.array([[ref_text.encode("utf-8")]], dtype=object))
+            inputs.append(i_ref_text)
+
+        i_spk = InferInput("speaker_id", [1, 1], "BYTES")
+        i_spk.set_data_from_numpy(np.array([[str(spk_id).encode("utf-8")]], dtype=object))
+        inputs.append(i_spk)
+
+        warm_text = (COSYVOICE_CACHE_WARMUP_TEXT or "Hello.").strip() or "Hello."
+        i_tgt_text = InferInput("target_text", [1, 1], "BYTES")
+        i_tgt_text.set_data_from_numpy(np.array([[warm_text.encode("utf-8")]], dtype=object))
+        inputs.append(i_tgt_text)
+
+        client.infer(model_name=COSYVOICE_TRITON_MODEL, inputs=inputs)
+        COSYVOICE_SPK_CACHE.add(spk_id)
+        log.info("CosyVoice cache: warmed spk_id=%s", spk_id)
+        return True
+    except Exception as e:
+        log.warning("CosyVoice cache warm error for spk_id=%s: %s", spk_id, e)
+        return False
+
+
+def _cosyvoice_cache_all_personas() -> None:
+    """Warm CosyVoice2 Triton cache for all personas with voice WAVs."""
+    try:
+        personas = load_personas()
+        warmed = 0
+        for p in personas:
+            voice_wav_path = (p.get("voice_wav_path") or "").strip()
+            if not voice_wav_path or not Path(voice_wav_path).is_file():
+                continue
+            spk_id = p.get("id") or ""
+            if _cosyvoice_cache_speaker_triton(str(spk_id), voice_wav_path, p.get("voice_ref_text")):
+                warmed += 1
+        log.info("CosyVoice cache: warmed %s personas", warmed)
+    except Exception as e:
+        log.warning("CosyVoice cache all failed: %s", e)
+
+
+def _render_f5_greeting_to_file(persona: dict) -> Path | None:
+    """Generate and cache a short greeting clip for the persona using F5."""
+    if TTS_PROVIDER != "f5" or not F5_TTS_BASE_URL:
+        return None
+    voice_wav_path = persona.get("voice_wav_path")
+    if not voice_wav_path or not Path(voice_wav_path).is_file():
+        return None
+    greet_path = DATA_DIR / f"greeting_{persona.get('id')}.f32"
+    if greet_path.is_file():
+        return greet_path
+    text = f"Hey, I'm {persona.get('name') or 'your assistant'}."
+    voice_ref_text = (persona.get("voice_ref_text") or "").strip()
+
+    proc = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    buf = bytearray()
+    total_in = total_out = 0
+    sr = 24000
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            with open(voice_wav_path, "rb") as f:
+                files = {"speaker_wav": (Path(voice_wav_path).name, f, "audio/wav")}
+                data = {"text": text[:TTS_MAX_CHARS], "ref_text": voice_ref_text}
+                with client.stream("POST", f"{F5_TTS_BASE_URL}/api/tts/stream_raw", data=data, files=files) as r:
+                    sr_hdr = r.headers.get("x-sample-rate", "")
+                    try:
+                        if sr_hdr:
+                            sr = int(sr_hdr)
+                    except Exception:
+                        sr = 24000
+                    if sr != 24000:
+                        if proc.stdin:
+                            proc.stdin.close()
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        proc = subprocess.Popen(
+                            ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        )
+                    for chunk in r.iter_bytes(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        total_in += len(chunk)
+                        if proc.stdin:
+                            proc.stdin.write(chunk)
+                    if proc.stdin:
+                        proc.stdin.close()
+                    if proc.stdout:
+                        buf.extend(proc.stdout.read())
+    except Exception as e:
+        log.warning("F5 greeting render failed: %s", e)
+        return None
+    finally:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    if buf:
+        try:
+            greet_path.write_bytes(buf)
+            log.info("Greeting cached for persona %s (%s bytes)", persona.get("id"), len(buf))
+            return greet_path
+        except Exception as e:
+            log.warning("Failed to write greeting cache: %s", e)
+    return None
+
+
+def _ensure_greeting_cached(persona: dict) -> Path | None:
+    """Return greeting path; generate if missing."""
+    greet_path = DATA_DIR / f"greeting_{persona.get('id')}.f32"
+    if greet_path.is_file():
+        return greet_path
+    return _render_f5_greeting_to_file(persona)
+
+def _chatterbox_voice_exists(voice_id: str) -> bool:
+    """True if this voice_id is registered in Chatterbox (MongoDB)."""
+    if not voice_id or not (CHATTERBOX_BASE_URL or "").strip():
+        return False
+    url = f"{CHATTERBOX_BASE_URL.rstrip('/')}/api/voices/{voice_id}"
+    try:
+        r = httpx.get(url, timeout=15.0)
+        return r.status_code == 200
+    except Exception as e:
+        log.debug("Chatterbox voice lookup failed for %s: %s", voice_id, e)
+        return False
+
+
+def _ensure_chatterbox_voice_id(persona: dict) -> str:
+    """Ensure Chatterbox has a usable voice_id; re-clone from voice_wav_path if missing or stale."""
+    if TTS_PROVIDER != "chatterbox":
+        return (persona.get("voice_id") or "").strip()
+    pid = (persona.get("id") or "").strip()
+    voice_id = (persona.get("voice_id") or "").strip()
+    voice_wav_path = persona.get("voice_wav_path") or ""
+    path = Path(voice_wav_path) if voice_wav_path else None
+
+    if voice_id and _chatterbox_voice_exists(voice_id):
+        return voice_id
+
+    if voice_id:
+        log.warning(
+            "Chatterbox voice_id %s not found on TTS service (DB reset or new server); re-cloning if WAV exists (persona %s)",
+            voice_id,
+            pid,
+        )
+
+    if not path or not path.is_file():
+        if voice_id:
+            log.warning("Cannot re-clone Chatterbox voice for persona %s: missing or invalid voice_wav_path", pid)
+        return voice_id
+
+    try:
+        audio = path.read_bytes()
+        new_id = _chatterbox_clone_voice(audio, persona.get("name") or pid)
+        if new_id:
+            persona["voice_id"] = new_id
+            try:
+                personas = load_personas()
+                for p in personas:
+                    if p.get("id") == pid:
+                        p["voice_id"] = new_id
+                        break
+                save_personas(personas)
+            except Exception as e:
+                log.warning("Failed to persist chatterbox voice_id for %s: %s", pid, e)
+            log.info("Chatterbox re-cloned voice for persona %s -> voice_id %s", pid, new_id)
+            return new_id
+    except Exception as e:
+        log.warning("Chatterbox re-clone failed for %s: %s", pid, e)
+    return voice_id
+
+
+def _load_greeting_bytes(persona_id: str) -> bytes | None:
+    path = DATA_DIR / f"greeting_{persona_id}.f32"
+    if path.is_file():
+        try:
+            return path.read_bytes()
+        except Exception:
+            return None
+    return None
+
+
+def _start_audio_tts_stream_to_queue(
+    voice_id: str,
+    voice_wav_path: str | None,
+    voice_ref_text: str | None,
+    text: str,
+    q: "asyncio.Queue[bytes | None]",
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    log.info("Audio TTS: provider=%s voice_wav=%s", TTS_PROVIDER, bool(voice_wav_path))
+    if TTS_PROVIDER == "xtts" and voice_wav_path and XTTS_BASE_URL:
+        _start_xtts_stream_to_audio_queue(voice_wav_path, text, q, loop)
+        return
+    if TTS_PROVIDER == "f5" and voice_wav_path and F5_TTS_BASE_URL:
+        _start_f5_stream_to_audio_queue(voice_wav_path, voice_ref_text, text, q, loop)
+        return
+    if TTS_PROVIDER == "qwen3" and voice_wav_path and QWEN3_TTS_BASE_URL:
+        _start_qwen3_stream_to_audio_queue(voice_wav_path, voice_ref_text, text, q, loop)
+        return
+    if TTS_PROVIDER == "cosyvoice" and voice_wav_path and (COSYVOICE_USE_TRITON or COSYVOICE_BASE_URL):
+        _start_cosyvoice_stream_to_audio_queue(voice_wav_path, voice_ref_text, text, voice_id, q, loop)
+        return
+    _start_tts_stream_to_audio_queue(voice_id, text, q, loop)
+
+
+def _start_tts_stream_to_mp4_audio_queue(voice_id: str, text: str, q: "asyncio.Queue[bytes | None]", loop: asyncio.AbstractEventLoop, out: dict | None = None) -> None:
+    """Stream TTS audio into ffmpeg and push fragmented MP4 (AAC) chunks into a queue."""
+    if out is None:
+        out = {}
+    url = f"{CHATTERBOX_BASE_URL}/api/tts/stream"
+    params = {
+        "voice_id": voice_id,
+        "text": (text or "").strip()[:TTS_MAX_CHARS],
+        "format": "wav",
+    }
+    proc = subprocess.Popen(
+        [
+            "ffmpeg", "-loglevel", "error", "-i", "pipe:0",
+            "-ac", "1", "-ar", "16000",
+            "-c:a", "aac", "-b:a", "96k",
+            "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "pipe:1",
+        ],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    def _put(item: bytes | None):
+        fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
+        fut.result()
+
+    total_out = 0
+    total_in = 0
+    status_code = None
+    content_type = None
+
+    def _read_stdout():
+        try:
+            while True:
+                data = proc.stdout.read(65536)
+                if not data:
+                    break
+                nonlocal total_out
+                total_out += len(data)
+                _put(data)
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            with client.stream("GET", url, params=params) as r:
+                r.raise_for_status()
+                status_code = r.status_code
+                content_type = r.headers.get("content-type")
+                for chunk in r.iter_bytes(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    total_in += len(chunk)
+                    if proc.stdin:
+                        proc.stdin.write(chunk)
+        if proc.stdin:
+            proc.stdin.close()
+        reader.join(timeout=5)
+        proc.wait(timeout=10)
+    except Exception as e:
+        out["error"] = str(e)
+    finally:
+        try:
+            err = proc.stderr.read() if proc.stderr else b""
+            if err:
+                log.warning("TTS audio ffmpeg stderr: %s", err.decode("utf-8", "replace"))
+        except Exception:
+            pass
+        log.info(
+            "TTS audio stream stats: status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s",
+            status_code, content_type, total_in, total_out, len((text or "").strip()),
+        )
+        if total_out == 0 and "error" not in out:
+            out["error"] = "TTS audio stream produced no output"
+        _put(None)
+
+
+def _start_tts_wav_to_holder(
+    voice_id: str,
+    voice_wav_path: str | None,
+    voice_ref_text: str | None,
+    text: str,
+    out: dict,
+) -> None:
+    """Fetch full WAV from TTS and store in out['wav']."""
+    if not text or not text.strip():
+        out["error"] = "Empty TTS text"
+        return
+
+    if TTS_PROVIDER == "qwen3":
+        if not QWEN3_TTS_BASE_URL:
+            out["error"] = "Qwen3-TTS not configured (missing QWEN3_TTS_BASE_URL)"
+            return
+        if not voice_wav_path or not Path(voice_wav_path).is_file():
+            out["error"] = "Qwen3-TTS requires a persona voice_wav_path; upload a voice WAV for this persona"
+            return
+
+        t0 = time.monotonic()
+        proc = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", "-f", "wav", "-ar", "16000", "-ac", "1", "pipe:1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        buf = bytearray()
+        total_in = 0
+        status_code = None
+        content_type = None
+        sr = 24000
+
+        def _read_stdout():
+            try:
+                while True:
+                    data = proc.stdout.read(65536)
+                    if not data:
+                        break
+                    buf.extend(data)
+            except Exception:
+                pass
+
+        reader = threading.Thread(target=_read_stdout, daemon=True)
+        reader.start()
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                with open(voice_wav_path, "rb") as f:
+                    files = {"speaker_wav": (Path(voice_wav_path).name, f, "audio/wav")}
+                    data = {
+                        "text": (text or "").strip()[:TTS_MAX_CHARS],
+                        "ref_text": (voice_ref_text or "").strip() or (text or "").strip()[:TTS_MAX_CHARS],
+                        "language": "English",
+                    }
+                    with client.stream("POST", f"{QWEN3_TTS_BASE_URL}/api/tts/stream_raw", data=data, files=files) as r:
+                        status_code = r.status_code
+                        content_type = r.headers.get("content-type")
+                        first_chunk_at = None
+                        sr_hdr = r.headers.get("x-sample-rate", "")
+                        try:
+                            if sr_hdr:
+                                sr = int(sr_hdr)
+                        except Exception:
+                            sr = 24000
+                        if sr != 24000:
+                            try:
+                                if proc.stdin:
+                                    proc.stdin.close()
+                            except Exception:
+                                pass
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            proc = subprocess.Popen(
+                                ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", "-f", "wav", "-ar", "16000", "-ac", "1", "pipe:1"],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            )
+                        r.raise_for_status()
+                        for chunk in r.iter_bytes(chunk_size=8192):
+                            if not chunk:
+                                continue
+                            if first_chunk_at is None:
+                                first_chunk_at = time.monotonic()
+                                log.info("Qwen3-TTS wav first_chunk at +%.2fs", first_chunk_at - t0)
+                            total_in += len(chunk)
+                            if proc.stdin:
+                                proc.stdin.write(chunk)
+            if proc.stdin:
+                proc.stdin.close()
+            reader.join(timeout=5)
+            proc.wait(timeout=10)
+        except Exception as e:
+            out["error"] = str(e)
+        finally:
+            try:
+                err = proc.stderr.read() if proc.stderr else b""
+                if err:
+                    log.warning("Qwen3-TTS wav ffmpeg stderr: %s", err.decode("utf-8", "replace"))
+            except Exception:
+                pass
+            log.info(
+                "Qwen3-TTS wav stats: status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s",
+                status_code, content_type, total_in, len(buf), len((text or "").strip()),
+            )
+            log.info("Qwen3-TTS wav done total=+%.2fs", time.monotonic() - t0)
+            if not buf and "error" not in out:
+                out["error"] = "Qwen3-TTS wav produced no audio"
+            out["wav"] = bytes(buf)
+        return
+
+    try:
+        out["wav"] = _chatterbox_tts_wav(voice_id, text)
+    except Exception as e:
+        out["error"] = str(e)
 
 
 def _chatterbox_clone_voice(audio: bytes, voice_name: str, user_id: str = "twynbook") -> str:
@@ -1338,6 +3261,7 @@ def _chatterbox_tts_wav(voice_id: str, text: str) -> bytes:
 async def create_persona(
     name: str = Form(...),
     system_prompt: str = Form(""),
+    voice_ref_text: str = Form(""),
     face: UploadFile = File(None),
     voice: UploadFile = File(None),
     avatar_listing_id: str = Form(""),
@@ -1434,6 +3358,7 @@ async def create_persona(
         current_user["id"],
         image_id,
         voice_id,
+        (voice_ref_text or "").strip(),
         role_pack_id,
         assigned_tool_ids,
     )
@@ -1465,6 +3390,7 @@ def _create_persona_sync(
     user_id: str = "",
     avatar_image_id: str | None = None,
     avatar_voice_id: str | None = None,
+    voice_ref_text_in: str | None = None,
     assigned_role_pack_id: str | None = None,
     assigned_listing_ids: list[str] | None = None,
 ) -> None:
@@ -1474,7 +3400,32 @@ def _create_persona_sync(
         image_id = avatar_image_id
         preview_url = f"{DITTO_API_URL}/personas/{image_id}/preview"
         voice_id = avatar_voice_id
+        voice_wav_path = None
+        voice_ref_text = None
+        try:
+            listing = get_listing(avatar_image_id) or {}
+            listing_wav = (listing.get("voice_wav_path") or "").strip()
+            if listing_wav:
+                src = Path(listing_wav)
+                if src.is_file():
+                    dest = DATA_DIR / f"voice_{persona_id}.wav"
+                    dest.write_bytes(src.read_bytes())
+                    voice_wav_path = dest
+            voice_ref_text = (listing.get("voice_ref_text") or "").strip() or None
+            if voice_ref_text is None and voice_wav_path and Path(voice_wav_path).is_file():
+                try:
+                    voice_ref_text = _stt_transcribe_wav_sync(Path(voice_wav_path).read_bytes()) or None
+                except Exception:
+                    voice_ref_text = None
+        except Exception:
+            pass
         log.info("Background create: using avatar image_id=%s voice_id=%s", image_id, voice_id)
+        if TTS_PROVIDER == "cosyvoice" and voice_wav_path:
+            if COSYVOICE_USE_TRITON and COSYVOICE_USE_CACHE:
+                _cosyvoice_cache_speaker_triton(str(voice_id), str(voice_wav_path), voice_ref_text)
+            else:
+                if voice_ref_text:
+                    _cosyvoice_register_speaker(voice_id, str(voice_wav_path), voice_ref_text)
     else:
         try:
             ditto_persona = _ditto_create_persona(face_bytes, name)
@@ -1486,12 +3437,44 @@ def _create_persona_sync(
         preview_url = ditto_persona.get("preview_url") or f"{DITTO_API_URL}/personas/{image_id}/preview"
         log.info("Background create: Ditto OK persona_id=%s image_id=%s", persona_id, image_id)
         try:
-            voice_id = _chatterbox_clone_voice(voice_bytes, name)
+            voice_wav_path = DATA_DIR / f"voice_{persona_id}.wav"
+            if voice_bytes:
+                voice_bytes = _trim_voice_wav(voice_bytes, max_seconds=MAX_VOICE_SECONDS, min_seconds=MIN_VOICE_SECONDS)
+                voice_wav_path.write_bytes(voice_bytes)
+            if TTS_PROVIDER == "cosyvoice":
+                # CosyVoice uses the raw WAV directly; no Chatterbox clone needed.
+                voice_id = persona_id
+                log.info("Background create: cosyvoice voice OK persona_id=%s", persona_id)
+            elif TTS_PROVIDER == "qwen3":
+                voice_id = TTS_PROVIDER
+                log.info("Background create: qwen3 voice OK persona_id=%s", persona_id)
+            else:
+                voice_id = _chatterbox_clone_voice(voice_bytes, name)
+                log.info("Background create: Chatterbox OK persona_id=%s voice_id=%s", persona_id, voice_id)
         except Exception as e:
-            log.exception("Background create: Chatterbox failed for persona_id=%s: %s", persona_id, e)
+            log.exception("Background create: Voice setup failed for persona_id=%s: %s", persona_id, e)
             creation_status[persona_id] = {"status": "failed", "error": str(e)}
             return
-        log.info("Background create: Chatterbox OK persona_id=%s voice_id=%s", persona_id, voice_id)
+        voice_ref_text = (voice_ref_text_in or "").strip() or None
+        if TTS_PROVIDER == "cosyvoice":
+            # Force prompt text to match the actual audio by transcribing the recording.
+            try:
+                voice_ref_text = _stt_transcribe_wav_sync(voice_bytes) or None
+            except Exception as e:
+                voice_ref_text = None
+                log.warning("CosyVoice voice_ref_text STT failed: %s", e)
+            if not voice_ref_text:
+                creation_status[persona_id] = {
+                    "status": "failed",
+                    "error": "Voice reference transcription failed. Please re-record in a quiet environment and read the script clearly.",
+                }
+                return
+        if TTS_PROVIDER == "cosyvoice" and voice_wav_path:
+            if COSYVOICE_USE_TRITON and COSYVOICE_USE_CACHE:
+                _cosyvoice_cache_speaker_triton(str(voice_id), str(voice_wav_path), voice_ref_text)
+            else:
+                if voice_ref_text:
+                    _cosyvoice_register_speaker(voice_id, str(voice_wav_path), voice_ref_text)
     # Idle video: 30s silence via POST /generate only (streaming is for chat reply clips)
     idle_path = DATA_DIR / f"idle_{persona_id}.mp4"
     idle_path_resolved = None
@@ -1513,6 +3496,8 @@ def _create_persona_sync(
         "name": name,
         "image_id": image_id,
         "voice_id": voice_id,
+        "voice_wav_path": str(voice_wav_path) if voice_wav_path else None,
+        "voice_ref_text": voice_ref_text,
         "system_prompt": system_prompt,
         "preview_url": preview_url,
         "idle_video_path": str(idle_path_resolved) if idle_path_resolved else None,
@@ -1523,6 +3508,10 @@ def _create_persona_sync(
     personas = load_personas()
     personas.append(persona)
     save_personas(personas)
+    try:
+        _ensure_greeting_cached(persona)
+    except Exception:
+        pass
     if persona_id in creation_status:
         del creation_status[persona_id]
     log.info("Persona %s created (idle_video=%s)", persona_id, bool(idle_path_resolved))
@@ -1544,77 +3533,162 @@ async def _ditto_stream_reader(
     video_chunks: list[bytes],
     read_error: list[Exception | None],
     segment_queue: asyncio.Queue[bytes | None] | None = None,
+    input_ready: asyncio.Event | None = None,
 ) -> None:
     """Read WebSocket messages in background; collect video bytes after sending_video.
     If segment_queue is set, put each binary chunk there (and None when done) for Phase 2 streaming.
+    When input_ready is set, it is signaled on {"status":"ready"} or on fatal error so the sender
+    can start audio only after Ditto has finished setup and entered its receive loop (avoids WS deadlock).
     """
     try:
         receiving_video = False
+        first_binary = True
+        chunk_count = 0
         async for message in ws:
             if isinstance(message, str):
                 data = json.loads(message)
                 if data.get("error"):
                     read_error.append(RuntimeError(data["error"]))
+                    if input_ready is not None:
+                        input_ready.set()
                     if segment_queue is not None:
                         segment_queue.put_nowait(None)
                     return
                 status = data.get("status", "")
+                # Ditto may buffer inbound audio during sdk.setup (input_buffering); then we can send TTS
+                # before "ready". Legacy servers: only "ready" means receive loop is active.
+                if input_ready is not None and not input_ready.is_set():
+                    if status == "ready" or (
+                        status == "initializing" and data.get("input_buffering")
+                    ):
+                        input_ready.set()
                 if status == "sending_video":
+                    log.info("Ditto stream: received sending_video status")
                     receiving_video = True
                 elif status == "done":
+                    log.info("Ditto stream: received done status (chunks=%s)", chunk_count)
                     if segment_queue is not None:
                         segment_queue.put_nowait(None)
                     return
-            elif isinstance(message, bytes) and receiving_video:
+            elif isinstance(message, bytes):
+                # Some servers may send binary before the "sending_video" status.
+                if not receiving_video:
+                    receiving_video = True
+                if first_binary:
+                    log.info("Ditto stream: first binary chunk (%s bytes)", len(message))
+                    first_binary = False
+                chunk_count += 1
                 video_chunks.append(message)
                 if segment_queue is not None:
                     segment_queue.put_nowait(message)
+        log.info("Ditto stream: reader completed (chunks=%s)", chunk_count)
         if segment_queue is not None:
             segment_queue.put_nowait(None)
     except ConnectionClosed:
+        if input_ready is not None:
+            input_ready.set()
         if not video_chunks and not read_error:
+            log.warning("Ditto stream: connection closed before sending video")
             read_error.append(RuntimeError("Ditto closed connection before sending video"))
         if segment_queue is not None:
             segment_queue.put_nowait(None)
     except Exception as e:
+        if input_ready is not None:
+            input_ready.set()
+        log.warning("Ditto stream: reader error: %s", e)
         read_error.append(e)
         if segment_queue is not None:
             segment_queue.put_nowait(None)
 
 async def ditto_stream_generate(
     image_id: str,
-    audio_float32_16k: bytes,
     output_path: str,
     segment_queue: asyncio.Queue[bytes | None] | None = None,
+    *,
+    audio_float32_16k: bytes | None = None,
+    audio_queue: asyncio.Queue[bytes | None] | None = None,
+    ws_base: str | None = None,
+    worker_idx: int | None = None,
 ) -> None:
-    """WebSocket streaming: send float32 16 kHz mono audio to Ditto /stream, receive MP4 (or fMP4), write to output_path.
-    If segment_queue is set, each binary chunk is also put there for Phase 2 SSE streaming (caller yields video_segment events).
+    """WebSocket to Ditto /stream: send float32 16 kHz mono audio (buffer or queue), receive fMP4, write output_path.
+
+    Pass exactly one of ``audio_float32_16k`` (full utterance) or ``audio_queue`` (TTS chunks + trailing None).
+    If ``segment_queue`` is set, each binary chunk is forwarded there for live MSE streaming.
     """
-    if not audio_float32_16k:
+    if (audio_float32_16k is None) == (audio_queue is None):
+        raise RuntimeError("Ditto stream: pass exactly one of audio_float32_16k or audio_queue")
+    if audio_float32_16k is not None and not audio_float32_16k:
         raise RuntimeError("Ditto stream: no audio bytes to send")
-    ws_base = _ditto_streaming_url()
+    if ws_base is None or worker_idx is None:
+        worker_idx, ws_base = _pick_ditto_worker()
     ws_url = f"{ws_base}/stream?image_id={image_id}"
-    log.info("Ditto stream: connecting to %s (sending %s bytes, then empty binary for end)", ws_url, len(audio_float32_16k))
+    if audio_float32_16k is not None:
+        log.info(
+            "Ditto stream: connecting to %s (sending %s bytes, then empty binary for end)",
+            ws_url,
+            len(audio_float32_16k),
+        )
+    else:
+        log.info("Ditto stream: connecting to %s (streaming audio chunks from queue)", ws_url)
     video_chunks: list[bytes] = []
     read_error: list[Exception | None] = []
+    t_send0 = time.monotonic()
+    lock_acquired = False
+    lock = _DITTO_WS_LOCKS[worker_idx] if (worker_idx is not None and worker_idx < len(_DITTO_WS_LOCKS)) else None
     try:
-        async with websockets.connect(
-            ws_url, close_timeout=30, max_size=2**26,
-            ping_interval=20, ping_timeout=120,
-            open_timeout=30,
-        ) as ws:
-            reader_task = asyncio.create_task(
-                _ditto_stream_reader(ws, video_chunks, read_error, segment_queue)
-            )
+        if lock:
+            if lock.locked():
+                log.info(
+                    "Ditto stream: waiting for worker %s lock (prior clip still rendering; single Ditto GPU)",
+                    worker_idx,
+                )
+            await lock.acquire()
+            lock_acquired = True
+        try:
+            async with websockets.connect(
+                ws_url, close_timeout=30, max_size=2**26,
+                ping_interval=20, ping_timeout=120,
+                open_timeout=30,
+            ) as ws:
+                ditto_input_ready = asyncio.Event()
+                reader_task = asyncio.create_task(
+                    _ditto_stream_reader(
+                        ws, video_chunks, read_error, segment_queue, ditto_input_ready
+                    )
+                )
+                try:
+                    await asyncio.wait_for(ditto_input_ready.wait(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    log.error("Ditto stream: timed out waiting for server ready (reply from %s)", ws_url)
+                    raise RuntimeError("Ditto stream: server did not send status=ready within 120s") from None
+                if read_error:
+                    try:
+                        await reader_task
+                    except Exception:
+                        pass
+                    raise read_error[0]
+                if audio_float32_16k is not None:
+                    chunk_size = 65536
+                    for i in range(0, len(audio_float32_16k), chunk_size):
+                        await ws.send(audio_float32_16k[i : i + chunk_size])
+                    await ws.send(b"")
+                    log.info("Ditto stream: sent audio bytes in %.2fs", time.monotonic() - t_send0)
+                else:
+                    assert audio_queue is not None
+                    while True:
+                        chunk = await audio_queue.get()
+                        if chunk is None:
+                            break
+                        await ws.send(chunk)
+                    await ws.send(b"")
 
-            chunk_size = 65536
-            for i in range(0, len(audio_float32_16k), chunk_size):
-                await ws.send(audio_float32_16k[i : i + chunk_size])
-            await ws.send(b"")
-
-            await reader_task
-            if read_error:
-                raise read_error[0]
+                await reader_task
+                log.info("Ditto stream: reader_task completed in %.2fs", time.monotonic() - t_send0)
+                if read_error:
+                    raise read_error[0]
+        finally:
+            if lock and lock_acquired and lock.locked():
+                lock.release()
 
         full_mp4 = b"".join(video_chunks)
         if not full_mp4:
@@ -1623,17 +3697,23 @@ async def ditto_stream_generate(
             with open(output_path, "wb") as f:
                 f.write(full_mp4)
             log.info("Ditto stream: wrote %s (%s bytes, %s chunks)", output_path, len(full_mp4), len(video_chunks))
-    except Exception as e:
+    except asyncio.CancelledError:
+        raise
+    except Exception:
         log.exception("Ditto stream failed for %s", output_path)
         raise
     finally:
         if segment_queue is not None:
-            segment_queue.put_nowait(None)
+            try:
+                segment_queue.put_nowait(None)
+            except Exception:
+                pass
 
 
-def ditto_generate_post(image_id: str, audio_wav_bytes: bytes, output_path: str) -> None:
-    """POST /generate: send audio WAV + image_id, receive MP4. Used only for idle video on persona create."""
-    url = f"{DITTO_API_URL}/generate"
+def ditto_generate_post(image_id: str, audio_wav_bytes: bytes, output_path: str, base_url: str | None = None) -> None:
+    """POST /generate: send audio WAV + image_id, receive MP4. Used for idle video and chunked replies."""
+    base = (base_url or DITTO_API_URL).rstrip("/")
+    url = f"{base}/generate"
     log.info("Ditto POST /generate: %s (%s audio bytes)", url, len(audio_wav_bytes))
     with httpx.Client(timeout=httpx.Timeout(connect=30, read=600, write=30, pool=600)) as client:
         resp = client.post(
@@ -1665,17 +3745,66 @@ def _stream_ollama_sentences_sync(
     messages: list,
     sentence_queue: "asyncio.Queue[str | None]",
     loop: asyncio.AbstractEventLoop,
+    boundary_re: re.Pattern | None = None,
+    split_re: re.Pattern | None = None,
+    audio_chunk_max: int | None = None,
+    audio_chunk_min: int | None = None,
 ) -> str:
     """
     Synchronous worker (runs in executor).
     Streams Ollama /api/chat with stream=true, detects completed sentences,
     puts each onto sentence_queue. Puts None when done. Returns full assistant text.
     """
-    url = f"{ollama_url.rstrip('/')}/api/chat"
+    url = f"{ollama_url.rstrip('/')}/v1/chat/completions"
     payload = {"model": ollama_model, "messages": messages, "stream": True}
     content = ""
     emitted_up_to = 0
     t0 = time.monotonic()
+    # Audio chunking: prefer punctuation before max chars, otherwise hard split.
+    audio_chunker = bool(audio_chunk_max)
+    if audio_chunker:
+        audio_chunk_max = max(30, int(audio_chunk_max))
+        audio_chunk_min = max(1, int(audio_chunk_min or 1))
+        punct_re = re.compile(r"(?<!\d)[.!?]|(?<!\d),(?!\d)")
+
+    def _emit_text_chunk(chunk: str):
+        s = (chunk or "").strip()
+        if not s:
+            return
+        log.info("Ollama: sentence yielded (+%.2fs, %s chars): %s", time.monotonic()-t0, len(s), s[:40])
+        asyncio.run_coroutine_threadsafe(sentence_queue.put(s), loop).result()
+
+    def _emit_audio_chunks(force_flush: bool = False):
+        nonlocal emitted_up_to
+        while True:
+            window = content[emitted_up_to:]
+            if not window:
+                return
+            if len(window) < audio_chunk_min and not force_flush:
+                return
+
+            cut = None
+            if len(window) >= audio_chunk_max:
+                # Prefer last punctuation within [min, max], otherwise hard split at max.
+                last = None
+                for mm in punct_re.finditer(window[:audio_chunk_max]):
+                    if mm.end() >= audio_chunk_min:
+                        last = mm
+                cut = last.end() if last else audio_chunk_max
+            else:
+                # We have >= min and < max: emit at first punctuation >= min.
+                for mm in punct_re.finditer(window):
+                    if mm.end() >= audio_chunk_min:
+                        cut = mm.end()
+                        break
+                if cut is None:
+                    if force_flush:
+                        cut = len(window)
+                    else:
+                        return
+            _emit_text_chunk(window[:cut])
+            emitted_up_to += cut
+
     try:
         with httpx.Client(timeout=60.0) as client_http:
             log.info("Ollama: starting stream for %s messages", len(messages))
@@ -1704,25 +3833,35 @@ def _stream_ollama_sentences_sync(
                         continue
                     
                     content += delta
-                    # Yield sentences as they form: match punctuation followed by space/newline or end of string
-                    matches = list(re.finditer(r"(?<=[.?])(?:\s+|$)|(?:\s*\n\s*)+", content[emitted_up_to:]))
-                    if matches:
-                        last_match = matches[-1]
-                        block = content[emitted_up_to : emitted_up_to + last_match.end()]
-                        for s in _chunk_by_sentences(block):
-                            s = s.strip()
-                            if s:
-                                log.info("Ollama: sentence yielded (+%.2fs): %s", time.monotonic()-t0, s[:40])
-                                asyncio.run_coroutine_threadsafe(sentence_queue.put(s), loop).result()
-                        emitted_up_to += last_match.end()
+                    if audio_chunker:
+                        _emit_audio_chunks()
+                    else:
+                        boundary_re = boundary_re or SENTENCE_BOUNDARY_PERIOD_RE
+                        split_re = split_re or SENTENCE_SPLIT_PERIOD_RE
+                        # Yield sentences as they form based on provided boundary regex.
+                        matches = list(boundary_re.finditer(content[emitted_up_to:]))
+                        if matches:
+                            last_match = matches[-1]
+                            block = content[emitted_up_to : emitted_up_to + last_match.end()]
+                            for s in _chunk_by_sentences(block, split_re=split_re):
+                                s = s.strip()
+                                if s:
+                                    _emit_text_chunk(s)
+                            emitted_up_to += last_match.end()
                     
                     if data.get("done"): break
         
         # Flush
-        remaining = content[emitted_up_to:].strip()
-        if remaining:
-            log.info("Ollama: final sentence yielded (+%.2fs): %s", time.monotonic()-t0, remaining[:40])
-            asyncio.run_coroutine_threadsafe(sentence_queue.put(remaining), loop).result()
+        if audio_chunker:
+            _emit_audio_chunks(force_flush=True)
+            remaining = content[emitted_up_to:].strip()
+            if remaining:
+                _emit_text_chunk(remaining)
+        else:
+            remaining = content[emitted_up_to:].strip()
+            if remaining:
+                log.info("Ollama: final sentence yielded (+%.2fs): %s", time.monotonic()-t0, remaining[:40])
+                asyncio.run_coroutine_threadsafe(sentence_queue.put(remaining), loop).result()
         log.info("Ollama: finished in %.2fs, total_len=%d", time.monotonic()-t0, len(content))
     except Exception as e:
         log.exception("Ollama: worker failed: %s", e)
@@ -1736,6 +3875,8 @@ def _stream_openai_sentences_sync(
     messages: list,
     sentence_queue: "asyncio.Queue[str | None]",
     loop: asyncio.AbstractEventLoop,
+    boundary_re: re.Pattern | None = None,
+    split_re: re.Pattern | None = None,
 ) -> str:
     """
     Synchronous worker (runs in executor).
@@ -1757,12 +3898,14 @@ def _stream_openai_sentences_sync(
                 if delta is None: continue
                 content += delta
                 
-                # Yield sentences as they form: match punctuation followed by space/newline or end of string
-                matches = list(re.finditer(r"(?<=[.?])(?:\s+|$)|(?:\s*\n\s*)+", content[emitted_up_to:]))
+                boundary_re = boundary_re or SENTENCE_BOUNDARY_PERIOD_RE
+                split_re = split_re or SENTENCE_SPLIT_PERIOD_RE
+                # Yield sentences as they form based on provided boundary regex.
+                matches = list(boundary_re.finditer(content[emitted_up_to:]))
                 if matches:
                     last_match = matches[-1]
                     sentence_block = content[emitted_up_to : emitted_up_to + last_match.end()]
-                    for s in _chunk_by_sentences(sentence_block):
+                    for s in _chunk_by_sentences(sentence_block, split_re=split_re):
                         s = s.strip()
                         if s:
                             log.info("LLM: sentence yielded (+%.2fs): %s", time.monotonic() - t0, s[:40])
@@ -1776,6 +3919,111 @@ def _stream_openai_sentences_sync(
         remaining = content[emitted_up_to:].strip()
         if remaining:
             log.info("LLM: final sentence yielded (+%.2fs): %s", time.monotonic() - t0, remaining[:40])
+            asyncio.run_coroutine_threadsafe(sentence_queue.put(remaining), loop).result()
+        log.info("LLM: finished in %.2fs, total_len=%d", time.monotonic() - t0, len(content))
+    except Exception as e:
+        log.exception("LLM: worker failed: %s", e)
+    finally:
+        asyncio.run_coroutine_threadsafe(sentence_queue.put(None), loop).result()
+    return content.strip()
+
+
+def _stream_ollama_continuous_sync(
+    ollama_url: str,
+    ollama_model: str,
+    messages: list,
+    sentence_queue: "asyncio.Queue[str | None]",
+    loop: asyncio.AbstractEventLoop,
+    chunk_chars: int,
+) -> str:
+    """Stream Ollama tokens and emit fixed-size chunks (no sentence boundaries)."""
+    url = f"{ollama_url.rstrip('/')}/v1/chat/completions"
+    payload = {"model": ollama_model, "messages": messages, "stream": True}
+    content = ""
+    emitted_up_to = 0
+    t0 = time.monotonic()
+    chunk_chars = max(20, int(chunk_chars))
+    try:
+        with httpx.Client(timeout=60.0) as client_http:
+            log.info("Ollama: starting stream for %s messages", len(messages))
+            with client_http.stream("POST", url, json=payload) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    clean_line = line.strip()
+                    if clean_line.startswith("data:"):
+                        clean_line = clean_line[5:].strip()
+                    if not clean_line or clean_line == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(clean_line)
+                    except Exception:
+                        continue
+                    msg = data.get("message")
+                    delta = ""
+                    if isinstance(msg, dict):
+                        delta = msg.get("content") or ""
+                    elif "choices" in data:
+                        choices = data.get("choices")
+                        if choices:
+                            delta = choices[0].get("delta", {}).get("content") or ""
+                    if not delta:
+                        if data.get("done"):
+                            break
+                        continue
+                    content += delta
+                    while len(content) - emitted_up_to >= chunk_chars:
+                        chunk = content[emitted_up_to : emitted_up_to + chunk_chars]
+                        if chunk.strip():
+                            log.info("Ollama: chunk yielded (+%.2fs): %s", time.monotonic() - t0, chunk[:40])
+                            asyncio.run_coroutine_threadsafe(sentence_queue.put(chunk), loop).result()
+                        emitted_up_to += chunk_chars
+                    if data.get("done"):
+                        break
+        remaining = content[emitted_up_to:]
+        if remaining.strip():
+            log.info("Ollama: final chunk yielded (+%.2fs): %s", time.monotonic() - t0, remaining[:40])
+            asyncio.run_coroutine_threadsafe(sentence_queue.put(remaining), loop).result()
+        log.info("Ollama: finished in %.2fs, total_len=%d", time.monotonic() - t0, len(content))
+    except Exception as e:
+        log.exception("Ollama: worker failed: %s", e)
+    finally:
+        asyncio.run_coroutine_threadsafe(sentence_queue.put(None), loop).result()
+    return content.strip()
+
+
+def _stream_openai_continuous_sync(
+    client: OpenAI,
+    messages: list,
+    sentence_queue: "asyncio.Queue[str | None]",
+    loop: asyncio.AbstractEventLoop,
+    chunk_chars: int,
+) -> str:
+    """Stream OpenAI tokens and emit fixed-size chunks (no sentence boundaries)."""
+    content = ""
+    emitted_up_to = 0
+    t0 = time.monotonic()
+    chunk_chars = max(20, int(chunk_chars))
+    try:
+        log.info("LLM: starting stream for %s messages", len(messages))
+        resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, stream=True)
+        for chunk in resp:
+            if not chunk or not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content
+            if delta is None:
+                continue
+            content += delta
+            while len(content) - emitted_up_to >= chunk_chars:
+                segment = content[emitted_up_to : emitted_up_to + chunk_chars]
+                if segment.strip():
+                    log.info("LLM: chunk yielded (+%.2fs): %s", time.monotonic() - t0, segment[:40])
+                    asyncio.run_coroutine_threadsafe(sentence_queue.put(segment), loop).result()
+                emitted_up_to += chunk_chars
+        remaining = content[emitted_up_to:]
+        if remaining.strip():
+            log.info("LLM: final chunk yielded (+%.2fs): %s", time.monotonic() - t0, remaining[:40])
             asyncio.run_coroutine_threadsafe(sentence_queue.put(remaining), loop).result()
         log.info("LLM: finished in %.2fs, total_len=%d", time.monotonic() - t0, len(content))
     except Exception as e:
@@ -1840,7 +4088,7 @@ class IdleMotionManager:
                     
                     # Start Ditto for silence
                     ditto_fut = asyncio.ensure_future(
-                        ditto_stream_generate(self.image_id, self._silence, c_path, s_queue)
+                        ditto_stream_generate(self.image_id, c_path, s_queue, audio_float32_16k=self._silence)
                     )
                     
                     # Push segments from queue to media server
@@ -1926,19 +4174,45 @@ async def _run_chat_stream(ctx: dict):
 
     sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
     openai_task: asyncio.Task | None = None
+    mode = (ctx.get("mode") or "audio").strip().lower()
+    if mode == "audio":
+        boundary_re = SENTENCE_BOUNDARY_AUDIO_RE
+        split_re = SENTENCE_SPLIT_AUDIO_RE
+    else:
+        boundary_re = SENTENCE_BOUNDARY_PERIOD_RE
+        split_re = SENTENCE_SPLIT_PERIOD_RE
     if use_ollama:
-        openai_task = asyncio.ensure_future(
-            loop.run_in_executor(
-                None,
-                _stream_ollama_sentences_sync,
-                ollama_url,
-                ollama_model,
-                messages,
-                sentence_queue,
-                loop,
+        if mode == "audio" and AUDIO_CONTINUOUS:
+            openai_task = asyncio.ensure_future(
+                loop.run_in_executor(
+                    None,
+                    _stream_ollama_continuous_sync,
+                    ollama_url,
+                    ollama_model,
+                    messages,
+                    sentence_queue,
+                    loop,
+                    AUDIO_CHUNK_CHARS,
+                )
             )
-        )
-        log.info("Chat timing: Ollama stream started (model=%s)", ollama_model)
+            log.info("Chat timing: Ollama stream started (continuous, model=%s)", ollama_model)
+        else:
+            openai_task = asyncio.ensure_future(
+                loop.run_in_executor(
+                    None,
+                    _stream_ollama_sentences_sync,
+                    ollama_url,
+                    ollama_model,
+                    messages,
+                    sentence_queue,
+                    loop,
+                    boundary_re,
+                    split_re,
+                    None,
+                    None,
+                )
+            )
+            log.info("Chat timing: Ollama stream started (model=%s)", ollama_model)
     elif tools_for_llm and client:
         async def _tool_task():
             full = await loop.run_in_executor(
@@ -1952,43 +4226,73 @@ async def _run_chat_stream(ctx: dict):
     else:
         if not client:
             raise RuntimeError("Set OLLAMA_URL or OPENAI_API_KEY for chat")
-        openai_task = asyncio.ensure_future(
-            loop.run_in_executor(
-                None, _stream_openai_sentences_sync, client, messages, sentence_queue, loop
+        if mode == "audio" and AUDIO_CONTINUOUS:
+            openai_task = asyncio.ensure_future(
+                loop.run_in_executor(
+                    None, _stream_openai_continuous_sync, client, messages, sentence_queue, loop, AUDIO_CHUNK_CHARS
+                )
             )
-        )
-        log.info("Chat timing: OpenAI stream started (stream=True)")
+            log.info("Chat timing: OpenAI stream started (continuous)")
+        else:
+            openai_task = asyncio.ensure_future(
+                loop.run_in_executor(
+                    None, _stream_openai_sentences_sync, client, messages, sentence_queue, loop, boundary_re, split_re
+                )
+            )
+            log.info("Chat timing: OpenAI stream started (stream=True)")
 
-    async def prefetch_clip(idx, text_to_prefetch):
-        """Prepare TTS and start Ditto generation for a clip index."""
+    async def prefetch_clip(idx, bundle):
+        """Video: TTS only. Streams float32 chunks into audio_queue (unbounded). Ditto runs in the main loop."""
         try:
+            text_to_prefetch = bundle.get("text") if isinstance(bundle, dict) else bundle
+            deltas = bundle.get("deltas", []) if isinstance(bundle, dict) else []
             log.info("Prefetch: clip %s (%s chars)", idx, len(text_to_prefetch))
-            # 1. TTS
-            t_tts0 = time.monotonic()
-            wav_data = await loop.run_in_executor(None, _chatterbox_tts_wav, voice_id, text_to_prefetch)
-            log.info("Prefetch: TTS done in %.2fs for clip %s", time.monotonic() - t_tts0, idx)
-            if not wav_data or len(wav_data) < 44:
-                return {"error": "Invalid WAV"}
-            
-            # 2. Conversion
-            audio_f32_data = _wav_to_16k_float32_mono(wav_data)
-            if not audio_f32_data or len(audio_f32_data) < 6400:
-                return {"error": "Audio too short"}
-            
-            # 3. Ditto Start
+            if TTS_PROVIDER == "qwen3":
+                if not QWEN3_TTS_BASE_URL:
+                    return {"error": "Qwen3-TTS not configured (missing QWEN3_TTS_BASE_URL)"}
+                voice_wav_path = p.get("voice_wav_path")
+                if not voice_wav_path or not Path(voice_wav_path).is_file():
+                    return {"error": "Qwen3-TTS requires a persona voice_wav_path; upload a voice WAV for this persona"}
             c_path = str(DATA_DIR / f"reply_{persona_id}_{reply_id}_{idx}.mp4")
-            s_queue = asyncio.Queue()
-            d_fut = asyncio.ensure_future(
-                ditto_stream_generate(image_id, audio_f32_data, c_path, s_queue)
+            t_tts0 = time.monotonic()
+            metrics = {"prefetch_at": t_tts0, "tts_started_at": t_tts0}
+            if use_streaming:
+                audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+                tts_thread = threading.Thread(
+                    target=_start_audio_tts_stream_to_queue,
+                    args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_to_prefetch, audio_queue, loop),
+                    daemon=True,
+                )
+                tts_thread.start()
+                log.info("Prefetch: TTS streaming started for clip %s (Ditto deferred to pipeline)", idx)
+                return {
+                    "index": idx,
+                    "text": text_to_prefetch,
+                    "deltas": deltas,
+                    "path": c_path,
+                    "audio_queue": audio_queue,
+                    "tts_started_at": t_tts0,
+                    "tts_thread": tts_thread,
+                    "metrics": metrics,
+                }
+            audio_holder: dict = {}
+            tts_thread = threading.Thread(
+                target=_start_tts_wav_to_holder,
+                args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_to_prefetch, audio_holder),
+                daemon=True,
             )
+            tts_thread.start()
+            log.info("Prefetch: TTS WAV started for clip %s", idx)
             return {
                 "index": idx,
                 "text": text_to_prefetch,
-                "wav": wav_data,
-                "audio_f32": audio_f32_data,
+                "deltas": deltas,
                 "path": c_path,
-                "segment_queue": s_queue,
-                "ditto_fut": d_fut,
+                "audio_queue": None,
+                "tts_started_at": t_tts0,
+                "tts_thread": tts_thread,
+                "audio_holder": audio_holder,
+                "metrics": metrics,
             }
         except Exception as pre_err:
             log.exception("Prefetch failed for clip %s: %s", idx, pre_err)
@@ -1997,84 +4301,402 @@ async def _run_chat_stream(ctx: dict):
     sentences_log: list[str] = []
     clip_index = 0
     stream_ended = False
+    use_streaming = os.environ.get("DITTO_STREAMING", "").lower() in ("1", "true", "yes")
+    mode = (ctx.get("mode") or "audio").strip().lower()
+
+    def _split_text(text: str, max_chars: int | None, force_hard: bool = False, min_cut: int = 20) -> tuple[str, str]:
+        """Split text into head/tail at natural boundaries within max_chars."""
+        if not text:
+            return "", ""
+        if max_chars is None:
+            return text.strip(), ""
+        max_chars = max(30, int(max_chars))
+        if len(text) <= max_chars:
+            return text.strip(), ""
+        # Prefer sentence boundaries, then clause boundaries, then space.
+        puncts = [".", "?", "!", ";", ":", ","]
+        cut = -1
+        for p in puncts:
+            idx = text.rfind(p, 0, max_chars)
+            if idx > cut:
+                cut = idx
+        if cut < min_cut:
+            cut = text.rfind(" ", 0, max_chars)
+        if cut < min_cut and force_hard:
+            cut = max_chars
+        if cut < min_cut:
+            cut = max_chars
+        head = text[:cut + 1].rstrip()
+        tail = text[cut + 1:].lstrip()
+        return head, tail
+
+    pending_text: str | None = None
 
     async def get_next_bundle():
         nonlocal stream_ended
-        bundle = []
-        needed = FIRST_CLIP_SENTENCES if clip_index == 0 else SENTENCES_PER_CLIP
-        while len(bundle) < needed and not stream_ended:
-            try:
-                s = await asyncio.wait_for(sentence_queue.get(), timeout=30.0)
-                if s is None:
-                    stream_ended = True
+        nonlocal pending_text
+        deltas = []
+        # If we have leftover text from a previous split, emit it first.
+        if pending_text:
+            text = pending_text
+            pending_text = None
+        else:
+            bundle = []
+            if mode == "audio":
+                if AUDIO_CONTINUOUS:
+                    max_sentences = 1
+                    min_chars = 0
+                else:
+                    max_sentences = AUDIO_FIRST_CLIP_SENTENCES if clip_index == 0 else AUDIO_SENTENCES_PER_CLIP
+                    min_chars = AUDIO_CLIP_MIN_CHARS
+            elif mode == "video" and clip_index == 0:
+                # First muxed Ditto clip: same sentence bundling as audio mode for earlier first fragment (single A/V clock in UI).
+                max_sentences = AUDIO_FIRST_CLIP_SENTENCES
+                min_chars = AUDIO_CLIP_MIN_CHARS
+            else:
+                max_sentences = FIRST_CLIP_SENTENCES if clip_index == 0 else SENTENCES_PER_CLIP
+                min_chars = CLIP_MIN_CHARS
+            current_len = 0
+            while not stream_ended and (len(bundle) < max_sentences or (min_chars and current_len < min_chars)):
+                try:
+                    s = await asyncio.wait_for(sentence_queue.get(), timeout=30.0)
+                    if s is None:
+                        stream_ended = True
+                        break
+                    bundle.append(s)
+                    if current_len:
+                        current_len += 1  # space
+                    current_len += len(s)
+                    sentences_log.append(s)
+                    deltas.append(s)
+                    if min_chars and current_len >= min_chars and len(bundle) >= max_sentences:
+                        break
+                except asyncio.TimeoutError:
                     break
-                bundle.append(s)
-                sentences_log.append(s)
-            except asyncio.TimeoutError:
-                break
-        return " ".join(bundle) if bundle else None
+            text = " ".join(bundle) if bundle else None
 
-    FIRST_CLIP_SENTENCES = 1
+        if not text:
+            return None
+
+        if mode == "audio":
+            head, tail = _split_text(text, None)
+        elif mode == "video" and clip_index == 0:
+            # Cap first utterance like audio-friendly TTFR; env override else AUDIO_CLIP_MAX_CHARS.
+            vcap = FIRST_CLIP_MAX_CHARS if FIRST_CLIP_MAX_CHARS is not None else AUDIO_CLIP_MAX_CHARS
+            head, tail = _split_text(text, vcap)
+        else:
+            if clip_index == 0:
+                head, tail = _split_text(text, FIRST_CLIP_MAX_CHARS)
+            else:
+                head, tail = _split_text(text, CLIP_MAX_CHARS)
+        if tail:
+            pending_text = tail
+        return {"text": head if head else None, "deltas": deltas}
     
     async def get_and_prefetch(idx):
         bundle = await get_next_bundle()
-        if not bundle:
+        if not bundle or not bundle.get("text"):
             return None
         return await prefetch_clip(idx, bundle)
 
-    # Start preparing the first clip immediately
-    prefetch_task = asyncio.create_task(get_and_prefetch(0))
-    
+    prefetch_task = None
+    video_ditto_task: asyncio.Task | None = None  # video streaming: cancel on WS teardown so Ditto lock is not stuck
     try:
-        while True:
-            # Wait for the current clip's pre-generation to finish (if not already done)
-            clip_data = await prefetch_task
-            if not clip_data:
-                break
-            
-            i = clip_index
-            clip_index += 1
-            current_text = clip_data["text"]
-            
-            # IMMEDIATELY start preparing the NEXT clip while we stream this one
-            prefetch_task = asyncio.create_task(get_and_prefetch(i + 1))
-            
-            if "error" in clip_data:
-                log.error("Clip %s failed: %s", i, clip_data["error"])
-                yield ("event", "error", {"index": i, "error": clip_data["error"]})
-                break
-            
-            # Yield binary data for the current clip
-            seq_queue = clip_data["segment_queue"]
-            ditto_fut = clip_data["ditto_fut"]
-            
-            segment_count = 0
-            while True:
+        if mode == "audio":
+            async def prefetch_audio_clip(idx, text_to_prefetch, unbounded=False):
                 try:
-                    # Shorter timeout during binary yield to keep connection alive
-                    chunk = await asyncio.wait_for(seq_queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    yield ("keepalive",)
-                    continue
-                
-                if chunk is None:
+                    text_value = text_to_prefetch.get("text") if isinstance(text_to_prefetch, dict) else text_to_prefetch
+                    deltas = text_to_prefetch.get("deltas", []) if isinstance(text_to_prefetch, dict) else []
+                    log.info("Prefetch: audio clip %s (%s chars)", idx, len(text_value))
+                    if TTS_PROVIDER == "qwen3":
+                        if not QWEN3_TTS_BASE_URL:
+                            return {"error": "Qwen3-TTS not configured (missing QWEN3_TTS_BASE_URL)"}
+                        voice_wav_path = p.get("voice_wav_path")
+                        if not voice_wav_path or not Path(voice_wav_path).is_file():
+                            return {"error": "Qwen3-TTS requires a persona voice_wav_path; upload a voice WAV for this persona"}
+                    t_tts0 = time.monotonic()
+                    metrics = {"prefetch_at": t_tts0, "tts_started_at": t_tts0}
+                    audio_holder = {}
+                    audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=0 if unbounded else 8)
+                    tts_thread = threading.Thread(
+                        target=_start_audio_tts_stream_to_queue,
+                        args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_value, audio_queue, loop),
+                        daemon=True,
+                    )
+                    tts_thread.start()
+                    return {
+                        "index": idx,
+                        "text": text_value,
+                        "deltas": deltas,
+                        "audio_queue": audio_queue,
+                        "tts_started_at": t_tts0,
+                        "tts_thread": tts_thread,
+                        "audio_holder": audio_holder,
+                        "metrics": metrics,
+                    }
+                except Exception as pre_err:
+                    log.exception("Prefetch audio failed for clip %s: %s", idx, pre_err)
+                    return {"error": str(pre_err)}
+
+            async def get_and_prefetch_audio(idx, unbounded=False):
+                bundle = await get_next_bundle()
+                if not bundle or not bundle.get("text"):
+                    return None
+                return await prefetch_audio_clip(idx, bundle, unbounded=unbounded)
+
+            audio_serial = TTS_PROVIDER in ("xtts", "f5", "cosyvoice", "qwen3", "chatterbox")
+            prefetch_task = asyncio.create_task(get_and_prefetch_audio(0)) if not audio_serial else None
+            next_serial_task = None  # early-prefetched next clip for serial mode
+            while True:
+                if audio_serial:
+                    if next_serial_task is not None:
+                        clip_data = await next_serial_task
+                        next_serial_task = None
+                    else:
+                        clip_data = await get_and_prefetch_audio(clip_index)
+                else:
+                    clip_data = await prefetch_task
+                if not clip_data:
                     break
-                
-                if segment_count == 0:
+
+                i = clip_index
+                clip_index += 1
+                if "error" in clip_data:
+                    log.error("Audio clip %s failed: %s", i, clip_data["error"])
+                    yield ("event", "error", {"index": i, "error": clip_data["error"]})
+                    break
+                current_text = clip_data["text"]
+                if not audio_serial:
+                    prefetch_task = asyncio.create_task(get_and_prefetch_audio(i + 1))
+                for delta in clip_data.get("deltas", []):
+                    yield ("event", "text_delta", {"text": delta})
+
+                tts_thread = clip_data.get("tts_thread")
+                audio_holder = clip_data.get("audio_holder")
+                if audio_holder is None:
+                    audio_holder = {}
+                audio_queue = clip_data.get("audio_queue")
+                if audio_queue is None:
+                    raise RuntimeError("Audio queue missing")
+                metrics = clip_data.get("metrics") or {}
+
+                segment_count = 0
+                audio_start_at = None
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        yield ("keepalive",)
+                        continue
+                    if chunk is None:
+                        break
+                    if segment_count == 0:
+                        audio_start_at = time.monotonic()
+                        log.info("Pipeline: emitting audio_start for clip %s at +%.2fs", i, audio_start_at - t_start)
+                        if metrics:
+                            log.info(
+                                "ClipTiming audio clip=%s prefetch=+%.2fs tts_start=+%.2fs audio_start=+%.2fs",
+                                i,
+                                metrics.get("prefetch_at", t_start) - t_start,
+                                metrics.get("tts_started_at", t_start) - t_start,
+                                audio_start_at - t_start,
+                            )
+                        yield ("event", "audio_start", {"index": i, "format": "f32le", "sample_rate": 16000, "channels": 1})
+                        yield ("event", "clip", {"index": i, "text": current_text, "mode": "audio", "streaming": True})
+                        # Serial mode: kick off next clip's TTS now while current clip plays,
+                        # using an unbounded queue so it buffers freely without stalling F5-TTS.
+                        if audio_serial and next_serial_task is None:
+                            next_serial_task = asyncio.create_task(get_and_prefetch_audio(clip_index, unbounded=True))
+                    segment_count += 1
+                    yield ("binary_audio", i, chunk)
+
+                if tts_thread:
+                    tts_thread.join(timeout=5)
+                if audio_holder.get("error"):
+                    raise RuntimeError(audio_holder["error"])
+                if audio_start_at:
+                    log.info(
+                        "ClipTiming audio clip=%s done segments=%s total=+%.2fs",
+                        i, segment_count, time.monotonic() - t_start
+                    )
+        else:
+            # Video: TTS prefetch overlaps with Ditto for the *previous* clip; Ditto is always serial (one GPU).
+            prefetch_task = asyncio.create_task(get_and_prefetch(0))
+
+            while True:
+                clip_data = await prefetch_task
+                if not clip_data:
+                    break
+
+                i = clip_index
+                clip_index += 1
+
+                if "error" in clip_data:
+                    log.error("Clip %s failed: %s", i, clip_data["error"])
+                    yield ("event", "error", {"index": i, "error": clip_data["error"]})
+                    break
+
+                current_text = clip_data["text"]
+
+                # Start next clip's TTS now so it runs while Ditto renders this clip.
+                prefetch_task = asyncio.create_task(get_and_prefetch(i + 1))
+
+                for delta in clip_data.get("deltas", []):
+                    yield ("event", "text_delta", {"text": delta})
+
+                if use_streaming:
+                    audio_queue = clip_data.get("audio_queue")
+                    if audio_queue is None:
+                        raise RuntimeError("Video streaming clip missing audio_queue")
+                    seq_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+                    worker_idx, ws_base = _pick_ditto_worker()
+                    metrics = clip_data.get("metrics") or {}
+                    metrics["worker_idx"] = worker_idx
+                    metrics["ws_base"] = ws_base
+                    metrics["tts_ready_at"] = time.monotonic()
+                    metrics["ditto_started_at"] = time.monotonic()
+
+                    ditto_fut = asyncio.ensure_future(
+                        ditto_stream_generate(
+                            image_id,
+                            clip_data["path"],
+                            seq_queue,
+                            audio_queue=audio_queue,
+                            ws_base=ws_base,
+                            worker_idx=worker_idx,
+                        )
+                    )
+                    video_ditto_task = ditto_fut
+
+                    segment_count = 0
+                    first_chunk_at = None
+                    normal_clip_end = False
+                    try:
+                        while True:
+                            try:
+                                chunk = await asyncio.wait_for(seq_queue.get(), timeout=1.0)
+                            except asyncio.TimeoutError:
+                                yield ("keepalive",)
+                                continue
+
+                            if chunk is None:
+                                normal_clip_end = True
+                                break
+
+                            if segment_count == 0:
+                                first_chunk_at = time.monotonic()
+                                log.info("Pipeline: emitting video_start for clip %s at +%.2fs", i, first_chunk_at - t_start)
+                                if metrics:
+                                    log.info(
+                                        "ClipTiming video clip=%s prefetch=+%.2fs tts_start=+%.2fs tts_ready=+%.2fs ditto_start=+%.2fs first_chunk=+%.2fs",
+                                        i,
+                                        metrics.get("prefetch_at", t_start) - t_start,
+                                        metrics.get("tts_started_at", t_start) - t_start,
+                                        metrics.get("tts_ready_at", t_start) - t_start,
+                                        metrics.get("ditto_started_at", t_start) - t_start,
+                                        first_chunk_at - t_start,
+                                    )
+                                    log.info(
+                                        "ClipTiming video clip=%s worker=%s base=%s",
+                                        i,
+                                        metrics.get("worker_idx"),
+                                        metrics.get("ws_base"),
+                                    )
+                                yield ("event", "video_start", {"index": i})
+
+                            segment_count += 1
+                            yield ("binary", i, chunk)
+                    except asyncio.CancelledError:
+                        if not ditto_fut.done():
+                            log.info(
+                                "Ditto stream: cancelling background task (pipeline cancelled) reply_id=%s",
+                                reply_id,
+                            )
+                            ditto_fut.cancel()
+                        try:
+                            await ditto_fut
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        video_ditto_task = None
+                        raise
+                    finally:
+                        video_ditto_task = None
+                        # If the client disconnects or the generator is closed during yield, the else-branch
+                        # never ran and ditto_fut would keep running — leaving _DITTO_WS_LOCKS held forever.
+                        if normal_clip_end:
+                            try:
+                                await ditto_fut
+                            except Exception:
+                                pass
+                        elif not ditto_fut.done():
+                            log.info(
+                                "Ditto stream: cancelling orphan task (abnormal clip end / generator exit) reply_id=%s",
+                                reply_id,
+                            )
+                            ditto_fut.cancel()
+                            try:
+                                await ditto_fut
+                            except (asyncio.CancelledError, Exception):
+                                pass
+
+                    metrics["ditto_done_at"] = time.monotonic()
+
+                    tts_thread = clip_data.get("tts_thread")
+                    if tts_thread:
+                        tts_thread.join(timeout=30)
+                        if tts_thread.is_alive():
+                            log.warning("TTS thread still running after 30s for clip %s", i)
+
+                    log.info("Pipeline: clip %s finished yielding (%s segments)", i, segment_count)
+                    if metrics:
+                        log.info(
+                            "ClipTiming video clip=%s done segments=%s total=+%.2fs",
+                            i, segment_count, time.monotonic() - t_start
+                        )
+                    clip_url = f"/api/personas/{persona_id}/reply/{reply_id}/{i}"
+                    yield ("event", "clip", {"index": i, "text": current_text, "streaming": True, "url": clip_url})
+
+                else:
+                    tts_thread = clip_data.get("tts_thread")
+                    audio_holder = clip_data.get("audio_holder")
+                    if audio_holder is None:
+                        audio_holder = {}
+                    if tts_thread:
+                        tts_thread.join(timeout=60)
+                        if tts_thread.is_alive():
+                            log.warning("TTS thread still running after 60s for clip %s", i)
+                    audio_wav = audio_holder.get("wav", b"")
+                    if audio_holder.get("error"):
+                        raise RuntimeError(audio_holder["error"])
+                    if not audio_wav:
+                        raise RuntimeError("TTS produced no audio")
+                    audio_f32 = _wav_to_16k_float32_mono(audio_wav)
+                    widx, wbase = _pick_ditto_worker()
+                    await ditto_stream_generate(
+                        image_id,
+                        clip_data["path"],
+                        None,
+                        audio_float32_16k=audio_f32,
+                        ws_base=wbase,
+                        worker_idx=widx,
+                    )
                     log.info("Pipeline: emitting video_start for clip %s at +%.2fs", i, time.monotonic() - t_start)
                     yield ("event", "video_start", {"index": i})
-                
-                segment_count += 1
-                yield ("binary", i, chunk)
-            
-            # Wait for render cleanup
-            try: await ditto_fut
-            except: pass
-            
-            log.info("Pipeline: clip %s finished yielding (%s segments)", i, segment_count)
-            yield ("event", "clip", {"index": i, "text": current_text, "streaming": True})
+                    clip_url = f"/api/personas/{persona_id}/reply/{reply_id}/{i}"
+                    yield ("event", "clip", {"index": i, "text": current_text, "streaming": False, "url": clip_url})
 
     finally:
+        if video_ditto_task and not video_ditto_task.done():
+            log.warning(
+                "Chat pipeline: cancelling stray Ditto task on teardown reply_id=%s (release worker lock)",
+                reply_id,
+            )
+            video_ditto_task.cancel()
+            try:
+                await video_ditto_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Cleanup both pipeline tasks
         if prefetch_task:
             prefetch_task.cancel()
@@ -2094,16 +4716,17 @@ async def _run_chat_stream(ctx: dict):
                 full_text = " ".join(sentences_log)
             
             log.info("AI Text: %s...", full_text[:60].replace("\n", " "))
-            p["conversation"] = p.get("conversation", []) + [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": full_text},
-            ]
-            personas = load_personas()
-            for idx, x in enumerate(personas):
-                if x.get("id") == persona_id:
-                    personas[idx] = p
-                    break
-            save_personas(personas)
+            if ctx.get("persist", True):
+                p["conversation"] = p.get("conversation", []) + [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": full_text},
+                ]
+                personas = load_personas()
+                for idx, x in enumerate(personas):
+                    if x.get("id") == persona_id:
+                        personas[idx] = p
+                        break
+                save_personas(personas)
         except Exception as save_err:
             log.error("Failed to finalize conversation state: %s", save_err)
 
@@ -2165,7 +4788,11 @@ async def chat(persona_id: str, message: str = Form(...), current_user: dict = D
     messages.append({"role": "user", "content": message})
 
     loop = asyncio.get_event_loop()
-    voice_id, image_id = p["voice_id"], p["image_id"]
+    if TTS_PROVIDER == "cosyvoice":
+        voice_id = persona_id
+    else:
+        voice_id = _ensure_chatterbox_voice_id(p)
+    image_id = p["image_id"]
     reply_id = uuid.uuid4().hex
     t_request = time.monotonic()
     log.info("Chat: request received (persona_id=%s)", persona_id)
@@ -2194,6 +4821,9 @@ async def chat(persona_id: str, message: str = Form(...), current_user: dict = D
             elif item[0] == "binary":
                 _, idx, b = item
                 yield f"event: video_segment\ndata: {json.dumps({'index': idx, 'base64': base64.b64encode(b).decode('ascii')})}\n\n"
+            elif item[0] == "binary_audio":
+                _, idx, b = item
+                yield f"event: audio_segment\ndata: {json.dumps({'index': idx, 'base64': base64.b64encode(b).decode('ascii')})}\n\n"
             elif item[0] == "keepalive":
                 yield ": keepalive\n\n"
 
@@ -2202,6 +4832,327 @@ async def chat(persona_id: str, message: str = Form(...), current_user: dict = D
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.websocket("/api/personas/{persona_id}/audio/rtc")
+async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
+    """Bidirectional WebRTC audio: mic in -> STT -> LLM -> TTS out (no auth, share-like)."""
+    if RTCPeerConnection is None or RTCSessionDescription is None or AudioResampler is None or AudioFrame is None or MediaStreamTrack is None or candidate_from_sdp is None:
+        await websocket.accept()
+        await websocket.send_json({"event": "error", "data": {"error": "WebRTC not available on server"}})
+        await websocket.close()
+        return
+
+    await websocket.accept()
+    stt_only = (websocket.query_params.get("stt_only") or "").strip().lower() in ("1", "true", "yes")
+    log.info(
+        "RTC audio: ws accepted persona_id=%s stt_base=%s stt_only=%s",
+        persona_id,
+        STT_BASE_URL or "(unset)",
+        stt_only,
+    )
+    persona_cached = get_persona(persona_id)
+    if not persona_cached:
+        await websocket.send_json({"event": "error", "data": {"error": "Persona not found"}})
+        await websocket.close()
+        return
+    if TTS_PROVIDER == "chatterbox":
+        try:
+            persona_cached["voice_id"] = _ensure_chatterbox_voice_id(persona_cached)
+        except Exception:
+            pass
+    if TTS_PROVIDER == "cosyvoice":
+        try:
+            voice_wav_path = persona_cached.get("voice_wav_path")
+            voice_ref_text = persona_cached.get("voice_ref_text")
+            if voice_wav_path:
+                if COSYVOICE_USE_TRITON and COSYVOICE_USE_CACHE:
+                    _cosyvoice_cache_speaker_triton(str(persona_id), str(voice_wav_path), voice_ref_text)
+                else:
+                    if voice_ref_text:
+                        _cosyvoice_register_speaker(str(persona_id), str(voice_wav_path), voice_ref_text)
+        except Exception:
+            pass
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _ensure_greeting_cached, persona_cached)
+    except Exception:
+        pass
+    pc = RTCPeerConnection(RTCConfiguration(_get_ice_servers()))
+    out_track = _OutgoingAudioTrack()
+    pc.addTrack(out_track)
+    transcript_dc = {"ch": None}
+    remote_candidates: list[RTCIceCandidate] = []
+    utterance_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    connection_ready = asyncio.Event()
+
+    @pc.on("connectionstatechange")
+    async def on_conn_state():
+        log.info("RTC audio state=%s", pc.connectionState)
+        if pc.connectionState == "connected":
+            connection_ready.set()
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        if channel.label in ("transcript", "events", "control"):
+            transcript_dc["ch"] = channel
+
+    async def send_dc(payload: dict):
+        ch = transcript_dc.get("ch")
+        if ch and ch.readyState == "open":
+            try:
+                ch.send(json.dumps(payload))
+            except Exception:
+                pass
+
+    @pc.on("icecandidate")
+    async def on_icecandidate(candidate):
+        if candidate is None:
+            return
+        payload = {
+            "action": "candidate",
+            "candidate": candidate.candidate,
+            "sdpMid": candidate.sdpMid,
+            "sdpMLineIndex": candidate.sdpMLineIndex,
+        }
+        try:
+            await websocket.send_text(json.dumps(payload))
+        except Exception:
+            pass
+
+    async def process_audio_track(track):
+        resampler = AudioResampler(format="s16", layout="mono", rate=16000)
+        vad = _AudioVADBuffer()
+        await send_dc({"event": "ready"})
+        log.info("RTC audio: track receiver started")
+        try:
+            await asyncio.wait_for(connection_ready.wait(), timeout=3.0)
+        except Exception:
+            pass
+
+        async def play_greeting():
+            data = _load_greeting_bytes(persona_id)
+            if not data:
+                return
+            chunk_bytes = 3200 * 4  # ~0.2s at 16k f32
+            idx = 0
+            while idx < len(data):
+                chunk = data[idx : idx + chunk_bytes]
+                out_track.put_f32_16k(chunk)
+                samples = len(chunk) // 4
+                await asyncio.sleep(max(samples / 16000.0, 0.01))
+                idx += chunk_bytes
+        try:
+            if not stt_only:
+                await play_greeting()
+        except Exception as e:
+            log.warning("RTC audio: greeting playback skipped: %s", e)
+        _rms_log_counter = 0
+        while True:
+            try:
+                frame = await track.recv()
+            except Exception:
+                break
+            frames = resampler.resample(frame)
+            if not isinstance(frames, list):
+                frames = [frames]
+            for f in frames:
+                pcm = f.to_ndarray()
+                if pcm.ndim > 1:
+                    pcm = pcm[0]
+                # Pause STT while TTS is speaking (half-duplex) + short cooldown after speech ends.
+                if out_track._speaking or (time.monotonic() - out_track._speaking_ended_at) < 0.3:
+                    vad._reset()
+                    continue
+                # Log RMS every ~2s (100 frames @ 20ms) to show incoming audio levels
+                _rms_log_counter += 1
+                if _rms_log_counter >= 100:
+                    _rms_log_counter = 0
+                    rms = float(np.sqrt(np.mean((pcm.astype(np.float32) / 32768.0) ** 2)))
+                    log.info("RTC audio: RMS=%.4f (threshold=%.4f speech=%dms)", rms, vad.rms_threshold, vad._speech_ms)
+                segs = vad.push(pcm.astype(np.int16, copy=False))
+                for seg in segs:
+                    seg_ms = int(len(seg) / 16)
+                    log.info("RTC audio: VAD segment %sms", seg_ms)
+                    wav_bytes = _pcm16_to_wav_bytes(seg)
+                    text = await _stt_transcribe_wav(wav_bytes)
+                    log.info("RTC audio: STT result %r (%dms segment)", text or "(empty)", seg_ms)
+                    if text:
+                        await send_dc({"event": "user_transcript", "text": text})
+                        if not stt_only:
+                            await utterance_queue.put(text)
+
+    @pc.on("track")
+    def on_track(track):
+        if track.kind == "audio":
+            log.info("RTC audio: inbound audio track received")
+            asyncio.create_task(process_audio_track(track))
+
+    async def run_llm_loop():
+        while True:
+            text = await utterance_queue.get()
+            if text is None:
+                return
+            p = get_persona(persona_id)
+            if not p:
+                await send_dc({"event": "error", "text": "Persona not found"})
+                continue
+            about = (p.get("system_prompt") or "").strip() or "You are a helpful assistant."
+            system_content = (
+                "You are a character in a conversation. The following describes you (the character), not the person you are chatting with. "
+                "Any name or trait in that description refers to you—do not use it for the user. Refer to the other person as 'you' or by what they tell you.\n\n"
+                "About you (the character):\n" + about
+            )
+            rp_id = (p.get("assigned_role_pack_id") or "").strip() or None
+            if rp_id:
+                rp_listing = get_listing(rp_id)
+                if rp_listing and _listing_type(rp_listing) == "role_pack":
+                    role_prompt = (rp_listing.get("role_prompt") or "").strip()
+                    if role_prompt:
+                        system_content = system_content + "\n\n" + role_prompt
+            rag_user_id = p.get("user_id")
+            rag_context = get_rag_context(persona_id, rag_user_id, text)
+            if rag_context:
+                system_content = system_content + "\n\nUse the following information when relevant to the user's question:\n" + rag_context
+            messages = [
+                {"role": "system", "content": system_content + "\n\nIMPORTANT: Do NOT use exclamation marks (!) in your response. Use only periods (.) and question marks (?) for punctuation.\nKeep responses to one short sentence (max 12 words)."},
+            ]
+            for m in p.get("conversation", []):
+                messages.append({"role": m["role"], "content": m["content"]})
+            messages.append({"role": "user", "content": text})
+            if AUDIO_HISTORY_MAX > 0:
+                messages = _trim_messages_for_audio(messages, AUDIO_HISTORY_MAX)
+
+            client = httpx.Client(timeout=60.0)
+            ctx = {
+                "p": p,
+                "client": client,
+                "messages": messages,
+                "persona_id": persona_id,
+                "reply_id": uuid.uuid4().hex,
+                "loop": asyncio.get_event_loop(),
+                "voice_id": (persona_id if TTS_PROVIDER == "cosyvoice" else p["voice_id"]),
+                "image_id": p["image_id"],
+                "t_request": time.monotonic(),
+                "message": text,
+                "ollama_url": OLLAMA_URL,
+                "ollama_model": OLLAMA_MODEL,
+                "persist": True,
+                "mode": "audio",
+            }
+
+            await send_dc({"event": "assistant_start"})
+            try:
+                out_track.set_speaking(True)
+                prefill_ms = int(os.environ.get("AUDIO_PREFILL_MS", "1200") or "1200")
+                prefill_bytes = int(16000 * 4 * (prefill_ms / 1000.0))
+                play_buf = bytearray()
+                prefilled = False
+                async def _play_audio(buf: bytearray):
+                    if not buf:
+                        return
+                    chunk_bytes = 3200 * 4  # ~0.2s at 16k f32
+                    idx = 0
+                    data = bytes(buf)
+                    while idx < len(data):
+                        chunk = data[idx : idx + chunk_bytes]
+                        out_track.put_f32_16k(chunk)
+                        samples = len(chunk) // 4
+                        await asyncio.sleep(max(samples / 16000.0, 0.01))
+                        idx += chunk_bytes
+                async for item in _run_chat_stream(ctx):
+                    if item[0] == "event" and item[1] == "clip":
+                        payload = item[2] or {}
+                        clip_text = (payload.get("text") or "").strip()
+                        if clip_text:
+                            await send_dc({"event": "assistant_text", "text": clip_text})
+                    elif item[0] == "binary_audio":
+                        if item[2]:
+                            play_buf.extend(item[2])
+                        if not prefilled:
+                            if len(play_buf) >= prefill_bytes:
+                                await _play_audio(play_buf)
+                                play_buf.clear()
+                                prefilled = True
+                        else:
+                            if play_buf:
+                                await _play_audio(play_buf)
+                                play_buf.clear()
+                if play_buf:
+                    await _play_audio(play_buf)
+                out_track.flush()
+                out_track.put_f32_16k(b"\x00" * (320 * 2))  # ~20ms of silence to ensure tail delivery
+                await send_dc({"event": "assistant_done"})
+            except Exception as e:
+                log.warning("RTC audio pipeline error: %s", e)
+                await send_dc({"event": "error", "text": str(e)})
+            finally:
+                out_track.set_speaking(False)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    llm_task = asyncio.create_task(run_llm_loop()) if not stt_only else None
+
+    try:
+        while True:
+            msg = json.loads(await websocket.receive_text())
+            action = msg.get("action")
+            if action == "offer":
+                offer = RTCSessionDescription(sdp=msg["sdp"], type=msg["type"])
+                await pc.setRemoteDescription(offer)
+                if remote_candidates:
+                    for cand in remote_candidates:
+                        try:
+                            await pc.addIceCandidate(cand)
+                        except Exception:
+                            pass
+                    remote_candidates.clear()
+                answer = await pc.createAnswer()
+                await pc.setLocalDescription(answer)
+                await websocket.send_text(json.dumps({"action": "answer", "sdp": pc.localDescription.sdp, "type": pc.localDescription.type}))
+            elif action == "candidate":
+                cand_sdp = (msg.get("candidate") or "").strip()
+                if not cand_sdp:
+                    continue
+                if not cand_sdp.startswith("candidate:"):
+                    cand_sdp = "candidate:" + cand_sdp
+                try:
+                    cand = candidate_from_sdp(cand_sdp)
+                    cand.sdpMid = msg.get("sdpMid")
+                    cand.sdpMLineIndex = msg.get("sdpMLineIndex")
+                except Exception:
+                    continue
+                if pc.remoteDescription is None:
+                    remote_candidates.append(cand)
+                else:
+                    await pc.addIceCandidate(cand)
+            elif action == "ping":
+                try:
+                    await websocket.send_text(json.dumps({"action": "pong", "ts": msg.get("ts")}))
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        log.info("RTC audio websocket disconnect persona_id=%s", persona_id)
+    except Exception as e:
+        log.warning("RTC audio websocket error: %s", e)
+        try:
+            await websocket.send_json({"event": "error", "data": {"error": str(e)}})
+        except Exception:
+            pass
+    finally:
+        try:
+            await utterance_queue.put(None)
+        except Exception:
+            pass
+        if llm_task:
+            try:
+                llm_task.cancel()
+            except Exception:
+                pass
+        await pc.close()
 
 
 @app.websocket("/api/personas/{persona_id}/chat/stream")
@@ -2226,6 +5177,7 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
         raw = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
         msg = json.loads(raw)
         message = (msg.get("message") or "").strip()
+        mode = (msg.get("mode") or "audio").strip().lower()
         webrtc_session_id = (msg.get("webrtc_session_id") or "").strip() or None
     except Exception as e:
         try:
@@ -2249,6 +5201,11 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
         await websocket.send_json({"event": "error", "data": {"error": "Persona not found"}})
         await websocket.close()
         return
+    if TTS_PROVIDER == "chatterbox":
+        try:
+            p["voice_id"] = _ensure_chatterbox_voice_id(p)
+        except Exception:
+            pass
 
     ws_use_ollama = bool(OLLAMA_URL)
     if not ws_use_ollama and not OPENAI_API_KEY:
@@ -2279,9 +5236,24 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
     for m in p.get("conversation", []):
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": message})
+    if mode == "audio":
+        if AUDIO_HISTORY_MAX > 0:
+            before = len(messages)
+            messages = _trim_messages_for_audio(messages, AUDIO_HISTORY_MAX)
+            after = len(messages)
+            if after < before:
+                log.info("History trimmed for mode=audio: %s -> %s messages", before, after)
+    else:
+        if CHAT_HISTORY_MAX > 0:
+            before = len(messages)
+            messages = _trim_messages_for_audio(messages, CHAT_HISTORY_MAX)
+            after = len(messages)
+            if after < before:
+                log.info("History trimmed for mode=%s: %s -> %s messages", mode, before, after)
 
     loop = asyncio.get_event_loop()
-    voice_id, image_id = p["voice_id"], p["image_id"]
+    voice_id = (persona_id if TTS_PROVIDER == "cosyvoice" else p["voice_id"])
+    image_id = p["image_id"]
     reply_id = uuid.uuid4().hex
     t_request = time.monotonic()
     p = get_persona(persona_id, current_user["id"])
@@ -2299,8 +5271,8 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
         return
 
     log.info(
-        "Chat WS: request received persona_id=%s webrtc_session_id=%s use_ollama=%s",
-        persona_id, webrtc_session_id or "(none)", ws_use_ollama,
+        "Chat WS: request received persona_id=%s mode=%s webrtc_session_id=%s use_ollama=%s",
+        persona_id, mode, webrtc_session_id or "(none)", ws_use_ollama,
     )
 
     ctx = {
@@ -2316,6 +5288,8 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
         "message": message,
         "ollama_url": OLLAMA_URL if ws_use_ollama else "",
         "ollama_model": OLLAMA_MODEL,
+        "persist": True,
+        "mode": mode,
     }
     push_ws = None
 
@@ -2368,6 +5342,11 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
                 # Wait for items from the producer.
                 item = await asyncio.wait_for(pipeline_queue.get(), timeout=KEEPALIVE_INTERVAL)
             except asyncio.TimeoutError:
+                if consumer_task.done():
+                    break
+                # Client may have disconnected; avoid send after close (RuntimeError on ASGI).
+                if websocket.application_state != WebSocketState.CONNECTED:
+                    break
                 # No pipeline item; send keepalive so socket always has traffic (avoids proxy timeout)
                 try:
                     async with ws_send_lock:
@@ -2379,7 +5358,8 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
                         log.info("Chat WS: local keepalive (count=%s) reply_id=%s", keepalive_count, reply_id)
                         last_log_at = now
                 except Exception as e:
-                    print(f"DEBUG: Chat WS: keepalive send error: {e}", flush=True)
+                    log.debug("Chat WS: keepalive send ended: %s", e)
+                    break
                 continue
             
             # Log what we got so we can see if items arrive or loop exits early
@@ -2388,19 +5368,23 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
                 break
             
             kind = item[0]
-            if kind == "event":
-                print(f"DEBUG: Chat WS: SENDING event {item[1]} for reply_id={reply_id}", flush=True)
-                async with ws_send_lock:
-                    await websocket.send_json({"event": item[1], "data": item[2]})
-                sent_count += 1
-            elif kind == "binary":
-                async with ws_send_lock:
-                    await websocket.send_bytes(item[2])
-                sent_count += 1
-            elif kind == "keepalive":
-                async with ws_send_lock:
-                    await websocket.send_json({"event": "keepalive", "data": {}})
-                sent_count += 1
+            try:
+                if kind == "event":
+                    print(f"DEBUG: Chat WS: SENDING event {item[1]} for reply_id={reply_id}", flush=True)
+                    async with ws_send_lock:
+                        await websocket.send_json({"event": item[1], "data": item[2]})
+                    sent_count += 1
+                elif kind in ("binary", "binary_audio"):
+                    async with ws_send_lock:
+                        await websocket.send_bytes(item[2])
+                    sent_count += 1
+                elif kind == "keepalive":
+                    async with ws_send_lock:
+                        await websocket.send_json({"event": "keepalive", "data": {}})
+                    sent_count += 1
+            except Exception as e:
+                log.debug("Chat WS: client gone or send failed: %s", e)
+                break
     except WebSocketDisconnect:
         print(f"DEBUG: Chat WS: WebSocketDisconnect for reply_id={reply_id}", flush=True)
     except asyncio.CancelledError:
@@ -2408,10 +5392,11 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
     except Exception as e:
         print(f"ERROR: Chat WS loop: {e}", flush=True)
         log.exception("Chat WS: Exception sent_count=%s %s", sent_count, e)
-        try:
-            await websocket.send_json({"event": "error", "data": {"error": str(e)}})
-        except Exception:
-            pass
+        if websocket.application_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.send_json({"event": "error", "data": {"error": str(e)}})
+            except Exception:
+                pass
     finally:
         pipeline_task.cancel()
         consumer_task.cancel()
@@ -2435,6 +5420,123 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
             pass
 
 
+@app.websocket("/api/share/{share_id}/chat/stream")
+async def share_chat_stream_ws(websocket: WebSocket, share_id: str):
+    """Public WebSocket chat for shared persona. No auth, no persistence."""
+    await websocket.accept()
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+        msg = json.loads(raw)
+        message = (msg.get("message") or "").strip()
+        mode = (msg.get("mode") or "audio").strip().lower()
+    except Exception as e:
+        try:
+            await websocket.send_json({"event": "error", "data": {"error": f"Invalid message: {e}"}})
+        except Exception:
+            pass
+        await websocket.close()
+        return
+
+    if not message:
+        try:
+            while True:
+                await websocket.receive_text()
+        except Exception:
+            pass
+        return
+
+    p = get_persona_by_share_id(share_id)
+    if not p:
+        await websocket.send_json({"event": "error", "data": {"error": "Shared persona not found"}})
+        await websocket.close()
+        return
+
+    ws_use_ollama = bool(OLLAMA_URL)
+    if not ws_use_ollama and not OPENAI_API_KEY:
+        await websocket.send_json({"event": "error", "data": {"error": "Set OLLAMA_URL or OPENAI_API_KEY for chat"}})
+        await websocket.close()
+        return
+
+    client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    about = (p.get("system_prompt") or "").strip() or "You are a helpful assistant."
+    system_content = (
+        "You are a character in a conversation. The following describes you (the character), not the person you are chatting with. "
+        "Any name or trait in that description refers to you—do not use it for the user. Refer to the other person as 'you' or by what they tell you.\n\n"
+        "About you (the character):\n" + about
+    )
+    messages = [
+        {"role": "system", "content": system_content + "\n\nIMPORTANT: Do NOT use exclamation marks (!) in your response. Use only periods (.) and question marks (?) for punctuation."},
+        {"role": "user", "content": message},
+    ]
+
+    loop = asyncio.get_event_loop()
+    voice_id = (p.get("id") if TTS_PROVIDER == "cosyvoice" else p["voice_id"])
+    image_id = p["image_id"]
+    reply_id = uuid.uuid4().hex
+    t_request = time.monotonic()
+
+    log.info(
+        "Share Chat WS: request received share_id=%s persona_id=%s use_ollama=%s",
+        share_id, p.get("id"), ws_use_ollama,
+    )
+
+    ctx = {
+        "p": p,
+        "client": client,
+        "messages": messages,
+        "persona_id": p.get("id"),
+        "reply_id": reply_id,
+        "loop": loop,
+        "voice_id": voice_id,
+        "image_id": image_id,
+        "t_request": t_request,
+        "message": message,
+        "ollama_url": OLLAMA_URL if ws_use_ollama else "",
+        "ollama_model": OLLAMA_MODEL,
+        "persist": False,
+        "mode": mode,
+    }
+
+    pipeline_queue: asyncio.Queue[tuple | None] = asyncio.Queue()
+
+    async def pipeline_producer():
+        try:
+            async for item in _run_chat_stream(ctx):
+                await pipeline_queue.put(item)
+        except Exception as e:
+            log.error("Share Chat WS: pipeline_producer CRASHED: %s", e, exc_info=True)
+            await pipeline_queue.put(("event", "error", {"error": str(e)}))
+        finally:
+            await pipeline_queue.put(None)
+
+    pipeline_task = asyncio.create_task(pipeline_producer(), name=f"share_chat_{reply_id}")
+
+    try:
+        while True:
+            item = await pipeline_queue.get()
+            if item is None:
+                break
+            kind = item[0]
+            if kind == "event":
+                await websocket.send_json({"event": item[1], "data": item[2]})
+            elif kind in ("binary", "binary_audio"):
+                await websocket.send_bytes(item[2])
+            elif kind == "keepalive":
+                await websocket.send_json({"event": "keepalive", "data": {}})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        pipeline_task.cancel()
+        try:
+            await pipeline_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @app.get("/api/personas/{persona_id}/reply/{reply_id}/{clip_index}")
 def get_reply_video_clip(persona_id: str, reply_id: str, clip_index: int, request: Request):
     """Serve one clip of a chunked reply (for streaming playback)."""
@@ -2445,6 +5547,18 @@ def get_reply_video_clip(persona_id: str, reply_id: str, clip_index: int, reques
     if not path.is_file():
         raise HTTPException(404, "Reply clip not found")
     return _video_response(request, path, "video/mp4")
+
+
+@app.get("/api/personas/{persona_id}/reply-audio/{reply_id}/{clip_index}")
+def get_reply_audio_clip(persona_id: str, reply_id: str, clip_index: int):
+    """Serve one audio clip (WAV) of a reply."""
+    p = get_persona(persona_id)
+    if not p:
+        raise HTTPException(404, "Persona not found")
+    path = DATA_DIR / f"reply_{persona_id}_{reply_id}_{clip_index}.wav"
+    if not path.is_file():
+        raise HTTPException(404, "Reply audio not found")
+    return FileResponse(path, media_type="audio/wav")
 
 
 # ---- Serve frontend (when STATIC_DIR is set, e.g. in Docker) ----

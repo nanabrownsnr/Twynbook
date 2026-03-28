@@ -4,6 +4,7 @@ import { apiFetch, authHeaders } from '../auth'
 
 const API = '/api'
 const STEPS = 3
+const VOICE_REF_TEXT = 'This is my standard voice sample for my digital twin. I speak clearly, at a steady pace, with a natural tone. The system will use this recording to learn my voice and speech patterns. I always avoid long pauses and speak naturally at all times.'
 
 export default function CreatePersona() {
   const navigate = useNavigate()
@@ -90,6 +91,29 @@ export default function CreatePersona() {
   const [recordingTime, setRecordingTime] = useState(0)
   const recordingTimerRef = useRef(null)
   const [recordError, setRecordError] = useState(null)
+  const [voiceDuration, setVoiceDuration] = useState(0)
+  const lastRecordSecondsRef = useRef(0)
+  const [voiceDurationError, setVoiceDurationError] = useState('')
+
+  const measureAudioDuration = (file) => new Promise((resolve) => {
+    try {
+      const audio = document.createElement('audio')
+      const url = URL.createObjectURL(file)
+      audio.preload = 'metadata'
+      audio.onloadedmetadata = () => {
+        const duration = Number.isFinite(audio.duration) ? audio.duration : 0
+        URL.revokeObjectURL(url)
+        resolve(duration || 0)
+      }
+      audio.onerror = () => {
+        URL.revokeObjectURL(url)
+        resolve(0)
+      }
+      audio.src = url
+    } catch (e) {
+      resolve(0)
+    }
+  })
 
   const startCamera = () => {
     setCameraError(null)
@@ -166,6 +190,8 @@ export default function CreatePersona() {
   const startRecording = () => {
     setRecordError(null)
     setVoiceFile(null)
+    setVoiceDuration(0)
+    setVoiceDurationError('')
     navigator.mediaDevices
       .getUserMedia({ audio: true })
       .then((stream) => {
@@ -180,7 +206,11 @@ export default function CreatePersona() {
           if (chunks.length) {
             const blob = new Blob(chunks, { type: mime })
             const ext = mime.includes('webm') ? 'webm' : 'ogg'
-            setVoiceFile(new File([blob], `recording.${ext}`, { type: blob.type }))
+            const file = new File([blob], `recording.${ext}`, { type: blob.type })
+            if (true) {
+              setVoiceFile(file)
+              measureAudioDuration(file).then((d) => setVoiceDuration(d))
+            }
           }
           if (recordingTimerRef.current) {
             clearInterval(recordingTimerRef.current)
@@ -192,7 +222,12 @@ export default function CreatePersona() {
         mediaRecorderRef.current = recorder
         setRecording(true)
         setRecordingTime(0)
-        recordingTimerRef.current = setInterval(() => setRecordingTime((t) => t + 1), 1000)
+        lastRecordSecondsRef.current = 0
+        recordingTimerRef.current = setInterval(() => setRecordingTime((t) => {
+          const next = t + 1
+          lastRecordSecondsRef.current = next
+          return next
+        }), 1000)
       })
       .catch((err) => setRecordError(err.message || 'Could not access microphone'))
   }
@@ -204,7 +239,12 @@ export default function CreatePersona() {
     setRecording(false)
   }
 
-  const clearVoice = () => setVoiceFile(null)
+  const clearVoice = () => {
+    setVoiceFile(null)
+    setVoiceDuration(0)
+    setRecordError(null)
+    setVoiceDurationError('')
+  }
 
   const goNext = () => {
     setError(null)
@@ -241,6 +281,7 @@ export default function CreatePersona() {
       setError('Please complete step 2: ' + missing.join(', ') + '.')
       return
     }
+
     setSubmitting(true)
     const form = new FormData()
     form.set('name', name.trim())
@@ -250,6 +291,7 @@ export default function CreatePersona() {
     } else {
       form.set('face', faceFile)
       form.set('voice', voiceFile)
+      form.set('voice_ref_text', VOICE_REF_TEXT)
     }
     if (selectedRolePackId && purchasedRolePacks.some((r) => r.id === selectedRolePackId)) {
       form.set('assigned_role_pack_id', selectedRolePackId)
@@ -427,7 +469,20 @@ export default function CreatePersona() {
             </fieldset>
             <fieldset className="create-fieldset" style={selectedAvatarId ? { opacity: 0.6 } : undefined}>
               <legend>Voice {selectedAvatarId ? '(optional when using purchased avatar)' : ''}</legend>
-              <p className="create-field-hint">This will be your twin&apos;s voice.</p>
+              <p className="create-field-hint">This will be your twin&apos;s voice. Read the script below clearly and at a natural pace, then stop the recording.</p>
+              <div className="voice-script">
+                <div className="voice-script-header">
+                  <span>Read this script while recording</span>
+                  <button
+                    type="button"
+                    className="btn-link"
+                    onClick={() => navigator.clipboard?.writeText(VOICE_REF_TEXT)}
+                  >
+                    Copy
+                  </button>
+                </div>
+                <p>{VOICE_REF_TEXT}</p>
+              </div>
               {!recording ? (
                 <button type="button" className="btn-secondary" onClick={startRecording} disabled={!!selectedAvatarId}>Record voice</button>
               ) : (
@@ -437,6 +492,7 @@ export default function CreatePersona() {
                 </div>
               )}
               {recordError && <p className="error">{recordError}</p>}
+              {voiceDurationError && <p className="error">{voiceDurationError}</p>}
               {voiceFile && !recording && (
                 <p className="file-set">
                   <span>Recording set: {voiceFile.name}</span>
@@ -444,7 +500,29 @@ export default function CreatePersona() {
                 </p>
               )}
               <p className="or">or upload an audio file (WAV preferred)</p>
-              <input type="file" accept="audio/*,.wav" onChange={(e) => { const f = e.target.files?.[0]; if (f) { setVoiceFile(f); setSelectedAvatarId('') } }} disabled={!!selectedAvatarId} />
+              <input
+                type="file"
+                accept="audio/*,.wav"
+                onChange={(e) => {
+                  const f = e.target.files?.[0]
+                  if (f) {
+                    setVoiceFile(f)
+                    setSelectedAvatarId('')
+                    setRecordError(null)
+                    measureAudioDuration(f).then((d) => {
+                      setVoiceDuration(d)
+                      if (d && d < MIN_VOICE_SECONDS) {
+                        setVoiceDurationError(`Audio must be at least ${MIN_VOICE_SECONDS} seconds.`)
+                      } else if (d && d > MAX_VOICE_SECONDS) {
+                        setVoiceDurationError(`Audio must be at most ${MAX_VOICE_SECONDS} seconds.`)
+                      } else {
+                        setVoiceDurationError('')
+                      }
+                    })
+                  }
+                }}
+                disabled={!!selectedAvatarId}
+              />
             </fieldset>
           </div>
         )}
@@ -609,6 +687,9 @@ export default function CreatePersona() {
         .camera-actions button:disabled { opacity: 0.6; cursor: not-allowed; }
         .record-box { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin: 0.5rem 0; }
         .record-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--error); animation: create-pulse 1s infinite; }
+        .voice-script { margin: 0.75rem 0; padding: 0.75rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-input); }
+        .voice-script-header { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; font-size: 0.9rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+        .voice-script p { margin: 0; line-height: 1.5; }
         @keyframes create-pulse { 50% { opacity: 0.5; } }
         .file-set { font-size: 0.9rem; color: var(--text-secondary); margin: 0.25rem 0; }
         .or { font-size: 0.85rem; color: var(--text-muted); margin: 0.75rem 0 0.25rem; }

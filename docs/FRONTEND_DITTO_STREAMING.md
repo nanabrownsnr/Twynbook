@@ -91,7 +91,7 @@ Then send this byte string in one or more WebSocket binary messages, then send a
 Use a library that supports WebSockets (e.g. `websockets`, or `httpx` with WebSocket support). Example structure (pseudocode):
 
 ```python
-async def ditto_stream_generate(image_id: str, audio_float32_16k: bytes, output_path: str) -> None:
+async def ditto_stream_generate(image_id: str, output_path: str, *, audio_float32_16k: bytes) -> None:
     ws_url = f"{DITTO_STREAMING_URL}/stream?image_id={image_id}"
     async with websockets.connect(ws_url) as ws:
         # Send audio in chunks (e.g. 64 KB)

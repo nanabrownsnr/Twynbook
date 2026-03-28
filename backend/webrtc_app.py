@@ -8,6 +8,7 @@ import json
 import logging
 import uuid
 import time
+import os
 from fractions import Fraction
 
 import av
@@ -25,6 +26,18 @@ from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 
 log = logging.getLogger("webrtc")
 sessions: dict = {}
+
+TURN_URL = os.environ.get("TURN_URL", "").strip()
+TURN_USERNAME = os.environ.get("TURN_USERNAME", "").strip()
+TURN_PASSWORD = os.environ.get("TURN_PASSWORD", "").strip()
+
+def _ice_servers():
+    servers = [RTCIceServer("stun:stun.l.google.com:19302")]
+    if TURN_URL and TURN_USERNAME and TURN_PASSWORD:
+        urls = [u.strip() for u in TURN_URL.split(",") if u.strip()]
+        if urls:
+            servers.append(RTCIceServer(urls=urls, username=TURN_USERNAME, credential=TURN_PASSWORD))
+    return servers
 
 class QueueVideoTrack(MediaStreamTrack):
     kind = "video"
@@ -170,7 +183,7 @@ async def signaling(websocket: WebSocket):
             action = msg.get("action")
             if action == "create_session":
                 session_id = str(uuid.uuid4())
-                pc = RTCPeerConnection(RTCConfiguration([RTCIceServer("stun:stun.l.google.com:19302")]))
+                pc = RTCPeerConnection(RTCConfiguration(_ice_servers()))
                 v_track, a_track = QueueVideoTrack(), QueueAudioTrack()
                 pc.addTrack(v_track); pc.addTrack(a_track)
                 sessions[session_id] = {"pc":pc, "v_track":v_track, "a_track":a_track, "init":None, "lock":asyncio.Lock()}

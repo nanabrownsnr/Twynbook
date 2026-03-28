@@ -16,6 +16,8 @@ export default function Home() {
   const [publishPrice, setPublishPrice] = useState('')
   const [publishing, setPublishing] = useState(false)
   const [publishError, setPublishError] = useState(null)
+  const [shareStatus, setShareStatus] = useState({})
+  const [shareModal, setShareModal] = useState({ open: false, url: '', copied: false })
   const user = getUser()
 
   const loadPersonas = () => {
@@ -81,6 +83,48 @@ export default function Home() {
       .then((r) => r.ok ? r.json() : Promise.reject())
       .then((updated) => setPersonas((prev) => prev.map((x) => x.id === updated.id ? updated : x)))
       .catch(() => {})
+  }
+
+  const handleShare = (e, p) => {
+    e.stopPropagation()
+    setShareStatus((prev) => ({ ...prev, [p.id]: { state: 'loading' } }))
+    apiFetch(`${API}/personas/${p.id}/share`, { method: 'POST' })
+      .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(new Error(t))))
+      .then((d) => {
+        const url = d.url || ''
+        setShareModal({ open: true, url, copied: false })
+        setShareStatus((prev) => ({ ...prev, [p.id]: { state: 'copied', url } }))
+        setTimeout(() => {
+          setShareStatus((prev) => {
+            if (!prev[p.id] || prev[p.id].state !== 'copied') return prev
+            return { ...prev, [p.id]: { state: 'idle', url } }
+          })
+        }, 2000)
+      })
+      .catch(() => setShareStatus((prev) => ({ ...prev, [p.id]: { state: 'error' } })))
+  }
+
+  const copyShareUrl = () => {
+    const url = shareModal.url
+    if (!url) return
+    const markCopied = () => setShareModal((prev) => ({ ...prev, copied: true }))
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(url).then(markCopied).catch(() => {
+        const input = document.querySelector('.share-input')
+        if (input) {
+          input.focus()
+          input.select()
+          try { document.execCommand('copy'); markCopied() } catch {}
+        }
+      })
+      return
+    }
+    const input = document.querySelector('.share-input')
+    if (input) {
+      input.focus()
+      input.select()
+      try { document.execCommand('copy'); markCopied() } catch {}
+    }
   }
 
   useEffect(() => {
@@ -182,12 +226,28 @@ export default function Home() {
                       <span className="persona-price">
                         {p.marketplace_price > 0 ? `$${Number(p.marketplace_price).toFixed(2)}/mo` : 'Free'}
                       </span>
-                      <button className="btn-unpublish" onClick={(e) => handleUnpublish(e, p)}>Unpublish</button>
+                      <div className="persona-actions-grid">
+                        <button className="btn-share" onClick={(e) => handleShare(e, p)}>
+                          {shareStatus[p.id]?.state === 'loading' ? 'Sharing…' :
+                            shareStatus[p.id]?.state === 'copied' ? 'Copied' :
+                            shareStatus[p.id]?.state === 'error' ? 'Try again' : 'Share'}
+                        </button>
+                        <button className="btn-unpublish" onClick={(e) => handleUnpublish(e, p)}>Unpublish</button>
+                      </div>
                     </>
                   ) : (
-                    <button className="btn-publish" onClick={() => openPublishModal(p)}>
-                      Publish to marketplace
-                    </button>
+                    <>
+                      <div className="persona-actions-grid">
+                        <button className="btn-publish" onClick={() => openPublishModal(p)}>
+                          Publish
+                        </button>
+                        <button className="btn-share" onClick={(e) => handleShare(e, p)}>
+                          {shareStatus[p.id]?.state === 'loading' ? 'Sharing…' :
+                            shareStatus[p.id]?.state === 'copied' ? 'Copied' :
+                            shareStatus[p.id]?.state === 'error' ? 'Try again' : 'Share'}
+                        </button>
+                      </div>
+                    </>
                   )}
                 </div>
               </div>
@@ -235,6 +295,25 @@ export default function Home() {
         </div>
       )}
 
+      {shareModal.open && (
+        <div className="modal-overlay" onClick={() => setShareModal({ open: false, url: '', copied: false })}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <button className="modal-close" onClick={() => setShareModal({ open: false, url: '', copied: false })} aria-label="Close">×</button>
+            <h2 className="modal-title">Share link</h2>
+            <p className="modal-hint">Anyone with this link can view and chat with your persona.</p>
+            <div className="share-row">
+              <input className="share-input" readOnly value={shareModal.url} onFocus={(e) => e.target.select()} />
+              <button className="share-copy" onClick={copyShareUrl} aria-label="Copy link" title="Copy link">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 9a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-7a2 2 0 0 1-2-2V9zm-5 5a2 2 0 0 0 2 2h1v-2H6V6h8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9z"/>
+                </svg>
+              </button>
+            </div>
+            {shareModal.copied && <p className="share-copied">Copied to clipboard.</p>}
+          </div>
+        </div>
+      )}
+
       <style>{`
         .home { padding: 2rem; max-width: 960px; margin: 0 auto; min-height: 100vh; background: var(--bg-page); }
         .home-loading { padding: 2rem; color: var(--text-secondary); }
@@ -269,20 +348,20 @@ export default function Home() {
         .home-section-title { font-family: var(--font-heading); font-size: 1.1rem; font-weight: 600; color: var(--text-primary); margin: 0 0 1rem; }
 
         /* Vertical list */
-        .persona-list { display: flex; flex-direction: column; gap: 0.75rem; }
+        .persona-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.9rem; }
 
         /* Row card */
-        .persona-row { display: flex; flex-direction: row; align-items: stretch; background: var(--bg-page); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; transition: box-shadow 0.2s, transform 0.15s; }
+        .persona-row { display: flex; flex-direction: column; align-items: stretch; background: var(--bg-page); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; transition: box-shadow 0.2s, transform 0.15s; height: 100%; }
         .persona-row:not(.persona-row-add):hover { box-shadow: var(--shadow); transform: translateY(-1px); }
 
         /* Thumbnail */
-        .persona-row-media { display: block; flex-shrink: 0; width: 120px; text-decoration: none; }
-        .persona-thumb { width: 120px; height: 120px; background: var(--border); display: flex; align-items: center; justify-content: center; overflow: hidden; }
+        .persona-row-media { display: block; width: 100%; text-decoration: none; }
+        .persona-thumb { width: 100%; height: 200px; background: var(--border); display: flex; align-items: center; justify-content: center; overflow: hidden; }
         .persona-thumb img, .persona-thumb video { width: 100%; height: 100%; object-fit: cover; }
         .persona-thumb.add-placeholder { font-size: 2.5rem; color: var(--text-muted); }
 
         /* Name + About + actions */
-        .persona-row-main { flex: 1; display: flex; flex-direction: column; justify-content: center; padding: 0.85rem 1rem 0.75rem; min-width: 0; gap: 0.35rem; }
+        .persona-row-main { display: flex; flex-direction: column; justify-content: center; padding: 0.9rem 0.95rem 0.75rem; min-width: 0; gap: 0.35rem; }
         .persona-row-name { font-family: var(--font-heading); font-size: 1rem; font-weight: 700; color: var(--text-primary); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .persona-row-name:hover { color: var(--primary); }
         .persona-row-about { font-size: 0.85rem; color: var(--text-secondary); line-height: 1.45; margin: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -294,11 +373,14 @@ export default function Home() {
         .persona-actions .btn-delete:disabled { opacity: 0.6; cursor: not-allowed; }
 
         /* Marketplace panel */
-        .persona-profile { width: 190px; flex-shrink: 0; border-left: 1px solid var(--border); padding: 0.85rem 1rem; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; gap: 0.5rem; background: var(--bg-card); }
-        .btn-publish { padding: 0.5rem 0.85rem; border-radius: var(--radius); border: 1px solid var(--primary); background: transparent; color: var(--primary); font-size: 0.82rem; font-weight: 600; cursor: pointer; white-space: nowrap; line-height: 1.3; text-align: left; }
+        .persona-profile { border-top: 1px solid var(--border); padding: 0.75rem 0.95rem; display: flex; flex-direction: column; justify-content: space-between; align-items: stretch; gap: 0.4rem; background: var(--bg-card); }
+        .btn-publish { padding: 0.45rem 0.6rem; border-radius: var(--radius); border: 1px solid var(--primary); background: transparent; color: var(--primary); font-size: 0.78rem; font-weight: 600; cursor: pointer; white-space: normal; line-height: 1.2; text-align: center; width: 100%; }
         .btn-publish:hover { background: var(--primary-muted); }
         .profile-badge-published { font-size: 0.78rem; font-weight: 700; color: #065f46; background: #d1fae5; padding: 0.2rem 0.55rem; border-radius: 999px; }
         .persona-price { font-size: 0.85rem; font-weight: 600; color: var(--text-primary); }
+        .persona-actions-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; }
+        .btn-share { padding: 0.45rem 0.6rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-page); color: var(--text-primary); font-size: 0.78rem; font-weight: 600; cursor: pointer; width: 100%; }
+        .btn-share:hover { border-color: var(--primary); color: var(--primary); }
         .btn-unpublish { font-size: 0.78rem; color: var(--text-muted); background: none; border: none; cursor: pointer; padding: 0; text-decoration: underline; }
         .btn-unpublish:hover { color: var(--error); }
 
@@ -326,8 +408,32 @@ export default function Home() {
         .modal-confirm { padding: 0.55rem 1.2rem; border-radius: var(--radius); border: none; background: var(--primary); color: #fff; font-weight: 600; font-size: 0.9rem; cursor: pointer; }
         .modal-confirm:hover:not(:disabled) { background: var(--primary-hover); }
         .modal-confirm:disabled { opacity: 0.65; cursor: not-allowed; }
+        .share-row { display: flex; gap: 0.6rem; align-items: center; }
+        .share-input { flex: 1; padding: 0.55rem 0.75rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-page); color: var(--text-primary); }
+        .share-copy { width: 40px; height: 40px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-card); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+        .share-copy:hover { border-color: var(--primary); color: var(--primary); }
+        .share-copy svg { width: 18px; height: 18px; fill: currentColor; }
+        .share-copied { margin: 0.5rem 0 0; font-size: 0.8rem; color: var(--text-muted); }
 
         .error { color: var(--error); }
+
+        @media (max-width: 980px) {
+          .persona-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+
+        @media (max-width: 720px) {
+          .home { padding: 1rem; }
+          .home-header { gap: 0.75rem; }
+          .home-header-actions { width: 100%; flex-wrap: wrap; }
+          .home-marketplace-btn, .home-admin-btn { width: 100%; text-align: center; }
+          .persona-list { grid-template-columns: 1fr; }
+          .persona-row { flex-direction: column; }
+          .persona-row-media { width: 100%; }
+          .persona-thumb { width: 100%; height: 180px; }
+          .persona-row-main { padding: 0.85rem; }
+          .persona-profile { width: 100%; border-left: none; border-top: 1px solid var(--border); }
+          .persona-actions { flex-wrap: wrap; gap: 0.5rem; }
+        }
       `}</style>
     </div>
   )
