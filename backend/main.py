@@ -71,6 +71,9 @@ SENTENCES_PER_CLIP = 2
 # Audio-mode sentence grouping (reduce TTS gaps between clips).
 AUDIO_FIRST_CLIP_SENTENCES = int(os.environ.get("AUDIO_FIRST_CLIP_SENTENCES", "1"))
 AUDIO_SENTENCES_PER_CLIP = int(os.environ.get("AUDIO_SENTENCES_PER_CLIP", "1"))
+# Video mode: first clip uses more sentences so the longer audio gives Ditto time to
+# pre-render clip 1 before clip 0 finishes playing (avoids the clip-0→1 stall gap).
+VIDEO_FIRST_CLIP_SENTENCES = int(os.environ.get("VIDEO_FIRST_CLIP_SENTENCES", str(AUDIO_FIRST_CLIP_SENTENCES)))
 # Audio-mode continuous chunking (no sentence boundaries)
 AUDIO_CONTINUOUS = os.environ.get("AUDIO_CONTINUOUS", "0").lower() in ("1", "true", "yes", "on")
 AUDIO_CHUNK_CHARS = int(os.environ.get("AUDIO_CHUNK_CHARS", "60"))
@@ -4350,8 +4353,9 @@ async def _run_chat_stream(ctx: dict):
                     max_sentences = AUDIO_FIRST_CLIP_SENTENCES if clip_index == 0 else AUDIO_SENTENCES_PER_CLIP
                     min_chars = AUDIO_CLIP_MIN_CHARS
             elif mode == "video" and clip_index == 0:
-                # First muxed Ditto clip: same sentence bundling as audio mode for earlier first fragment (single A/V clock in UI).
-                max_sentences = AUDIO_FIRST_CLIP_SENTENCES
+                # First muxed Ditto clip: VIDEO_FIRST_CLIP_SENTENCES (default 2) gives a longer
+                # first clip so Ditto has time to finish clip 1 before clip 0 plays out.
+                max_sentences = VIDEO_FIRST_CLIP_SENTENCES
                 min_chars = AUDIO_CLIP_MIN_CHARS
             else:
                 max_sentences = FIRST_CLIP_SENTENCES if clip_index == 0 else SENTENCES_PER_CLIP
@@ -4520,13 +4524,28 @@ async def _run_chat_stream(ctx: dict):
                         i, segment_count, time.monotonic() - t_start
                     )
         else:
-            # Video: TTS prefetch overlaps with Ditto for the *previous* clip; Ditto is always serial (one GPU).
+            # Video: TTS prefetch overlaps with Ditto for the previous clip.
+            # With multiple Ditto workers, a "lookahead" task starts Ditto for clip N+1 as soon
+            # as its TTS is ready — while clip N is still streaming — so both workers run in
+            # parallel and inter-clip gaps are eliminated.
             prefetch_task = asyncio.create_task(get_and_prefetch(0))
+            # lookahead holds a pre-started Ditto task for the NEXT clip (when >1 worker available).
+            lookahead: dict | None = None
 
             while True:
-                clip_data = await prefetch_task
-                if not clip_data:
-                    break
+                if lookahead is not None:
+                    # Ditto for this clip was already launched during the previous clip's streaming.
+                    clip_data = lookahead["clip_data"]
+                    seq_queue  = lookahead["seq_queue"]
+                    ditto_fut  = lookahead["ditto_fut"]
+                    metrics    = lookahead["metrics"]
+                    lookahead  = None
+                    # prefetch_task already points to clip i+2 (advanced when lookahead was created)
+                else:
+                    clip_data = await prefetch_task
+                    if not clip_data:
+                        break
+                    seq_queue = ditto_fut = metrics = None  # will be set in use_streaming block
 
                 i = clip_index
                 clip_index += 1
@@ -4538,8 +4557,9 @@ async def _run_chat_stream(ctx: dict):
 
                 current_text = clip_data["text"]
 
-                # Start next clip's TTS now so it runs while Ditto renders this clip.
-                prefetch_task = asyncio.create_task(get_and_prefetch(i + 1))
+                if ditto_fut is None:
+                    # Normal (non-lookahead) path: start next clip's TTS now so it overlaps Ditto.
+                    prefetch_task = asyncio.create_task(get_and_prefetch(i + 1))
 
                 for delta in clip_data.get("deltas", []):
                     yield ("event", "text_delta", {"text": delta})
@@ -4548,24 +4568,26 @@ async def _run_chat_stream(ctx: dict):
                     audio_queue = clip_data.get("audio_queue")
                     if audio_queue is None:
                         raise RuntimeError("Video streaming clip missing audio_queue")
-                    seq_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-                    worker_idx, ws_base = _pick_ditto_worker()
-                    metrics = clip_data.get("metrics") or {}
-                    metrics["worker_idx"] = worker_idx
-                    metrics["ws_base"] = ws_base
-                    metrics["tts_ready_at"] = time.monotonic()
-                    metrics["ditto_started_at"] = time.monotonic()
 
-                    ditto_fut = asyncio.ensure_future(
-                        ditto_stream_generate(
-                            image_id,
-                            clip_data["path"],
-                            seq_queue,
-                            audio_queue=audio_queue,
-                            ws_base=ws_base,
-                            worker_idx=worker_idx,
+                    if ditto_fut is None:
+                        # Normal path: start Ditto for this clip now.
+                        seq_queue = asyncio.Queue()
+                        worker_idx, ws_base = _pick_ditto_worker()
+                        metrics = clip_data.get("metrics") or {}
+                        metrics["worker_idx"] = worker_idx
+                        metrics["ws_base"] = ws_base
+                        metrics["tts_ready_at"] = time.monotonic()
+                        metrics["ditto_started_at"] = time.monotonic()
+                        ditto_fut = asyncio.ensure_future(
+                            ditto_stream_generate(
+                                image_id,
+                                clip_data["path"],
+                                seq_queue,
+                                audio_queue=audio_queue,
+                                ws_base=ws_base,
+                                worker_idx=worker_idx,
+                            )
                         )
-                    )
                     video_ditto_task = ditto_fut
 
                     segment_count = 0
@@ -4606,7 +4628,61 @@ async def _run_chat_stream(ctx: dict):
 
                             segment_count += 1
                             yield ("binary", i, chunk)
+
+                            # LOOKAHEAD: once TTS for clip i+1 is ready while we're still
+                            # streaming clip i, fire Ditto for it on the other worker immediately.
+                            # Only when >1 worker is available (otherwise serial is correct).
+                            if (
+                                lookahead is None
+                                and len(_DITTO_WS_BASES) > 1
+                                and prefetch_task.done()
+                                and not prefetch_task.cancelled()
+                            ):
+                                try:
+                                    next_clip = prefetch_task.result()
+                                    if next_clip and "error" not in next_clip:
+                                        next_sq: asyncio.Queue[bytes | None] = asyncio.Queue()
+                                        next_wi, next_wb = _pick_ditto_worker()
+                                        next_m = next_clip.get("metrics") or {}
+                                        next_m["worker_idx"] = next_wi
+                                        next_m["ws_base"] = next_wb
+                                        next_m["tts_ready_at"] = time.monotonic()
+                                        next_m["ditto_started_at"] = time.monotonic()
+                                        next_fut = asyncio.ensure_future(
+                                            ditto_stream_generate(
+                                                image_id,
+                                                next_clip["path"],
+                                                next_sq,
+                                                audio_queue=next_clip.get("audio_queue"),
+                                                ws_base=next_wb,
+                                                worker_idx=next_wi,
+                                            )
+                                        )
+                                        lookahead = {
+                                            "clip_data": next_clip,
+                                            "seq_queue": next_sq,
+                                            "ditto_fut": next_fut,
+                                            "metrics": next_m,
+                                        }
+                                        # Advance prefetch to clip i+2 so next iteration is ready.
+                                        prefetch_task = asyncio.create_task(get_and_prefetch(i + 2))
+                                        log.info(
+                                            "Lookahead: started Ditto for clip %s on worker %s"
+                                            " while clip %s is still streaming",
+                                            i + 1, next_wi, i,
+                                        )
+                                except Exception as _la_err:
+                                    log.warning("Lookahead: failed to pre-start clip %s Ditto: %s", i + 1, _la_err)
+
                     except asyncio.CancelledError:
+                        # Cancel lookahead Ditto first, then current.
+                        if lookahead is not None:
+                            lookahead["ditto_fut"].cancel()
+                            try:
+                                await lookahead["ditto_fut"]
+                            except Exception:
+                                pass
+                            lookahead = None
                         if not ditto_fut.done():
                             log.info(
                                 "Ditto stream: cancelling background task (pipeline cancelled) reply_id=%s",
@@ -4629,6 +4705,14 @@ async def _run_chat_stream(ctx: dict):
                             except Exception:
                                 pass
                         elif not ditto_fut.done():
+                            # Abnormal exit: cancel lookahead before cancelling current.
+                            if lookahead is not None:
+                                lookahead["ditto_fut"].cancel()
+                                try:
+                                    await lookahead["ditto_fut"]
+                                except Exception:
+                                    pass
+                                lookahead = None
                             log.info(
                                 "Ditto stream: cancelling orphan task (abnormal clip end / generator exit) reply_id=%s",
                                 reply_id,

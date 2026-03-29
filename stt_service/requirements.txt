@@ -1,0 +1,7 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+faster-whisper==1.1.0
+soundfile>=0.12.1
+numpy>=1.24.0
+python-multipart==0.0.17
+requests>=2.31.0

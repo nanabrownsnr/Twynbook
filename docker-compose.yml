@@ -25,7 +25,7 @@ services:
       - DATA_DIR=/app/data
       - STATIC_DIR=/app/static
       - DITTO_STREAMING=1
-      - DITTO_API_URLS=http://127.0.0.1:8080
+      - DITTO_API_URLS=http://127.0.0.1:8080,http://127.0.0.1:8081
       # WebRTC media server is same process at /webrtc; backend pushes segments here
       - MEDIA_SERVER_WS_URL=ws://localhost:8087/webrtc
       - STT_BASE_URL=http://127.0.0.1:8090
@@ -53,6 +53,7 @@ services:
       - AUDIO_CLIP_MIN_CHARS=0
       - AUDIO_FIRST_CLIP_SENTENCES=1
       - AUDIO_SENTENCES_PER_CLIP=1
+      - VIDEO_FIRST_CLIP_SENTENCES=2
       - XTTS_BASE_URL=http://127.0.0.1:8002
       - CHATTERBOX_BASE_URL=http://127.0.0.1:8000
       - TURN_URL=turn:178.194.34.219:3478?transport=udp,turn:178.194.34.219:3478?transport=tcp

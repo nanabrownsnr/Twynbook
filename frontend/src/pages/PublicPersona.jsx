@@ -1,17 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { getToken } from '../auth'
+import { isVideoMseAvailable, pickMuxedCodecString } from '../mseVideo'
 
 const API = '/api'
-const CODECS = 'video/mp4; codecs="avc1.42401E,mp4a.40.2"'
 const AUDIO_CODECS = 'audio/mp4; codecs="mp4a.40.2"'
 const AUDIO_SAMPLE_RATE = 16000
 const AUDIO_START_PAD_SEC = 0.05
-const USE_MSE = !(
-  typeof import.meta !== 'undefined' &&
-  import.meta.env &&
-  import.meta.env.VITE_DITTO_STREAMING === '0'
-)
 
 function shareChatWsUrl(shareId) {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -222,7 +217,7 @@ export default function PublicPersona() {
       if (data?.text && !hasStreamedTextRef.current) {
         setChatLog((prev) => [...prev, { role: 'assistant', text: data.text }])
       }
-      if (USE_MSE) return
+      if (isVideoMseAvailable()) return
       const url = data?.url
       if (!url) return
       setReplyState((prev) => {
@@ -471,7 +466,7 @@ export default function PublicPersona() {
     setShowReply(false)
     idleVideoRef.current?.play().catch(() => {})
 
-    if (mode === 'video' && USE_MSE) {
+    if (mode === 'video' && isVideoMseAvailable()) {
       const ms = new MediaSource()
       const blobUrl = URL.createObjectURL(ms)
       const mseState = {
@@ -485,8 +480,9 @@ export default function PublicPersona() {
 
       ms.onsourceopen = () => {
         try {
-          const sb = ms.addSourceBuffer(CODECS)
-          sb.mode = 'sequence'
+          const codec = pickMuxedCodecString()
+          if (!codec) return
+          const sb = ms.addSourceBuffer(codec)
           sb.onupdateend = () => {
             mseState.appending[0] = false
             if (mseState.queue.length > 0) {
