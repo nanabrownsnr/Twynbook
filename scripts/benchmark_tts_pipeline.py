@@ -121,15 +121,31 @@ def measure_qwen(voice_id: str, text: str) -> tuple[float, float, int]:
 
 
 def measure_chatterbox(voice_id: str, text: str) -> tuple[float, float, int]:
-    params = urllib.parse.urlencode(
-        {"voice_id": voice_id, "text": text, "format": "wav"}
-    )
-    url = f"http://127.0.0.1:8000/api/tts/stream?{params}"
+    """Match TwynBook Chatterbox path: GET /api/tts/pcm + low-latency ffmpeg -> 16k f32le."""
+    params = urllib.parse.urlencode({"voice_id": voice_id, "text": text})
+    url = f"http://127.0.0.1:8000/api/tts/pcm?{params}"
+    t0 = time.perf_counter()
+    req = urllib.request.Request(url)
+    resp = urllib.request.urlopen(req, timeout=180)
+    hdrs = resp.headers
+    sr = int(hdrs.get("X-Sample-Rate") or hdrs.get("x-sample-rate") or "24000")
+    ch = int(hdrs.get("X-Channels") or hdrs.get("x-channels") or "1")
+
     ff = subprocess.Popen(
         [
             "ffmpeg",
             "-loglevel",
             "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-f",
+            "s16le",
+            "-ar",
+            str(sr),
+            "-ac",
+            str(ch),
             "-i",
             "pipe:0",
             "-f",
@@ -144,13 +160,26 @@ def measure_chatterbox(voice_id: str, text: str) -> tuple[float, float, int]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    curl = subprocess.Popen(
-        ["curl", "-sS", "--max-time", "180", url],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    threading.Thread(target=pump, args=(curl, ff), daemon=True).start()
-    t0 = time.perf_counter()
+
+    def pump_resp() -> None:
+        try:
+            assert ff.stdin is not None
+            while True:
+                chunk = resp.read(32768)
+                if not chunk:
+                    break
+                ff.stdin.write(chunk)
+        finally:
+            try:
+                ff.stdin.close()
+            except Exception:
+                pass
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=pump_resp, daemon=True).start()
     buf = b""
     while len(buf) < FIRST_BYTES:
         piece = ff.stdout.read(FIRST_BYTES - len(buf))
@@ -161,7 +190,6 @@ def measure_chatterbox(voice_id: str, text: str) -> tuple[float, float, int]:
     while ff.stdout.read(65536):
         pass
     ff.wait(timeout=30)
-    curl.wait(timeout=5)
     t_end = time.perf_counter()
     return (t_first - t0, t_end - t0, len(buf))
 
@@ -178,7 +206,7 @@ def main() -> None:
         print(f"=== {label} text ({len(text)} chars) ===")
         for name, fn, vid in (
             ("Qwen+ffmpeg (TwynBook path)", measure_qwen, qv),
-            ("Chatterbox+ffmpeg (TwynBook path)", measure_chatterbox, cv),
+            ("Chatterbox PCM+ffmpeg (TwynBook path)", measure_chatterbox, cv),
         ):
             ttffs = []
             totals = []

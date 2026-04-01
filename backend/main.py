@@ -107,6 +107,10 @@ XTTS_LANGUAGE = os.environ.get("XTTS_LANGUAGE", "en").strip()
 # Add a small silence pad to smooth starts/ends of video clips (video mode only).
 DITTO_SILENCE_PRE_MS = int(os.environ.get("DITTO_SILENCE_PRE_MS", "120"))
 DITTO_SILENCE_POST_MS = int(os.environ.get("DITTO_SILENCE_POST_MS", "180"))
+# Chatterbox TTS streaming (TwynBook-only; does not affect other providers)
+CB_FFMPEG_LOW_LATENCY = os.environ.get("CB_FFMPEG_LOW_LATENCY", "1").strip().lower() in ("1", "true", "yes", "on")
+CB_HTTP_CHUNK_SIZE = max(4096, int(os.environ.get("CB_HTTP_CHUNK_SIZE", "32768")))
+CB_TTS_RAW_PCM = os.environ.get("CB_TTS_RAW_PCM", "1").strip().lower() in ("1", "true", "yes", "on")
 # Optional clip length caps (set env to enable). When unset, no hard max is enforced.
 FIRST_CLIP_MAX_CHARS = int(os.environ["FIRST_CLIP_MAX_CHARS"]) if os.environ.get("FIRST_CLIP_MAX_CHARS") else None
 CLIP_MAX_CHARS = int(os.environ["CLIP_MAX_CHARS"]) if os.environ.get("CLIP_MAX_CHARS") else None
@@ -2165,21 +2169,32 @@ def _audio_to_wav(data: bytes, content_type: str) -> bytes:
         raise HTTPException(400, "Could not convert voice to WAV. Rebuild the Docker image so the container includes ffmpeg (and optionally pydub).") from e
 
 
-def _start_tts_stream_to_audio_queue(voice_id: str, text: str, q: "asyncio.Queue[bytes | None]", loop: asyncio.AbstractEventLoop) -> None:
-    """Stream TTS audio into ffmpeg and push 16kHz float32 chunks into an asyncio queue."""
-    url = f"{CHATTERBOX_BASE_URL}/api/tts/stream"
-    params = {
-        "voice_id": voice_id,
-        "text": (text or "").strip()[:TTS_MAX_CHARS],
-        "format": "wav",
-    }
+def _start_tts_stream_to_audio_queue(
+    voice_id: str,
+    text: str,
+    q: "asyncio.Queue[bytes | None]",
+    loop: asyncio.AbstractEventLoop,
+    video_mode: bool = False,
+) -> None:
+    """Stream Chatterbox TTS into ffmpeg and push 16kHz float32 chunks into an asyncio queue.
+
+    Uses GET /api/tts/pcm when CB_TTS_RAW_PCM=1 (lower latency than WAV container).
+    Pre/post silence pads apply only in video_mode (Ditto clip boundary smoothing).
+    """
+    text_clean = (text or "").strip()[:TTS_MAX_CHARS]
+    use_pcm = bool(CB_TTS_RAW_PCM and (CHATTERBOX_BASE_URL or "").strip())
+    if use_pcm:
+        url = f"{CHATTERBOX_BASE_URL.rstrip('/')}/api/tts/pcm"
+        params: dict = {"voice_id": voice_id, "text": text_clean}
+    else:
+        url = f"{CHATTERBOX_BASE_URL.rstrip('/')}/api/tts/stream"
+        params = {"voice_id": voice_id, "text": text_clean, "format": "wav"}
     gain = float(os.environ.get("AUDIO_GAIN", "1.0") or 1.0)
     t0 = time.monotonic()
-    # ffmpeg: wav (stdin) -> raw float32 16k mono (stdout)
-    proc = subprocess.Popen(
-        ["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+    ff_base = ["ffmpeg", "-loglevel", "error"]
+    if CB_FFMPEG_LOW_LATENCY:
+        ff_base.extend(["-fflags", "nobuffer", "-flags", "low_delay"])
+    chunk_sz = CB_HTTP_CHUNK_SIZE
 
     def _put(item: bytes | None):
         fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
@@ -2189,6 +2204,8 @@ def _start_tts_stream_to_audio_queue(voice_id: str, text: str, q: "asyncio.Queue
     total_in = 0
     status_code = None
     content_type = None
+    proc: subprocess.Popen | None = None
+    reader: threading.Thread | None = None
 
     def _silence_f32_bytes(ms: int, sr: int = 16000) -> bytes:
         if not ms or ms <= 0:
@@ -2200,6 +2217,7 @@ def _start_tts_stream_to_audio_queue(voice_id: str, text: str, q: "asyncio.Queue
         return (np.zeros(n, dtype=np.float32)).tobytes()
 
     def _read_stdout():
+        assert proc is not None
         try:
             while True:
                 data = proc.stdout.read(65536)
@@ -2219,13 +2237,7 @@ def _start_tts_stream_to_audio_queue(voice_id: str, text: str, q: "asyncio.Queue
         except Exception:
             pass
 
-    reader = threading.Thread(target=_read_stdout, daemon=True)
-    reader.start()
-
     try:
-        pre = _silence_f32_bytes(DITTO_SILENCE_PRE_MS)
-        if pre:
-            _put(pre)
         with httpx.Client(timeout=60.0) as client:
             with client.stream("GET", url, params=params) as r:
                 try:
@@ -2240,39 +2252,110 @@ def _start_tts_stream_to_audio_queue(voice_id: str, text: str, q: "asyncio.Queue
                         "Chatterbox TTS failed HTTP %s voice_id=%s text_len=%s body=%s",
                         e.response.status_code,
                         voice_id,
-                        len((text or "").strip()),
+                        len(text_clean),
                         body or "(no body)",
                     )
                     raise
                 status_code = r.status_code
                 content_type = r.headers.get("content-type")
-                for chunk in r.iter_bytes(chunk_size=8192):
-                    if not chunk:
-                        continue
-                    total_in += len(chunk)
-                    if proc.stdin:
-                        proc.stdin.write(chunk)
-        if proc.stdin:
-            proc.stdin.close()
-        reader.join(timeout=5)
-        proc.wait(timeout=10)
+                if use_pcm:
+                    try:
+                        sr_in = int(r.headers.get("x-sample-rate") or "24000")
+                    except ValueError:
+                        sr_in = 24000
+                    try:
+                        ch_in = int(r.headers.get("x-channels") or "1")
+                    except ValueError:
+                        ch_in = 1
+                    bits = int(r.headers.get("x-bits-per-sample") or "16")
+                    if bits != 16:
+                        log.warning("Chatterbox PCM unexpected x-bits-per-sample=%s; assuming s16le", bits)
+                    proc = subprocess.Popen(
+                        ff_base
+                        + [
+                            "-f",
+                            "s16le",
+                            "-ar",
+                            str(sr_in),
+                            "-ac",
+                            str(ch_in),
+                            "-i",
+                            "pipe:0",
+                            "-f",
+                            "f32le",
+                            "-ar",
+                            "16000",
+                            "-ac",
+                            "1",
+                            "pipe:1",
+                        ],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                else:
+                    ff_cmd = list(ff_base)
+                    if CB_FFMPEG_LOW_LATENCY:
+                        ff_cmd.extend(["-probesize", "32", "-analyzeduration", "0"])
+                    ff_cmd.extend(["-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"])
+                    proc = subprocess.Popen(
+                        ff_cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                reader = threading.Thread(target=_read_stdout, daemon=True)
+                reader.start()
+                if video_mode:
+                    pre = _silence_f32_bytes(DITTO_SILENCE_PRE_MS)
+                    if pre:
+                        _put(pre)
+                try:
+                    for chunk in r.iter_bytes(chunk_size=chunk_sz):
+                        if not chunk:
+                            continue
+                        total_in += len(chunk)
+                        if proc.stdin:
+                            proc.stdin.write(chunk)
+                finally:
+                    try:
+                        if proc.stdin:
+                            proc.stdin.close()
+                    except Exception:
+                        pass
+                    if reader:
+                        reader.join(timeout=5)
+                    try:
+                        proc.wait(timeout=10)
+                    except Exception:
+                        pass
+    except Exception as e:
+        log.warning("Chatterbox TTS stream error: %s", e)
     finally:
-        try:
-            err = proc.stderr.read() if proc.stderr else b""
-            if err:
-                log.warning("TTS ffmpeg stderr: %s", err.decode("utf-8", "replace"))
-        except Exception:
-            pass
+        if proc is not None:
+            try:
+                err = proc.stderr.read() if proc.stderr else b""
+                if err:
+                    log.warning("TTS ffmpeg stderr: %s", err.decode("utf-8", "replace"))
+            except Exception:
+                pass
         audio_seconds = total_out / float(16000 * 4) if total_out else 0.0
         total_s = time.monotonic() - t0
         rtf = (total_s / audio_seconds) if audio_seconds > 0 else None
         rtf_str = f"{rtf:.2f}" if rtf is not None else "n/a"
         log.info(
-            "TTS stream stats: status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s audio_s=%.2f total_s=%.2f rtf=%s",
-            status_code, content_type, total_in, total_out, len((text or "").strip()),
-            audio_seconds, total_s, rtf_str,
+            "TTS stream stats: pcm=%s video_mode=%s status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s audio_s=%.2f total_s=%.2f rtf=%s",
+            use_pcm,
+            video_mode,
+            status_code,
+            content_type,
+            total_in,
+            total_out,
+            len(text_clean),
+            audio_seconds,
+            total_s,
+            rtf_str,
         )
-        # If streaming returned nothing, fallback to non-stream TTS (download/wav)
         if total_out == 0:
             try:
                 log.warning("TTS stream produced no audio; falling back to download/wav")
@@ -2282,9 +2365,10 @@ def _start_tts_stream_to_audio_queue(voice_id: str, text: str, q: "asyncio.Queue
                     _put(f32)
             except Exception:
                 pass
-        post = _silence_f32_bytes(DITTO_SILENCE_POST_MS)
-        if post:
-            _put(post)
+        if video_mode:
+            post = _silence_f32_bytes(DITTO_SILENCE_POST_MS)
+            if post:
+                _put(post)
         _put(None)
 
 
@@ -3296,8 +3380,9 @@ def _start_audio_tts_stream_to_queue(
     text: str,
     q: "asyncio.Queue[bytes | None]",
     loop: asyncio.AbstractEventLoop,
+    video_mode: bool = False,
 ) -> None:
-    log.info("Audio TTS: provider=%s voice_wav=%s", TTS_PROVIDER, bool(voice_wav_path))
+    log.info("Audio TTS: provider=%s voice_wav=%s video_mode=%s", TTS_PROVIDER, bool(voice_wav_path), video_mode)
     if TTS_PROVIDER == "xtts" and voice_wav_path and XTTS_BASE_URL:
         _start_xtts_stream_to_audio_queue(voice_wav_path, text, q, loop)
         return
@@ -3310,7 +3395,7 @@ def _start_audio_tts_stream_to_queue(
     if TTS_PROVIDER == "cosyvoice" and voice_wav_path and (COSYVOICE_USE_TRITON or COSYVOICE_BASE_URL):
         _start_cosyvoice_stream_to_audio_queue(voice_wav_path, voice_ref_text, text, voice_id, q, loop)
         return
-    _start_tts_stream_to_audio_queue(voice_id, text, q, loop)
+    _start_tts_stream_to_audio_queue(voice_id, text, q, loop, video_mode)
 
 
 def _start_tts_stream_to_mp4_audio_queue(voice_id: str, text: str, q: "asyncio.Queue[bytes | None]", loop: asyncio.AbstractEventLoop, out: dict | None = None) -> None:
@@ -4600,7 +4685,7 @@ async def _run_chat_stream(ctx: dict):
                 audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
                 tts_thread = threading.Thread(
                     target=_start_audio_tts_stream_to_queue,
-                    args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_to_prefetch, audio_queue, loop),
+                    args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_to_prefetch, audio_queue, loop, True),
                     daemon=True,
                 )
                 tts_thread.start()
@@ -4760,7 +4845,7 @@ async def _run_chat_stream(ctx: dict):
                     audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=0 if unbounded else 8)
                     tts_thread = threading.Thread(
                         target=_start_audio_tts_stream_to_queue,
-                        args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_value, audio_queue, loop),
+                        args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_value, audio_queue, loop, False),
                         daemon=True,
                     )
                     tts_thread.start()
