@@ -1,9 +1,11 @@
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate, Link, useLocation } from 'react-router-dom'
-import { apiFetch, authHeaders } from '../auth'
+import { apiFetch } from '../auth'
 
 const API = '/api'
 const STEPS = 3
+const MIN_VOICE_SECONDS = 15
+const MAX_VOICE_SECONDS = 20
 const VOICE_REF_TEXT = 'This is my standard voice sample for my digital twin. I speak clearly, at a steady pace, with a natural tone. The system will use this recording to learn my voice and speech patterns. I always avoid long pauses and speak naturally at all times.'
 
 export default function CreatePersona() {
@@ -26,8 +28,11 @@ export default function CreatePersona() {
   const purchasedAvatars = purchases.filter((l) => listingType(l) === 'avatar')
   const purchasedRolePacks = purchases.filter((l) => listingType(l) === 'role_pack')
   const purchasedTools = purchases.filter((l) => listingType(l) === 'integration')
+  const purchasedKnowledgePacks = purchases.filter((l) => listingType(l) === 'knowledge_pack')
   const [selectedToolIds, setSelectedToolIds] = useState([])
+  const [selectedKnowledgePackIds, setSelectedKnowledgePackIds] = useState([])
   const [marketplaceModalOpen, setMarketplaceModalOpen] = useState(false)
+  const [marketplaceModalTab, setMarketplaceModalTab] = useState('tools') // 'tools' | 'knowledge'
   const [marketplaceListings, setMarketplaceListings] = useState([])
   const [marketplaceLoading, setMarketplaceLoading] = useState(false)
   const [marketplaceBuying, setMarketplaceBuying] = useState(null)
@@ -58,6 +63,7 @@ export default function CreatePersona() {
   }, [marketplaceModalOpen])
 
   const marketplaceToolListings = marketplaceListings.filter((l) => listingType(l) === 'integration')
+  const marketplaceKnowledgeListings = marketplaceListings.filter((l) => listingType(l) === 'knowledge_pack')
   const isOwnedInModal = (id) => purchases.some((p) => p.id === id)
   const handleMarketplaceBuy = (listing) => {
     setMarketplaceBuying(listing.id)
@@ -72,6 +78,10 @@ export default function CreatePersona() {
 
   const toggleTool = (id) => {
     setSelectedToolIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+  }
+
+  const toggleKnowledgePack = (id) => {
+    setSelectedKnowledgePackIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
   }
 
   useEffect(() => {
@@ -298,6 +308,9 @@ export default function CreatePersona() {
     }
     if (selectedToolIds.length > 0) {
       form.set('assigned_listing_ids', JSON.stringify(selectedToolIds))
+    }
+    if (selectedKnowledgePackIds.length > 0) {
+      form.set('knowledge_pack_ids', JSON.stringify(selectedKnowledgePackIds))
     }
     docFiles.forEach((file) => form.append('documents', file))
     apiFetch(`${API}/personas/create`, { method: 'POST', body: form })
@@ -549,14 +562,41 @@ export default function CreatePersona() {
                     </label>
                   ))}
                 </div>
-                <button type="button" className="create-no-tools-link btn-marketplace-inline" onClick={() => setMarketplaceModalOpen(true)}>
+                <button type="button" className="create-no-tools-link btn-marketplace-inline" onClick={() => { setMarketplaceModalTab('tools'); setMarketplaceModalOpen(true) }}>
                   Browse more tools in marketplace →
                 </button>
               </>
             ) : null}
+            {purchasedKnowledgePacks.length > 0 && (
+              <div className="create-kb-packs-section">
+                <h3 className="create-tools-title">Knowledge packs <span className="create-optional">(optional)</span></h3>
+                <p className="create-kb-hint">Bundles from the marketplace are copied into this twyn&apos;s knowledge base at creation time.</p>
+                <div className="create-tools-list">
+                  {purchasedKnowledgePacks.map((listing) => (
+                    <label key={listing.id} className="create-tool-row">
+                      <input
+                        type="checkbox"
+                        checked={selectedKnowledgePackIds.includes(listing.id)}
+                        onChange={() => toggleKnowledgePack(listing.id)}
+                      />
+                      <div className="create-tool-info">
+                        {listing.logo_url && <img src={listing.logo_url} alt="" className="create-tool-logo" />}
+                        <span className="create-tool-name">{listing.name}</span>
+                        {listing.knowledge_pack_file_count != null && (
+                          <span className="create-pack-count">{listing.knowledge_pack_file_count} files</span>
+                        )}
+                      </div>
+                    </label>
+                  ))}
+                </div>
+                <button type="button" className="create-no-tools-link btn-marketplace-inline" onClick={() => { setMarketplaceModalTab('knowledge'); setMarketplaceModalOpen(true) }}>
+                  Browse knowledge packs in marketplace →
+                </button>
+              </div>
+            )}
             <div className="create-kb-section">
               <h3 className="create-tools-title">Knowledge base <span className="create-optional">(optional)</span></h3>
-              <p className="create-kb-hint">Add PDF or TXT documents. Your twyn will use them when answering questions.</p>
+              <p className="create-kb-hint">Add your own PDF or TXT documents (in addition to any packs above). Your twyn will use them when answering questions.</p>
               <label className="create-doc-upload">
                 <input
                   type="file"
@@ -582,7 +622,12 @@ export default function CreatePersona() {
                 <svg className="create-no-tools-icon" xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/><line x1="12" y1="12" x2="12" y2="16"/><line x1="10" y1="14" x2="14" y2="14"/></svg>
                 <p className="create-no-tools-text">No tools purchased yet.</p>
                 <p className="create-no-tools-hint">Buy tools in the marketplace to upskill your twyn. You can assign them here or after creation.</p>
-                <button type="button" className="create-no-tools-link" onClick={() => setMarketplaceModalOpen(true)}>Browse marketplace →</button>
+                <button type="button" className="create-no-tools-link" onClick={() => { setMarketplaceModalTab('tools'); setMarketplaceModalOpen(true) }}>Browse marketplace →</button>
+              </div>
+            )}
+            {purchasedKnowledgePacks.length === 0 && (
+              <div className="create-no-kp-hint">
+                <p className="create-field-hint">No knowledge packs yet. <button type="button" className="btn-link" onClick={() => { setMarketplaceModalTab('knowledge'); setMarketplaceModalOpen(true) }}>Browse marketplace</button> for curated document bundles.</p>
               </div>
             )}
           </div>
@@ -592,20 +637,57 @@ export default function CreatePersona() {
           <div className="create-marketplace-overlay" onClick={() => setMarketplaceModalOpen(false)}>
             <div className="create-marketplace-modal" onClick={(e) => e.stopPropagation()}>
               <div className="create-marketplace-header">
-                <h3>Buy tools</h3>
+                <h3>{marketplaceModalTab === 'tools' ? 'Buy tools' : 'Buy knowledge packs'}</h3>
                 <button type="button" className="create-marketplace-close" onClick={() => setMarketplaceModalOpen(false)} aria-label="Close">×</button>
               </div>
-              <p className="create-marketplace-hint">Quick buy a tool and continue creating. Your progress is saved.</p>
+              <div className="create-marketplace-tabs">
+                <button type="button" className={marketplaceModalTab === 'tools' ? 'active' : ''} onClick={() => setMarketplaceModalTab('tools')}>Tools</button>
+                <button type="button" className={marketplaceModalTab === 'knowledge' ? 'active' : ''} onClick={() => setMarketplaceModalTab('knowledge')}>Knowledge packs</button>
+              </div>
+              <p className="create-marketplace-hint">
+                {marketplaceModalTab === 'tools'
+                  ? 'Quick buy a tool and continue creating. Your progress is saved.'
+                  : 'Buy a document bundle, then select it above to attach to this twyn.'}
+              </p>
               {marketplaceLoading ? (
                 <p className="create-field-hint">Loading…</p>
-              ) : marketplaceToolListings.length === 0 ? (
-                <p className="create-field-hint">No tools in the marketplace yet.</p>
+              ) : marketplaceModalTab === 'tools' ? (
+                marketplaceToolListings.length === 0 ? (
+                  <p className="create-field-hint">No tools in the marketplace yet.</p>
+                ) : (
+                  <div className="create-marketplace-grid">
+                    {marketplaceToolListings.map((listing) => (
+                      <div key={listing.id} className="create-marketplace-card">
+                        {listing.logo_url && <img src={listing.logo_url} alt="" className="create-marketplace-card-logo" />}
+                        <span className="create-marketplace-card-name">{listing.name}</span>
+                        {listing.price > 0 && <span className="create-marketplace-card-price">${listing.price.toFixed(2)}/mo</span>}
+                        {isOwnedInModal(listing.id) ? (
+                          <span className="create-marketplace-owned">Owned</span>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn-primary create-marketplace-buy"
+                            disabled={marketplaceBuying === listing.id}
+                            onClick={() => handleMarketplaceBuy(listing)}
+                          >
+                            {marketplaceBuying === listing.id ? 'Processing…' : listing.price > 0 ? `Buy $${listing.price.toFixed(2)}/mo` : 'Add free'}
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )
+              ) : marketplaceKnowledgeListings.length === 0 ? (
+                <p className="create-field-hint">No knowledge packs in the marketplace yet.</p>
               ) : (
                 <div className="create-marketplace-grid">
-                  {marketplaceToolListings.map((listing) => (
+                  {marketplaceKnowledgeListings.map((listing) => (
                     <div key={listing.id} className="create-marketplace-card">
                       {listing.logo_url && <img src={listing.logo_url} alt="" className="create-marketplace-card-logo" />}
                       <span className="create-marketplace-card-name">{listing.name}</span>
+                      {listing.knowledge_pack_file_count != null && (
+                        <span className="create-marketplace-card-meta">{listing.knowledge_pack_file_count} files</span>
+                      )}
                       {listing.price > 0 && <span className="create-marketplace-card-price">${listing.price.toFixed(2)}/mo</span>}
                       {isOwnedInModal(listing.id) ? (
                         <span className="create-marketplace-owned">Owned</span>
@@ -720,6 +802,13 @@ export default function CreatePersona() {
         .create-marketplace-card-price { font-size: 0.9rem; color: var(--text-muted); }
         .create-marketplace-owned { font-size: 0.9rem; color: var(--primary); font-weight: 600; }
         .create-marketplace-buy { flex-shrink: 0; }
+        .create-kb-packs-section { margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px solid var(--border); }
+        .create-pack-count { font-size: 0.8rem; color: var(--text-muted); margin-left: 0.35rem; }
+        .create-no-kp-hint { margin-top: 0.75rem; }
+        .create-marketplace-tabs { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+        .create-marketplace-tabs button { padding: 0.35rem 0.75rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-card); color: var(--text-secondary); cursor: pointer; font-size: 0.875rem; }
+        .create-marketplace-tabs button.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+        .create-marketplace-card-meta { font-size: 0.8rem; color: var(--text-muted); width: 100%; }
         .create-kb-section { margin-top: 1.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); }
         .create-kb-hint { font-size: 0.875rem; color: var(--text-muted); margin: 0 0 0.5rem; }
         .create-doc-upload { display: inline-block; cursor: pointer; }

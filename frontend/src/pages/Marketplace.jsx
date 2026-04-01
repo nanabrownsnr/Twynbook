@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { apiFetch, getUser } from '../auth'
 
 const API = '/api'
+const KNOWLEDGE_PACK_MAX_DOCS = 5
 
 export default function Marketplace() {
   const user = getUser()
@@ -11,7 +12,7 @@ export default function Marketplace() {
   const [listings, setListings] = useState([])
   const [purchases, setPurchases] = useState([])
   const [loading, setLoading] = useState(true)
-  const [typeFilter, setTypeFilter] = useState('all') // 'all' | 'avatar' | 'integration' | 'role_pack'
+  const [typeFilter, setTypeFilter] = useState('all') // 'all' | 'avatar' | 'integration' | 'role_pack' | 'knowledge_pack' | 'twyn'
   const [modalListing, setModalListing] = useState(null)
   const [buying, setBuying] = useState(null)
   const [showAdminForm, setShowAdminForm] = useState(false)
@@ -19,6 +20,7 @@ export default function Marketplace() {
   const [form, setForm] = useState({ name: '', description: '', logo_url: '', price: '', mcp_server_url: '', listing_type: 'integration', role_prompt: '' })
   const [avatarFaceFile, setAvatarFaceFile] = useState(null)
   const [avatarVoiceFile, setAvatarVoiceFile] = useState(null)
+  const [knowledgePackFiles, setKnowledgePackFiles] = useState([])
   const [formSaving, setFormSaving] = useState(false)
   const [formError, setFormError] = useState(null)
 
@@ -69,6 +71,7 @@ export default function Marketplace() {
     setForm({ name: '', description: '', logo_url: '', price: '', mcp_server_url: '', listing_type: 'integration', role_prompt: '' })
     setAvatarFaceFile(null)
     setAvatarVoiceFile(null)
+    setKnowledgePackFiles([])
     setFormError(null)
     setShowAdminForm(true)
   }
@@ -86,6 +89,7 @@ export default function Marketplace() {
     })
     setAvatarFaceFile(null)
     setAvatarVoiceFile(null)
+    setKnowledgePackFiles([])
     setFormError(null)
     setShowAdminForm(true)
   }
@@ -103,12 +107,31 @@ export default function Marketplace() {
     if (!form.name.trim()) { setFormError('Name is required'); return }
     if (type === 'integration' && !form.mcp_server_url.trim()) { setFormError('MCP server URL is required for integrations'); return }
     if (type === 'role_pack' && !form.role_prompt.trim()) { setFormError('Role prompt is required for role packs'); return }
+    if (type === 'knowledge_pack' && !editingListing) {
+      if (!knowledgePackFiles.length) { setFormError('Add at least one PDF or TXT file for a knowledge pack'); return }
+      if (knowledgePackFiles.length > KNOWLEDGE_PACK_MAX_DOCS) {
+        setFormError(`A knowledge pack can include at most ${KNOWLEDGE_PACK_MAX_DOCS} documents`)
+        return
+      }
+    }
     if (type === 'avatar' && !editingListing) {
       if (!avatarFaceFile || !avatarVoiceFile) { setFormError('Face image and voice sample are required for new avatars'); return }
     }
     setFormSaving(true)
     try {
-      if (type === 'avatar' && !editingListing && avatarFaceFile && avatarVoiceFile) {
+      if (type === 'knowledge_pack' && !editingListing && knowledgePackFiles.length > 0) {
+        const fd = new FormData()
+        fd.set('name', form.name.trim())
+        fd.set('description', form.description.trim())
+        fd.set('price', String(parseFloat(form.price) || 0))
+        fd.set('logo_url', form.logo_url.trim())
+        knowledgePackFiles.forEach((file) => fd.append('files', file))
+        const res = await apiFetch(`${API}/admin/marketplace/knowledge-pack`, { method: 'POST', body: fd })
+        if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Knowledge pack creation failed') }
+        const saved = await res.json()
+        setListings((prev) => [...prev, saved])
+        setShowAdminForm(false)
+      } else if (type === 'avatar' && !editingListing && avatarFaceFile && avatarVoiceFile) {
         const fd = new FormData()
         fd.set('name', form.name.trim())
         fd.set('description', form.description.trim())
@@ -177,6 +200,7 @@ export default function Marketplace() {
               { key: 'avatar', label: 'Avatars' },
               { key: 'integration', label: 'Tools' },
               { key: 'role_pack', label: 'Roles' },
+              { key: 'knowledge_pack', label: 'Knowledge' },
             ].map(({ key, label }) => (
               <button
                 key={key}
@@ -192,7 +216,7 @@ export default function Marketplace() {
             {filteredListings.map((listing) => (
               <div key={listing.id} className="marketplace-card-wrap">
                 <button type="button" className="marketplace-card" onClick={() => setModalListing(listing)}>
-                  <span className={`marketplace-card-type marketplace-card-type-${listingType(listing)}`}>{listingType(listing) === 'integration' ? 'Tool' : listingType(listing) === 'role_pack' ? 'Role' : listingType(listing) === 'twyn' ? 'Twyn' : 'Avatar'}</span>
+                  <span className={`marketplace-card-type marketplace-card-type-${listingType(listing)}`}>{listingType(listing) === 'integration' ? 'Tool' : listingType(listing) === 'role_pack' ? 'Role' : listingType(listing) === 'knowledge_pack' ? 'Knowledge' : listingType(listing) === 'twyn' ? 'Twyn' : 'Avatar'}</span>
                   <div className={`marketplace-card-thumb ${listingType(listing) === 'avatar' || listingType(listing) === 'twyn' ? 'marketplace-card-thumb-avatar' : ''}`}>
                   {listingType(listing) === 'avatar' || listingType(listing) === 'twyn'
                     ? <><img src={`${API}/marketplace/${listing.id}/preview`} alt="" onError={(e) => { e.target.style.display = 'none'; e.target.nextElementSibling?.classList.add('show'); }} /><span className="marketplace-card-icon fallback">{listing.name[0]}</span></>
@@ -214,7 +238,7 @@ export default function Marketplace() {
           ))}
           </div>
           {filteredListings.length === 0 && (
-            <p className="marketplace-no-results">No {typeFilter === 'integration' ? 'tools' : typeFilter === 'role_pack' ? 'roles' : typeFilter === 'avatar' ? 'avatars' : typeFilter === 'twyn' ? 'twyns' : 'listings'} match this filter.</p>
+            <p className="marketplace-no-results">No {typeFilter === 'integration' ? 'tools' : typeFilter === 'role_pack' ? 'roles' : typeFilter === 'knowledge_pack' ? 'knowledge packs' : typeFilter === 'avatar' ? 'avatars' : typeFilter === 'twyn' ? 'twyns' : 'listings'} match this filter.</p>
           )}
         </>
       )}
@@ -237,7 +261,14 @@ export default function Marketplace() {
               </div>
               <button type="button" className="marketplace-modal-close" onClick={() => setModalListing(null)} aria-label="Close">×</button>
             </div>
-            <p className="marketplace-modal-desc">{modalListing.description || (listingType(modalListing) === 'role_pack' ? 'Role pack: prompt only (RAG + documents later).' : 'No description.')}</p>
+            <p className="marketplace-modal-desc">
+              {modalListing.description
+                || (listingType(modalListing) === 'role_pack'
+                  ? 'Role pack: prompt only (RAG + documents later).'
+                  : listingType(modalListing) === 'knowledge_pack'
+                    ? `Knowledge pack: ${modalListing.knowledge_pack_file_count ?? '?'} document(s). Attach when creating a persona (copied into your twyn’s knowledge base).`
+                    : 'No description.')}
+            </p>
             <div className="marketplace-modal-actions">
               {isOwned(modalListing.id) ? (
                 <span className="marketplace-owned-badge">✓ Owned</span>
@@ -270,6 +301,7 @@ export default function Marketplace() {
                 <select value={form.listing_type} onChange={(e) => setForm((f) => ({ ...f, listing_type: e.target.value }))} disabled={!!editingListing}>
                   <option value="integration">Integration (MCP tools)</option>
                   <option value="role_pack">Role pack (prompt)</option>
+                  <option value="knowledge_pack">Knowledge pack (PDF/TXT bundle)</option>
                   <option value="avatar">Avatar (face + voice)</option>
                 </select>
                 {editingListing && <span className="form-hint">Type cannot be changed when editing.</span>}
@@ -292,6 +324,31 @@ export default function Marketplace() {
                 <label>MCP server URL *
                   <input value={form.mcp_server_url} onChange={(e) => setForm((f) => ({ ...f, mcp_server_url: e.target.value }))} required={!editingListing} placeholder="http://74.161.41.130:8010/mcp" />
                 </label>
+              )}
+              {form.listing_type === 'knowledge_pack' && !editingListing && (
+                <label>Documents * (PDF or TXT, 1–{KNOWLEDGE_PACK_MAX_DOCS} files)
+                  <input
+                    type="file"
+                    accept=".pdf,.txt,application/pdf,text/plain"
+                    multiple
+                    onChange={(e) => {
+                      const list = Array.from(e.target.files || [])
+                      if (list.length > KNOWLEDGE_PACK_MAX_DOCS) {
+                        setFormError(`Only the first ${KNOWLEDGE_PACK_MAX_DOCS} files are kept (max ${KNOWLEDGE_PACK_MAX_DOCS} per pack).`)
+                        setKnowledgePackFiles(list.slice(0, KNOWLEDGE_PACK_MAX_DOCS))
+                      } else {
+                        setFormError(null)
+                        setKnowledgePackFiles(list)
+                      }
+                    }}
+                  />
+                  {knowledgePackFiles.length > 0 && (
+                    <span className="form-hint">{knowledgePackFiles.length} / {KNOWLEDGE_PACK_MAX_DOCS} file(s) selected</span>
+                  )}
+                </label>
+              )}
+              {form.listing_type === 'knowledge_pack' && editingListing && (
+                <p className="form-hint">Files are fixed after creation. Edit name, description, logo, or price only.</p>
               )}
               {form.listing_type === 'role_pack' && (
                 <label>Role prompt * (well-written prompt for this role; RAG + documents later)
@@ -388,6 +445,7 @@ export default function Marketplace() {
         .marketplace-card-type-avatar { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
         .marketplace-card-type-twyn { background: rgba(14, 165, 233, 0.15); color: #0284c7; }
         .marketplace-card-type-integration { background: rgba(100, 116, 139, 0.2); color: var(--text-secondary); }
+        .marketplace-card-type-knowledge_pack { background: rgba(245, 158, 11, 0.2); color: #d97706; }
         .marketplace-card-thumb .fallback { display: none; width: 100%; height: 100%; align-items: center; justify-content: center; }
         .marketplace-card-thumb .fallback.show { display: flex; }
         .marketplace-modal-thumb .fallback { display: none; width: 100%; height: 100%; align-items: center; justify-content: center; }

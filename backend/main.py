@@ -17,6 +17,7 @@ import time
 import struct
 import uuid
 import secrets
+import shutil
 import wave
 from fractions import Fraction
 from datetime import datetime, timezone, timedelta
@@ -101,6 +102,7 @@ COSYVOICE_CACHE_WARMUP_TEXT = os.environ.get("COSYVOICE_CACHE_WARMUP_TEXT", "Hel
 XTTS_BASE_URL = os.environ.get("XTTS_BASE_URL", "").strip().rstrip("/")
 F5_TTS_BASE_URL = os.environ.get("F5_TTS_BASE_URL", "").strip().rstrip("/")
 QWEN3_TTS_BASE_URL = os.environ.get("QWEN3_TTS_BASE_URL", "").strip().rstrip("/")
+QWEN3_TTS_LANGUAGE = (os.environ.get("QWEN3_TTS_LANGUAGE", "English") or "English").strip()
 XTTS_LANGUAGE = os.environ.get("XTTS_LANGUAGE", "en").strip()
 # Add a small silence pad to smooth starts/ends of video clips (video mode only).
 DITTO_SILENCE_PRE_MS = int(os.environ.get("DITTO_SILENCE_PRE_MS", "120"))
@@ -457,6 +459,10 @@ class PersonaUpdate(BaseModel):
     assigned_role_pack_id: str | None = None  # one role pack per twyn
 
 
+class KnowledgePacksAttach(BaseModel):
+    listing_ids: list[str] = []
+
+
 class PersonaPublish(BaseModel):
     price: float = 0.0
 
@@ -561,6 +567,8 @@ webrtc_managers = {}
 # Knowledge base: per-persona documents and embeddings (scoped by persona ownership)
 KB_DIR = DATA_DIR / "kb"
 KB_DIR.mkdir(parents=True, exist_ok=True)
+KB_PACKS_DIR = DATA_DIR / "kb_packs"
+KB_PACKS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _ollama_warmup():
@@ -616,12 +624,36 @@ RAG_CHUNK_TOKENS = 500
 RAG_OVERLAP_TOKENS = 50
 RAG_TOP_K = 5
 RAG_RELEVANCE_THRESHOLD = 0.25  # min cosine similarity to inject context; below = use general knowledge only
+KNOWLEDGE_PACK_MAX_DOCS = 5
 
 
 def _kb_persona_dir(persona_id: str) -> Path:
     d = KB_DIR / persona_id
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _kb_pack_dir(listing_id: str) -> Path:
+    return KB_PACKS_DIR / listing_id
+
+
+def _load_pack_manifest(listing_id: str) -> list[dict]:
+    meta = _kb_pack_dir(listing_id) / "_manifest.json"
+    if not meta.is_file():
+        return []
+    try:
+        with open(meta, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_pack_manifest(listing_id: str, manifest: list[dict]) -> None:
+    d = _kb_pack_dir(listing_id)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "_manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
 
 
 def _extract_text_from_file(path: Path, filename: str) -> str:
@@ -1277,8 +1309,10 @@ async def create_avatar_listing(
             voice_id = image_id
             log.info("Avatar listing: cosyvoice voice OK image_id=%s", image_id)
         elif TTS_PROVIDER == "qwen3":
-            voice_id = TTS_PROVIDER
-            log.info("Avatar listing: qwen3 voice OK image_id=%s", image_id)
+            if not QWEN3_TTS_BASE_URL:
+                raise ValueError("Qwen3-TTS not configured (missing QWEN3_TTS_BASE_URL)")
+            voice_id = ""  # set after WAV + optional STT below
+            log.info("Avatar listing: qwen3 will register after voice saved image_id=%s", image_id)
         else:
             voice_id = _chatterbox_clone_voice(voice_bytes, ditto_name)
     except Exception as e:
@@ -1291,6 +1325,15 @@ async def create_avatar_listing(
         voice_ref_text = _stt_transcribe_wav_sync(voice_bytes) or None
     except Exception:
         voice_wav_path = None
+    if TTS_PROVIDER == "qwen3" and voice_wav_path and voice_bytes:
+        try:
+            voice_id = _qwen3_register_voice(voice_bytes, ditto_name, voice_ref_text)
+            log.info("Avatar listing: qwen3 registered image_id=%s voice_id=%s", image_id, voice_id)
+        except Exception as e:
+            log.exception("Avatar listing: Qwen3 register failed: %s", e)
+            raise HTTPException(502, f"Qwen3 voice register failed: {e}") from e
+    elif TTS_PROVIDER == "qwen3":
+        raise HTTPException(502, "Qwen3 voice register failed: could not save reference WAV")
     if TTS_PROVIDER == "cosyvoice" and voice_wav_path:
         if COSYVOICE_USE_TRITON and COSYVOICE_USE_CACHE:
             _cosyvoice_cache_speaker_triton(str(voice_id), str(voice_wav_path), voice_ref_text)
@@ -1319,11 +1362,86 @@ async def create_avatar_listing(
     return listing
 
 
+@app.post("/api/admin/marketplace/knowledge-pack")
+async def create_knowledge_pack_listing(
+    name: str = Form(...),
+    description: str = Form(""),
+    price: float = Form(0.0),
+    logo_url: str = Form(""),
+    files: list[UploadFile] = File(default=[]),
+    current_user: dict = Depends(get_current_admin),
+):
+    """Admin: marketplace listing bundling PDF/TXT files; buyers attach copies to new personas' KB."""
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    if not files:
+        raise HTTPException(400, "At least one PDF or TXT file is required")
+    if len(files) > KNOWLEDGE_PACK_MAX_DOCS:
+        raise HTTPException(
+            400,
+            f"A knowledge pack can include at most {KNOWLEDGE_PACK_MAX_DOCS} documents",
+        )
+    listing_id = uuid.uuid4().hex
+    pack_dir = _kb_pack_dir(listing_id)
+    if pack_dir.exists():
+        shutil.rmtree(pack_dir, ignore_errors=True)
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict] = []
+    for f in files:
+        if len(manifest) >= KNOWLEDGE_PACK_MAX_DOCS:
+            break
+        if not f.filename:
+            continue
+        ext = Path(f.filename).suffix.lower()
+        if ext not in (".pdf", ".txt"):
+            continue
+        doc_id = uuid.uuid4().hex
+        safe_name = f"{doc_id}{ext}"
+        path = pack_dir / safe_name
+        path.write_bytes(await f.read())
+        manifest.append({
+            "id": doc_id,
+            "filename": f.filename,
+            "path": safe_name,
+        })
+    if not manifest:
+        shutil.rmtree(pack_dir, ignore_errors=True)
+        raise HTTPException(400, "No valid PDF or TXT files uploaded")
+    _save_pack_manifest(listing_id, manifest)
+    listing = {
+        "id": listing_id,
+        "name": name,
+        "description": (description or "").strip(),
+        "logo_url": (logo_url or "").strip(),
+        "price": float(price),
+        "mcp_server_url": "",
+        "listing_type": "knowledge_pack",
+        "role_prompt": "",
+        "image_id": "",
+        "voice_id": "",
+        "knowledge_pack_file_count": len(manifest),
+        "created_by": current_user["id"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    listings = load_listings()
+    listings.append(listing)
+    save_listings(listings)
+    return listing
+
+
 @app.put("/api/admin/marketplace/{listing_id}")
 def update_listing(listing_id: str, body: ListingUpdate, current_user: dict = Depends(get_current_admin)):
     listings = load_listings()
     for i, l in enumerate(listings):
         if l.get("id") == listing_id:
+            prev_type = _listing_type(l)
+            if body.listing_type is not None:
+                new_t = (body.listing_type or "").strip() or "integration"
+                if prev_type == "knowledge_pack" and new_t != "knowledge_pack":
+                    raise HTTPException(400, "Cannot change listing_type of a knowledge pack")
+                if prev_type != "knowledge_pack" and new_t == "knowledge_pack":
+                    raise HTTPException(400, "Use POST /api/admin/marketplace/knowledge-pack to create knowledge packs")
             if body.name is not None:
                 listings[i]["name"] = body.name.strip()
             if body.description is not None:
@@ -1354,6 +1472,9 @@ def delete_listing(listing_id: str, current_user: dict = Depends(get_current_adm
     if len(new_listings) == len(listings):
         raise HTTPException(404, "Listing not found")
     save_listings(new_listings)
+    pack_dir = _kb_pack_dir(listing_id)
+    if pack_dir.is_dir():
+        shutil.rmtree(pack_dir, ignore_errors=True)
     return {"ok": True}
 
 
@@ -1396,6 +1517,49 @@ def get_persona_endpoint(persona_id: str, current_user: dict = Depends(get_curre
     if not p:
         raise HTTPException(404, "Persona not found")
     return p
+
+
+@app.get("/api/personas/{persona_id}/ditto-cache")
+def persona_ditto_cache_status(persona_id: str, current_user: dict = Depends(get_current_user)):
+    """Proxy to Ditto: is this persona's face source_info already cached in GPU memory?"""
+    p = get_persona(persona_id, current_user["id"])
+    if not p:
+        raise HTTPException(404, "Persona not found")
+    image_id = p.get("image_id")
+    if not image_id:
+        return {"cached": False}
+    url = f"{DITTO_API_URL}/personas/{image_id}/cached"
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.get(url)
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPError as e:
+        log.warning("Ditto ditto-cache check failed: %s", e)
+        return {"cached": False}
+
+
+@app.post("/api/personas/{persona_id}/prime")
+def persona_prime(persona_id: str, current_user: dict = Depends(get_current_user)):
+    """Proxy to Ditto: warm source_info cache before the first video clip."""
+    p = get_persona(persona_id, current_user["id"])
+    if not p:
+        raise HTTPException(404, "Persona not found")
+    image_id = p.get("image_id")
+    if not image_id:
+        raise HTTPException(400, "Persona has no image_id")
+    url = f"{DITTO_API_URL}/personas/{image_id}/prime"
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            r = client.post(url)
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPStatusError as e:
+        log.warning("Ditto prime failed: %s %s", e.response.status_code, e.response.text)
+        raise HTTPException(502, "Ditto prime failed") from e
+    except httpx.HTTPError as e:
+        log.warning("Ditto prime error: %s", e)
+        raise HTTPException(502, "Ditto unreachable") from e
 
 
 @app.post("/api/personas/{persona_id}/share")
@@ -1760,6 +1924,76 @@ def delete_persona_document(persona_id: str, doc_id: str, current_user: dict = D
     chunks = [c for c in chunks if c.get("doc_id") != doc_id]
     _save_persona_chunks(persona_id, chunks)
     return {"ok": True}
+
+
+def _append_knowledge_packs_to_persona_kb(
+    persona_id: str,
+    pack_listing_ids: list[str],
+    owned: dict[str, dict],
+) -> int:
+    """Copy files from purchased knowledge_pack listings into persona KB; queue embedding. Returns docs added."""
+    existing = _load_persona_docs(persona_id)
+    kb_dir = _kb_persona_dir(persona_id)
+    new_jobs: list[tuple[str, Path, str]] = []
+    for lid in pack_listing_ids:
+        lid = (lid or "").strip()
+        if not lid or lid not in owned:
+            continue
+        pl = owned.get(lid) or {}
+        if _listing_type(pl) != "knowledge_pack":
+            continue
+        for entry in _load_pack_manifest(lid):
+            stored = (entry.get("path") or "").strip()
+            orig_name = (entry.get("filename") or stored or "document").strip()
+            if not stored:
+                continue
+            src = _kb_pack_dir(lid) / stored
+            if not src.is_file():
+                continue
+            ext = Path(orig_name).suffix.lower() or Path(stored).suffix.lower()
+            if ext not in (".pdf", ".txt"):
+                continue
+            doc_id = uuid.uuid4().hex
+            safe_name = f"{doc_id}{ext}"
+            dest = kb_dir / safe_name
+            dest.write_bytes(src.read_bytes())
+            existing.append({
+                "id": doc_id,
+                "filename": orig_name,
+                "path": safe_name,
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                "source_knowledge_pack_id": lid,
+            })
+            new_jobs.append((doc_id, dest, orig_name))
+    if not new_jobs:
+        return 0
+    _save_persona_docs(persona_id, existing)
+    loop = asyncio.get_event_loop()
+    for doc_id, path, filename in new_jobs:
+        loop.run_in_executor(None, _process_document_sync, persona_id, doc_id, path, filename)
+    return len(new_jobs)
+
+
+@app.post("/api/personas/{persona_id}/knowledge-packs")
+def attach_knowledge_packs_to_persona(
+    persona_id: str,
+    body: KnowledgePacksAttach,
+    current_user: dict = Depends(get_current_user),
+):
+    """Attach one or more purchased knowledge packs to an existing persona (copy into KB + embed)."""
+    if not get_persona(persona_id, current_user["id"]):
+        raise HTTPException(404, "Persona not found")
+    raw_ids = [str(x).strip() for x in (body.listing_ids or []) if x and str(x).strip()]
+    if not raw_ids:
+        raise HTTPException(400, "At least one knowledge pack listing id is required")
+    owned = {l["id"]: l for l in get_user_purchases(current_user["id"])}
+    n = _append_knowledge_packs_to_persona_kb(persona_id, raw_ids, owned)
+    if n == 0:
+        raise HTTPException(
+            400,
+            "No documents added — use purchased knowledge packs with valid files, or check listing ids.",
+        )
+    return {"ok": True, "documents_added": n}
 
 
 @app.delete("/api/personas/{persona_id}")
@@ -2254,17 +2488,13 @@ def _start_f5_stream_to_audio_queue(
 
 
 def _start_qwen3_stream_to_audio_queue(
-    voice_wav_path: str,
-    voice_ref_text: str | None,
+    voice_id: str,
     text: str,
     q: "asyncio.Queue[bytes | None]",
     loop: asyncio.AbstractEventLoop,
 ) -> None:
-    """Stream Qwen3-TTS raw float32 audio and resample to 16k mono f32le."""
-    if not QWEN3_TTS_BASE_URL:
-        return
-    path = Path(voice_wav_path)
-    if not path.is_file():
+    """Stream Qwen3-TTS voice-cloning API: GET /api/v1/tts/stream (s16le 24 kHz) -> 16 kHz mono f32le."""
+    if not QWEN3_TTS_BASE_URL or not (voice_id or "").strip():
         return
     t0 = time.monotonic()
 
@@ -2272,8 +2502,9 @@ def _start_qwen3_stream_to_audio_queue(
         fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
         fut.result()
 
+    # API: raw 16-bit PCM mono at 24 kHz (see service OpenAPI).
     proc = subprocess.Popen(
-        ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
+        ["ffmpeg", "-loglevel", "error", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
 
@@ -2281,8 +2512,14 @@ def _start_qwen3_stream_to_audio_queue(
     total_in = 0
     status_code = None
     content_type = None
-    sr = 24000
     first_chunk_at = None
+    params = {
+        "voice_id": voice_id.strip(),
+        "text": (text or "").strip()[:TTS_MAX_CHARS],
+    }
+    if QWEN3_TTS_LANGUAGE:
+        params["language"] = QWEN3_TTS_LANGUAGE
+    url = f"{QWEN3_TTS_BASE_URL}/api/v1/tts/stream"
 
     def _read_stdout():
         try:
@@ -2300,47 +2537,20 @@ def _start_qwen3_stream_to_audio_queue(
     reader.start()
 
     try:
-        with httpx.Client(timeout=60.0) as client:
-            with open(path, "rb") as f:
-                files = {"speaker_wav": (path.name, f, "audio/wav")}
-                data = {
-                    "text": (text or "").strip()[:TTS_MAX_CHARS],
-                    "ref_text": (voice_ref_text or "").strip() or (text or "").strip()[:TTS_MAX_CHARS],
-                    "language": "English",
-                }
-                with client.stream("POST", f"{QWEN3_TTS_BASE_URL}/api/tts/stream_raw", data=data, files=files) as r:
-                    status_code = r.status_code
-                    content_type = r.headers.get("content-type")
-                    sr_hdr = r.headers.get("x-sample-rate", "")
-                    try:
-                        if sr_hdr:
-                            sr = int(sr_hdr)
-                    except Exception:
-                        sr = 24000
-                    if sr != 24000:
-                        try:
-                            if proc.stdin:
-                                proc.stdin.close()
-                        except Exception:
-                            pass
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                        proc = subprocess.Popen(
-                            ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        )
-                    r.raise_for_status()
-                    for chunk in r.iter_bytes(chunk_size=8192):
-                        if not chunk:
-                            continue
-                        if first_chunk_at is None:
-                            first_chunk_at = time.monotonic()
-                            log.info("Qwen3-TTS first_chunk at +%.2fs", first_chunk_at - t0)
-                        total_in += len(chunk)
-                        if proc.stdin:
-                            proc.stdin.write(chunk)
+        with httpx.Client(timeout=120.0) as client:
+            with client.stream("GET", url, params=params) as r:
+                status_code = r.status_code
+                content_type = r.headers.get("content-type")
+                r.raise_for_status()
+                for chunk in r.iter_bytes(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    if first_chunk_at is None:
+                        first_chunk_at = time.monotonic()
+                        log.info("Qwen3-TTS first_chunk at +%.2fs", first_chunk_at - t0)
+                    total_in += len(chunk)
+                    if proc.stdin:
+                        proc.stdin.write(chunk)
     except Exception as e:
         log.warning("Qwen3-TTS stream error: %s", e)
     finally:
@@ -2978,6 +3188,97 @@ def _ensure_chatterbox_voice_id(persona: dict) -> str:
     return voice_id
 
 
+def _qwen3_voice_exists(voice_id: str) -> bool:
+    """True if voice_id is registered on the Qwen3-TTS voice-cloning service."""
+    if not voice_id or not QWEN3_TTS_BASE_URL:
+        return False
+    url = f"{QWEN3_TTS_BASE_URL}/api/v1/voices/{voice_id}"
+    try:
+        r = httpx.get(url, timeout=15.0)
+        return r.status_code == 200
+    except Exception as e:
+        log.debug("Qwen3-TTS voice lookup failed for %s: %s", voice_id, e)
+        return False
+
+
+def _qwen3_register_voice(
+    audio_bytes: bytes,
+    name: str,
+    ref_text: str | None = None,
+    user_id: str = "twynbook",
+) -> str:
+    """POST /api/v1/voices/register; returns voice_id from JSON (201)."""
+    url = f"{QWEN3_TTS_BASE_URL}/api/v1/voices/register"
+    data = {
+        "name": (name or "Voice")[:200],
+        "user_id": user_id,
+        "description": (name or "")[:500],
+        "ref_text": (ref_text or "").strip()[:4000],
+    }
+    if QWEN3_TTS_LANGUAGE:
+        data["language"] = QWEN3_TTS_LANGUAGE
+    with httpx.Client(timeout=300.0) as client:
+        files = {"audio_file": ("voice.wav", audio_bytes, "audio/wav")}
+        r = client.post(url, files=files, data=data)
+        r.raise_for_status()
+        out = r.json() if r.content else {}
+        vid = (out.get("voice_id") or "").strip()
+        if not vid:
+            raise ValueError("Qwen3-TTS register response missing voice_id")
+        return vid
+
+
+def _ensure_qwen3_voice_id(persona: dict) -> str:
+    """Ensure Qwen3-TTS has a registered voice_id; re-register from voice_wav_path if missing or stale."""
+    if TTS_PROVIDER != "qwen3":
+        return (persona.get("voice_id") or "").strip()
+    pid = (persona.get("id") or "").strip()
+    voice_id = (persona.get("voice_id") or "").strip()
+    voice_wav_path = persona.get("voice_wav_path") or ""
+    path = Path(voice_wav_path) if voice_wav_path else None
+
+    # Legacy placeholder from old integration (per-utterance WAV upload).
+    if voice_id == "qwen3":
+        voice_id = ""
+        persona["voice_id"] = ""
+
+    if voice_id and _qwen3_voice_exists(voice_id):
+        return voice_id
+
+    if voice_id:
+        log.warning(
+            "Qwen3-TTS voice_id %s not found on TTS service; re-registering if WAV exists (persona %s)",
+            voice_id,
+            pid,
+        )
+
+    if not path or not path.is_file():
+        if voice_id:
+            log.warning("Cannot re-register Qwen3 voice for persona %s: missing or invalid voice_wav_path", pid)
+        return voice_id
+
+    try:
+        audio = path.read_bytes()
+        ref_text = (persona.get("voice_ref_text") or "").strip() or None
+        new_id = _qwen3_register_voice(audio, persona.get("name") or pid, ref_text)
+        if new_id:
+            persona["voice_id"] = new_id
+            try:
+                personas = load_personas()
+                for p in personas:
+                    if p.get("id") == pid:
+                        p["voice_id"] = new_id
+                        break
+                save_personas(personas)
+            except Exception as e:
+                log.warning("Failed to persist Qwen3 voice_id for %s: %s", pid, e)
+            log.info("Qwen3-TTS registered voice for persona %s -> voice_id %s", pid, new_id)
+            return new_id
+    except Exception as e:
+        log.warning("Qwen3-TTS re-register failed for %s: %s", pid, e)
+    return voice_id
+
+
 def _load_greeting_bytes(persona_id: str) -> bytes | None:
     path = DATA_DIR / f"greeting_{persona_id}.f32"
     if path.is_file():
@@ -3003,8 +3304,8 @@ def _start_audio_tts_stream_to_queue(
     if TTS_PROVIDER == "f5" and voice_wav_path and F5_TTS_BASE_URL:
         _start_f5_stream_to_audio_queue(voice_wav_path, voice_ref_text, text, q, loop)
         return
-    if TTS_PROVIDER == "qwen3" and voice_wav_path and QWEN3_TTS_BASE_URL:
-        _start_qwen3_stream_to_audio_queue(voice_wav_path, voice_ref_text, text, q, loop)
+    if TTS_PROVIDER == "qwen3" and (voice_id or "").strip() and QWEN3_TTS_BASE_URL:
+        _start_qwen3_stream_to_audio_queue(voice_id, text, q, loop)
         return
     if TTS_PROVIDER == "cosyvoice" and voice_wav_path and (COSYVOICE_USE_TRITON or COSYVOICE_BASE_URL):
         _start_cosyvoice_stream_to_audio_queue(voice_wav_path, voice_ref_text, text, voice_id, q, loop)
@@ -3107,20 +3408,26 @@ def _start_tts_wav_to_holder(
         if not QWEN3_TTS_BASE_URL:
             out["error"] = "Qwen3-TTS not configured (missing QWEN3_TTS_BASE_URL)"
             return
-        if not voice_wav_path or not Path(voice_wav_path).is_file():
-            out["error"] = "Qwen3-TTS requires a persona voice_wav_path; upload a voice WAV for this persona"
+        if not (voice_id or "").strip():
+            out["error"] = "Qwen3-TTS requires a registered voice_id; re-save the persona or check voice registration"
             return
 
         t0 = time.monotonic()
         proc = subprocess.Popen(
-            ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", "-f", "wav", "-ar", "16000", "-ac", "1", "pipe:1"],
+            ["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-f", "wav", "-ar", "16000", "-ac", "1", "pipe:1"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         buf = bytearray()
         total_in = 0
         status_code = None
         content_type = None
-        sr = 24000
+        params = {
+            "voice_id": voice_id.strip(),
+            "text": (text or "").strip()[:TTS_MAX_CHARS],
+        }
+        if QWEN3_TTS_LANGUAGE:
+            params["language"] = QWEN3_TTS_LANGUAGE
+        url = f"{QWEN3_TTS_BASE_URL}/api/v1/tts/wav"
 
         def _read_stdout():
             try:
@@ -3135,48 +3442,21 @@ def _start_tts_wav_to_holder(
         reader = threading.Thread(target=_read_stdout, daemon=True)
         reader.start()
         try:
-            with httpx.Client(timeout=60.0) as client:
-                with open(voice_wav_path, "rb") as f:
-                    files = {"speaker_wav": (Path(voice_wav_path).name, f, "audio/wav")}
-                    data = {
-                        "text": (text or "").strip()[:TTS_MAX_CHARS],
-                        "ref_text": (voice_ref_text or "").strip() or (text or "").strip()[:TTS_MAX_CHARS],
-                        "language": "English",
-                    }
-                    with client.stream("POST", f"{QWEN3_TTS_BASE_URL}/api/tts/stream_raw", data=data, files=files) as r:
-                        status_code = r.status_code
-                        content_type = r.headers.get("content-type")
-                        first_chunk_at = None
-                        sr_hdr = r.headers.get("x-sample-rate", "")
-                        try:
-                            if sr_hdr:
-                                sr = int(sr_hdr)
-                        except Exception:
-                            sr = 24000
-                        if sr != 24000:
-                            try:
-                                if proc.stdin:
-                                    proc.stdin.close()
-                            except Exception:
-                                pass
-                            try:
-                                proc.kill()
-                            except Exception:
-                                pass
-                            proc = subprocess.Popen(
-                                ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", "-f", "wav", "-ar", "16000", "-ac", "1", "pipe:1"],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            )
-                        r.raise_for_status()
-                        for chunk in r.iter_bytes(chunk_size=8192):
-                            if not chunk:
-                                continue
-                            if first_chunk_at is None:
-                                first_chunk_at = time.monotonic()
-                                log.info("Qwen3-TTS wav first_chunk at +%.2fs", first_chunk_at - t0)
-                            total_in += len(chunk)
-                            if proc.stdin:
-                                proc.stdin.write(chunk)
+            with httpx.Client(timeout=120.0) as client:
+                with client.stream("GET", url, params=params) as r:
+                    status_code = r.status_code
+                    content_type = r.headers.get("content-type")
+                    first_chunk_at = None
+                    r.raise_for_status()
+                    for chunk in r.iter_bytes(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        if first_chunk_at is None:
+                            first_chunk_at = time.monotonic()
+                            log.info("Qwen3-TTS wav first_chunk at +%.2fs", first_chunk_at - t0)
+                        total_in += len(chunk)
+                        if proc.stdin:
+                            proc.stdin.write(chunk)
             if proc.stdin:
                 proc.stdin.close()
             reader.join(timeout=5)
@@ -3270,14 +3550,16 @@ async def create_persona(
     avatar_listing_id: str = Form(""),
     assigned_role_pack_id: str = Form(""),
     assigned_listing_ids: str = Form(""),
+    knowledge_pack_ids: str = Form(""),
     documents: list[UploadFile] = File(default=[]),
     current_user: dict = Depends(get_current_user),
 ):
     """
     Accept persona creation and return 202 immediately. Either provide avatar_listing_id (purchased
     avatar: use its image_id and voice_id) or upload face + voice. Optional assigned_role_pack_id,
-    assigned_listing_ids (JSON array of integration listing IDs), and documents (PDF/TXT for knowledge base).
-    Creation runs in the background so nginx doesn't timeout.
+    assigned_listing_ids (JSON array of integration listing IDs), knowledge_pack_ids (JSON array of
+    purchased knowledge_pack listing IDs — files are copied into the persona KB), and documents
+    (PDF/TXT uploads). Creation runs in the background so nginx doesn't timeout.
     """
     name = (name or "").strip()
     if not name:
@@ -3298,10 +3580,51 @@ async def create_persona(
     persona_id = uuid.uuid4().hex
     creation_status[persona_id] = "creating"
 
-    # Save optional knowledge base documents to kb/persona_id before background job (so sync can process them)
+    docs_meta: list[dict] = []
+    kb_dir: Path | None = None
+
+    pack_ids_raw = (knowledge_pack_ids or "").strip()
+    if pack_ids_raw:
+        try:
+            parsed_packs = json.loads(pack_ids_raw)
+            if isinstance(parsed_packs, list):
+                for pid in parsed_packs:
+                    pid = str(pid).strip()
+                    if not pid or pid not in owned:
+                        continue
+                    pl = owned.get(pid) or {}
+                    if _listing_type(pl) != "knowledge_pack":
+                        continue
+                    for entry in _load_pack_manifest(pid):
+                        stored = (entry.get("path") or "").strip()
+                        orig_name = (entry.get("filename") or stored or "document").strip()
+                        if not stored:
+                            continue
+                        src = _kb_pack_dir(pid) / stored
+                        if not src.is_file():
+                            continue
+                        ext = Path(orig_name).suffix.lower() or Path(stored).suffix.lower()
+                        if ext not in (".pdf", ".txt"):
+                            continue
+                        if kb_dir is None:
+                            kb_dir = _kb_persona_dir(persona_id)
+                        doc_id = uuid.uuid4().hex
+                        safe_name = f"{doc_id}{ext}"
+                        dest = kb_dir / safe_name
+                        dest.write_bytes(src.read_bytes())
+                        docs_meta.append({
+                            "id": doc_id,
+                            "filename": orig_name,
+                            "path": safe_name,
+                            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                            "source_knowledge_pack_id": pid,
+                        })
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     if documents:
-        kb_dir = _kb_persona_dir(persona_id)
-        docs_meta: list[dict] = []
+        if kb_dir is None:
+            kb_dir = _kb_persona_dir(persona_id)
         for f in documents:
             if not f.filename:
                 continue
@@ -3319,8 +3642,8 @@ async def create_persona(
                 "path": safe_name,
                 "uploaded_at": datetime.now(timezone.utc).isoformat(),
             })
-        if docs_meta:
-            _save_persona_docs(persona_id, docs_meta)
+    if docs_meta:
+        _save_persona_docs(persona_id, docs_meta)
 
     if avatar_id:
         if avatar_id not in owned:
@@ -3449,8 +3772,23 @@ def _create_persona_sync(
                 voice_id = persona_id
                 log.info("Background create: cosyvoice voice OK persona_id=%s", persona_id)
             elif TTS_PROVIDER == "qwen3":
-                voice_id = TTS_PROVIDER
-                log.info("Background create: qwen3 voice OK persona_id=%s", persona_id)
+                if not QWEN3_TTS_BASE_URL:
+                    creation_status[persona_id] = {"status": "failed", "error": "Qwen3-TTS not configured (missing QWEN3_TTS_BASE_URL)"}
+                    return
+                ref_for_reg = (voice_ref_text_in or "").strip() or None
+                if not ref_for_reg:
+                    try:
+                        ref_for_reg = _stt_transcribe_wav_sync(voice_bytes) or None
+                    except Exception as e:
+                        log.warning("Background create: qwen3 ref_text STT failed: %s", e)
+                        ref_for_reg = None
+                try:
+                    voice_id = _qwen3_register_voice(voice_bytes, name, ref_for_reg)
+                    log.info("Background create: qwen3 registered persona_id=%s voice_id=%s", persona_id, voice_id)
+                except Exception as e:
+                    log.exception("Background create: Qwen3 register failed persona_id=%s: %s", persona_id, e)
+                    creation_status[persona_id] = {"status": "failed", "error": f"Qwen3 voice register failed: {e}"}
+                    return
             else:
                 voice_id = _chatterbox_clone_voice(voice_bytes, name)
                 log.info("Background create: Chatterbox OK persona_id=%s voice_id=%s", persona_id, voice_id)
@@ -4253,9 +4591,8 @@ async def _run_chat_stream(ctx: dict):
             if TTS_PROVIDER == "qwen3":
                 if not QWEN3_TTS_BASE_URL:
                     return {"error": "Qwen3-TTS not configured (missing QWEN3_TTS_BASE_URL)"}
-                voice_wav_path = p.get("voice_wav_path")
-                if not voice_wav_path or not Path(voice_wav_path).is_file():
-                    return {"error": "Qwen3-TTS requires a persona voice_wav_path; upload a voice WAV for this persona"}
+                if not (voice_id or "").strip():
+                    return {"error": "Qwen3-TTS requires a registered voice_id; open the persona again or re-save voice"}
             c_path = str(DATA_DIR / f"reply_{persona_id}_{reply_id}_{idx}.mp4")
             t_tts0 = time.monotonic()
             metrics = {"prefetch_at": t_tts0, "tts_started_at": t_tts0}
@@ -4415,9 +4752,8 @@ async def _run_chat_stream(ctx: dict):
                     if TTS_PROVIDER == "qwen3":
                         if not QWEN3_TTS_BASE_URL:
                             return {"error": "Qwen3-TTS not configured (missing QWEN3_TTS_BASE_URL)"}
-                        voice_wav_path = p.get("voice_wav_path")
-                        if not voice_wav_path or not Path(voice_wav_path).is_file():
-                            return {"error": "Qwen3-TTS requires a persona voice_wav_path; upload a voice WAV for this persona"}
+                        if not (voice_id or "").strip():
+                            return {"error": "Qwen3-TTS requires a registered voice_id; open the persona again or re-save voice"}
                     t_tts0 = time.monotonic()
                     metrics = {"prefetch_at": t_tts0, "tts_started_at": t_tts0}
                     audio_holder = {}
@@ -4874,6 +5210,8 @@ async def chat(persona_id: str, message: str = Form(...), current_user: dict = D
     loop = asyncio.get_event_loop()
     if TTS_PROVIDER == "cosyvoice":
         voice_id = persona_id
+    elif TTS_PROVIDER == "qwen3":
+        voice_id = _ensure_qwen3_voice_id(p)
     else:
         voice_id = _ensure_chatterbox_voice_id(p)
     image_id = p["image_id"]
@@ -4943,6 +5281,11 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
     if TTS_PROVIDER == "chatterbox":
         try:
             persona_cached["voice_id"] = _ensure_chatterbox_voice_id(persona_cached)
+        except Exception:
+            pass
+    if TTS_PROVIDER == "qwen3":
+        try:
+            persona_cached["voice_id"] = _ensure_qwen3_voice_id(persona_cached)
         except Exception:
             pass
     if TTS_PROVIDER == "cosyvoice":
@@ -5082,6 +5425,16 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
             if not p:
                 await send_dc({"event": "error", "text": "Persona not found"})
                 continue
+            if TTS_PROVIDER == "chatterbox":
+                try:
+                    p["voice_id"] = _ensure_chatterbox_voice_id(p)
+                except Exception:
+                    pass
+            if TTS_PROVIDER == "qwen3":
+                try:
+                    p["voice_id"] = _ensure_qwen3_voice_id(p)
+                except Exception:
+                    pass
             about = (p.get("system_prompt") or "").strip() or "You are a helpful assistant."
             system_content = (
                 "You are a character in a conversation. The following describes you (the character), not the person you are chatting with. "
@@ -5288,6 +5641,11 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
     if TTS_PROVIDER == "chatterbox":
         try:
             p["voice_id"] = _ensure_chatterbox_voice_id(p)
+        except Exception:
+            pass
+    if TTS_PROVIDER == "qwen3":
+        try:
+            p["voice_id"] = _ensure_qwen3_voice_id(p)
         except Exception:
             pass
 
@@ -5534,6 +5892,16 @@ async def share_chat_stream_ws(websocket: WebSocket, share_id: str):
         await websocket.send_json({"event": "error", "data": {"error": "Shared persona not found"}})
         await websocket.close()
         return
+    if TTS_PROVIDER == "chatterbox":
+        try:
+            p["voice_id"] = _ensure_chatterbox_voice_id(p)
+        except Exception:
+            pass
+    if TTS_PROVIDER == "qwen3":
+        try:
+            p["voice_id"] = _ensure_qwen3_voice_id(p)
+        except Exception:
+            pass
 
     ws_use_ollama = bool(OLLAMA_URL)
     if not ws_use_ollama and not OPENAI_API_KEY:

@@ -29,7 +29,9 @@ services:
       # WebRTC media server is same process at /webrtc; backend pushes segments here
       - MEDIA_SERVER_WS_URL=ws://localhost:8087/webrtc
       - STT_BASE_URL=http://127.0.0.1:8090
-      - TTS_PROVIDER=chatterbox
+      # Default chatterbox; set TTS_PROVIDER=qwen3 in .env to use Qwen3-TTS on host port 8001
+      - TTS_PROVIDER=${TTS_PROVIDER:-chatterbox}
+      - QWEN3_TTS_BASE_URL=${QWEN3_TTS_BASE_URL:-http://127.0.0.1:8001}
       - COSYVOICE_USE_TRITON=0
       - COSYVOICE_USE_CACHE=0
       - COSYVOICE_BASE_URL=
@@ -61,6 +63,11 @@ services:
       - TURN_PASSWORD=twynbook
       - OLLAMA_URL=http://127.0.0.1:11434
       - OLLAMA_MODEL=qwen2.5:3b
+      # KB embeddings use qwen2.5:3b via RAG_OLLAMA_EMBED_MODEL default (same as OLLAMA_MODEL)
+      - RAG_OLLAMA_EMBED_MODEL=qwen2.5:3b
+      - RAG_EMBED_BACKEND=auto
+      - OLLAMA_ENABLE_TOOLS=1
+      - OLLAMA_MAX_TOOL_ROUNDS=3
     volumes:
       - twynbook-data:/app/data
     restart: unless-stopped

@@ -1,7 +1,6 @@
 import { useParams, Link } from 'react-router-dom'
 import { useEffect, useRef, useState } from 'react'
 import { apiFetch, getToken } from '../auth'
-import { isVideoMseAvailable, pickMuxedCodecString } from '../mseVideo'
 
 const API = '/api'
 const USE_MSE = !(
@@ -105,6 +104,7 @@ export default function Conversation() {
   const audioRtcRef = useRef({ pc: null, ws: null, dc: null, stream: null, remoteStream: null, pingTimer: null, sttOnly: null })
   const iceServersRef = useRef(null)
   const stallTimeoutRef = useRef(null)
+  const chatLogScrollRef = useRef(null)
   const pendingNewClipRef = useRef(false)
   const streamDoneRef = useRef(false)
   const perfRef = useRef({ start: 0, videoStart: 0, audioStart: 0, audioFirstChunk: 0 })
@@ -175,14 +175,14 @@ export default function Conversation() {
     } catch (_) { }
   }, [chatKey, chatLog])
 
-  const chatLogScrollRef = useRef(null)
+  // Always keep conversation pinned to the latest message.
   useEffect(() => {
     const el = chatLogScrollRef.current
     if (!el) return
     requestAnimationFrame(() => {
       el.scrollTop = el.scrollHeight
     })
-  }, [chatLog, mode])
+  }, [chatLog, mode, personaId])
 
   // Do NOT close chat/signaling WebSockets in a useEffect cleanup. In React 18 Strict Mode
   // the component unmounts and remounts, which would run cleanup and close the WS right
@@ -242,6 +242,7 @@ export default function Conversation() {
   }
 
   // --- Utility functions for Streaming (moved to component scope for accessibility) ---
+  const CODECS = 'video/mp4; codecs="avc1.42401E,mp4a.40.2"'
   /** Preroll before unmuting muxed Ditto A/V (one timeline; avoids mouth lagging separate early audio). */
   const MIN_MUXED_BUFFER_SEC = 0.18
   const MIN_MUXED_BUFFER_STREAM_DONE_SEC = 0.03
@@ -318,7 +319,7 @@ export default function Conversation() {
       if (data?.text && !hasStreamedTextRef.current) {
         setChatLog((prev) => [...prev, { role: 'assistant', text: data.text }])
       }
-      if (isVideoMseAvailable()) {
+      if (USE_MSE) {
         // Streaming Ditto sends fMP4 binary; this event is metadata only.
         if (data?.streaming !== false) return
         // Non-streaming Ditto (e.g. DITTO_STREAMING unset): no segments — play the MP4 URL instead of an empty MediaSource.
@@ -630,7 +631,7 @@ export default function Conversation() {
     setShowReply(false)
     idleVideoRef.current?.play().catch(() => { })
 
-    if (modeRef.current === 'video' && isVideoMseAvailable()) {
+    if (modeRef.current === 'video' && USE_MSE) {
       // 2) Setup NEW MediaSource for this specific response
       const ms = new MediaSource()
       const blobUrl = URL.createObjectURL(ms)
@@ -647,13 +648,8 @@ export default function Conversation() {
 
       ms.onsourceopen = () => {
         try {
-          const codec = pickMuxedCodecString()
-          if (!codec) {
-            console.error('[MSE] no supported muxed codec')
-            return
-          }
-          const sb = ms.addSourceBuffer(codec)
-          // Do not set sb.mode = 'sequence' — breaks Safari; default segments + timestampOffset works.
+          const sb = ms.addSourceBuffer(CODECS)
+          sb.mode = 'sequence'
           sb.onupdateend = () => {
             mseState.appending[0] = false
             if (mseState.queue.length > 0) {
@@ -760,19 +756,6 @@ export default function Conversation() {
       }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       console.info('[audio] got user media')
-      // iOS Safari: unlock inline video for MSE playback — STT calls sendMessage outside a tap gesture.
-      if (resolvedSttOnly) {
-        try {
-          const v = replyVideoRef.current
-          if (v) {
-            v.muted = true
-            v.playsInline = true
-            v.setAttribute('playsinline', '')
-            v.setAttribute('webkit-playsinline', '')
-            v.play().catch(() => {})
-          }
-        } catch (_) {}
-      }
       const pc = new RTCPeerConnection({ iceServers: iceServersRef.current })
       const dc = pc.createDataChannel('events')
       const pendingRemote = []
@@ -1040,296 +1023,285 @@ export default function Conversation() {
         </button>
         <Link to={`/persona/${personaId}/edit`} className="edit-link">Edit</Link>
       </header>
-      {mode === 'audio' ? (
+      {mode === 'video' ? (
+      <div className="video-wrap" aria-hidden="true">
+        {isGenerating && (
+          <div className="streaming-status generating">Thinking...</div>
+        )}
+        {isStreaming && !isGenerating && replyState.queue.length > 0 && (
+          <div className="streaming-status next">Next clip ready</div>
+        )}
+        {previewUrl && !showReply && (
+          <img
+            src={previewUrl}
+            alt=""
+            className="video-layer poster-fallback"
+            style={{ opacity: idlePlaying && !idleVideoError ? 0 : 1 }}
+          />
+        )}
+        <video
+          ref={idleVideoRef}
+          src={idleUrl && !idleVideoError ? idleUrl : undefined}
+          muted
+          loop
+          playsInline
+          autoPlay
+          preload="auto"
+          poster={previewUrl || undefined}
+          className="video-layer"
+          style={{ opacity: 1 }}
+          onError={() => setIdleVideoError(true)}
+          onPlaying={() => {
+            setIdlePlaying(true)
+            if (clearReplyPendingRef.current) {
+              clearReplyPendingRef.current = false
+              setShowReply(false)
+            }
+          }}
+          onPause={() => {
+            setIdlePlaying(false)
+            idleVideoRef.current?.play().catch(() => { })
+          }}
+          onWaiting={() => setIdlePlaying(false)}
+          onTimeUpdate={() => {
+            if (!idlePlaying) setIdlePlaying(true)
+          }}
+        />
+        <video
+          ref={replyVideoRef}
+          muted
+          autoPlay
+          loop={false}
+          playsInline
+          preload="auto"
+          className={`video-layer reply-layer${!showReply ? ' reply-hiding' : ''}`}
+          style={{
+            opacity: showReply ? 1 : 0,
+            pointerEvents: 'none',
+            // Kill transition instantly when starting a new message to avoid black flash
+            transition: isGenerating ? 'none' : undefined
+          }}
+          onPlaying={() => {
+            if (stallTimeoutRef.current) {
+              clearTimeout(stallTimeoutRef.current);
+              stallTimeoutRef.current = null;
+            }
+            if (longWaitTimeoutRef.current) {
+              clearTimeout(longWaitTimeoutRef.current);
+              longWaitTimeoutRef.current = null;
+            }
+            setShowReply(true)
+            if (perfRef.current.start) {
+              const tPlay = performance.now()
+              const dt = (tPlay - perfRef.current.start) / 1000
+              const dtAfterVideoStart = perfRef.current.videoStart ? (tPlay - perfRef.current.videoStart) / 1000 : null
+              console.info(`[ttfr] UI playback at ${dt.toFixed(2)}s` + (dtAfterVideoStart != null ? ` (after video_start ${dtAfterVideoStart.toFixed(2)}s)` : ''))
+            }
+          }}
+          onCanPlay={() => {
+            // Some browsers need this to recover from a deep stall
+            if (replyVideoRef.current && replyVideoRef.current.readyState >= 2) {
+              if (stallTimeoutRef.current) {
+                clearTimeout(stallTimeoutRef.current);
+                stallTimeoutRef.current = null;
+              }
+              if (longWaitTimeoutRef.current) {
+                clearTimeout(longWaitTimeoutRef.current);
+                longWaitTimeoutRef.current = null;
+              }
+              setShowReply(true);
+            }
+          }}
+          onCanPlayThrough={() => {
+            if (stallTimeoutRef.current) {
+              clearTimeout(stallTimeoutRef.current);
+              stallTimeoutRef.current = null;
+            }
+            if (longWaitTimeoutRef.current) {
+              clearTimeout(longWaitTimeoutRef.current);
+              longWaitTimeoutRef.current = null;
+            }
+            setShowReply(true);
+          }}
+          onTimeUpdate={() => {
+            if (!showReply && replyVideoRef.current && !replyVideoRef.current.paused) {
+              setShowReply(true)
+            }
+          }}
+          onProgress={() => {
+            if (USE_MSE && mode === 'video') resumeReplyPlayback()
+          }}
+          onEnded={handleReplyEnded}
+          onWaiting={() => {
+            // Fade back to idle if we stall FOR LONG, to avoid black screen
+            // but ignore short micro-stalls during buffer transitions.
+            if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
+            stallTimeoutRef.current = setTimeout(() => {
+              resumeReplyPlayback()
+              stallTimeoutRef.current = null;
+            }, 500);
+
+            // CRITICAL (video + MSE): the reply <video> fires `waiting` immediately while the
+            // MediaSource has zero bytes — normal for many seconds while Ditto encodes.  Do not
+            // replace sendMessage's 90s RECOVERY timer with this 10s fallback, or we set
+            // sending=false mid-stream, STT can open a new chat WS, and the pipeline cancels
+            // before any fMP4 arrives (looks like "video never worked").
+            if (USE_MSE && modeRef.current === 'video' && !gotFirstClipRef.current) {
+              return
+            }
+
+            // After the first segment exists: if we stall hard for 10s, unlock the UI.
+            if (longWaitTimeoutRef.current) clearTimeout(longWaitTimeoutRef.current);
+            longWaitTimeoutRef.current = setTimeout(() => {
+              setSending(false);
+              transitionToIdle();
+            }, 10000);
+          }}
+          onStalled={() => {
+            resumeReplyPlayback()
+          }}
+          onError={(e) => {
+            if (!replyVideoRef.current?.src) return
+            console.warn('[reply] video error', {
+              src: replyVideoRef.current?.src,
+              readyState: replyVideoRef.current?.readyState,
+              networkState: replyVideoRef.current?.networkState,
+              mediaError: replyVideoRef.current?.error?.message || replyVideoRef.current?.error?.code || null,
+            })
+            console.warn('Reply video error (may recover when MSE buffers data)', e.nativeEvent)
+          }}
+        />
+      </div>
+      ) : (
         <div className="audio-layout">
           <div className="audio-shell">
-            <div className="audio-left">
-              {streamError && <p className="stream-error">{streamError}</p>}
-              <div className="audio-card audio-persona-card">
-                <div className="audio-card-header">
-                  <div className="audio-title">{persona?.name || 'Persona'}</div>
-                  <div className={`audio-mode-pill ${micActive ? 'live' : ''}`}>
-                    {audioSpeaking ? 'Speaking' : micActive ? 'Listening' : 'Idle'}
-                  </div>
-                </div>
-                <div className="audio-poster-stage">
-                  {previewUrl && (
-                    <img src={previewUrl} alt="" className="audio-poster" />
-                  )}
+          <div className="audio-left">
+            <div className="audio-card">
+              <div className="audio-card-header">
+                <div className="audio-title">{persona?.name || 'Persona'}</div>
+                <div className={`audio-mode-pill ${micActive ? 'live' : ''}`}>
+                  {audioSpeaking ? 'Speaking' : micActive ? 'Listening' : 'Idle'}
                 </div>
               </div>
-              <div className="audio-mic-panel">
-                <button
-                  type="button"
-                  className={`mic-btn ${micActive ? 'active' : ''}`}
-                  onClick={() => (micActive ? stopMic() : startMic())}
-                >
-                  {micActive ? 'Mic On' : 'Mic Off'}
-                </button>
-                <div className="audio-mic-hint">{micActive ? 'Speak now…' : 'Tap to talk'}</div>
-                {micError && <p className="stream-error">{micError}</p>}
-              </div>
-              <audio
-                ref={audioRef}
-                className="assistant-audio-el"
-                onEnded={handleAudioEnded}
-                onPlaying={() => {
-                  if (perfRef.current.start) {
-                    const tPlay = performance.now()
-                    const dt = (tPlay - perfRef.current.start) / 1000
-                    const dtAfterStart = perfRef.current.audioStart ? (tPlay - perfRef.current.audioStart) / 1000 : null
-                    console.info(`[ttfr] audio_playback at ${dt.toFixed(2)}s` + (dtAfterStart != null ? ` (after audio_start ${dtAfterStart.toFixed(2)}s)` : ''))
-                  }
-                }}
-              />
+              {previewUrl && (
+                <img src={previewUrl} alt="" className="audio-poster" />
+              )}
             </div>
-            <div className="audio-right">
-              <div className="chat-panel">
-                <div className="chat-panel-header">
-                  <div className="chat-panel-title">Conversation</div>
-                  {isGenerating && <div className="audio-status">Thinking...</div>}
+            <div className="audio-mic-panel">
+              <button
+                type="button"
+                className={`mic-btn ${micActive ? 'active' : ''}`}
+                onClick={() => (micActive ? stopMic() : startMic())}
+              >
+                {micActive ? 'Mic On' : 'Mic Off'}
+              </button>
+              <div className="audio-mic-hint">{micActive ? 'Speak now…' : 'Tap to talk'}</div>
+              {micError && <p className="stream-error">{micError}</p>}
+            </div>
+          <audio
+            ref={audioRef}
+            onEnded={handleAudioEnded}
+            onPlaying={() => {
+              if (perfRef.current.start) {
+                const tPlay = performance.now()
+                const dt = (tPlay - perfRef.current.start) / 1000
+                const dtAfterStart = perfRef.current.audioStart ? (tPlay - perfRef.current.audioStart) / 1000 : null
+                console.info(`[ttfr] audio_playback at ${dt.toFixed(2)}s` + (dtAfterStart != null ? ` (after audio_start ${dtAfterStart.toFixed(2)}s)` : ''))
+              }
+            }}
+          />
+          </div>
+          <div className="audio-right">
+            <div className="chat-panel">
+              <div className="chat-panel-header">
+                <div className="chat-panel-title">Conversation</div>
+                {isGenerating && <div className="audio-status">Thinking...</div>}
+              </div>
+              <div className="chat-log" ref={chatLogScrollRef}>
+              {chatLog.map((m, i) => (
+                <div key={`${m.role}-${i}`} className={`chat-msg ${m.role}`}>
+                  <span className="chat-role">{m.role === 'user' ? 'You' : persona.name}</span>
+                  <span className="chat-text">{m.text}</span>
                 </div>
-                <div className="chat-log" ref={chatLogScrollRef}>
-                  {chatLog.map((m, i) => (
-                    <div key={`${m.role}-${i}`} className={`chat-msg ${m.role}`}>
-                      <span className="chat-role">{m.role === 'user' ? 'You' : persona.name}</span>
-                      <span className="chat-text">{m.text}</span>
-                    </div>
-                  ))}
-                </div>
-                <div className="audio-input-wrap">
-                  <form onSubmit={sendMessage} className="input-form">
-                    <input
-                      type="text"
-                      value={input}
-                      onChange={(e) => setInput(e.target.value)}
-                      placeholder="Type a message…"
-                      disabled={sending}
-                    />
-                    <button type="submit" disabled={sending || !input.trim()}>Send</button>
-                    <button
-                      type="button"
-                      className="stop-btn"
-                      onClick={stopPlayback}
-                      disabled={!canStop}
-                    >
-                      Stop
-                    </button>
-                  </form>
-                </div>
+              ))}
+              </div>
+              <div className="audio-input-wrap">
+                {streamError && <p className="stream-error">{streamError}</p>}
+                <form onSubmit={sendMessage} className="input-form">
+                  <input
+                    type="text"
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    placeholder="Type a message…"
+                    disabled={sending}
+                  />
+                  <button type="submit" disabled={sending || !input.trim()}>Send</button>
+                  <button
+                    type="button"
+                    className="stop-btn"
+                    onClick={stopPlayback}
+                    disabled={!canStop}
+                  >
+                    Stop
+                  </button>
+                </form>
               </div>
             </div>
+          </div>
           </div>
         </div>
-      ) : (
-        <div className="audio-layout video-layout">
-          <div className="audio-shell">
-            <div className="audio-left">
-              {streamError && <p className="stream-error">{streamError}</p>}
-              <div className="audio-card video-persona-card">
-                <div className="audio-card-header">
-                  <div className="audio-title">{persona?.name || 'Persona'}</div>
-                  <div className="audio-mode-pill audio-mode-pill-video">Video</div>
-                </div>
-                <div className="video-card-stage">
-                  <div className="video-wrap">
-                    {isGenerating && (
-                      <div className="streaming-status generating">Thinking...</div>
-                    )}
-                    {isStreaming && !isGenerating && replyState.queue.length > 0 && (
-                      <div className="streaming-status next">Next clip ready</div>
-                    )}
-                    {previewUrl && !showReply && (
-                      <img
-                        src={previewUrl}
-                        alt=""
-                        className="video-layer poster-fallback"
-                        style={{ opacity: idlePlaying && !idleVideoError ? 0 : 1 }}
-                      />
-                    )}
-                    <video
-                      ref={idleVideoRef}
-                      src={idleUrl && !idleVideoError ? idleUrl : undefined}
-                      muted
-                      loop
-                      playsInline
-                      autoPlay
-                      preload="auto"
-                      poster={previewUrl || undefined}
-                      className="video-layer"
-                      style={{ opacity: 1 }}
-                      onError={() => setIdleVideoError(true)}
-                      onPlaying={() => {
-                        setIdlePlaying(true)
-                        if (clearReplyPendingRef.current) {
-                          clearReplyPendingRef.current = false
-                          setShowReply(false)
-                        }
-                      }}
-                      onPause={() => {
-                        setIdlePlaying(false)
-                        idleVideoRef.current?.play().catch(() => { })
-                      }}
-                      onWaiting={() => setIdlePlaying(false)}
-                      onTimeUpdate={() => {
-                        if (!idlePlaying) setIdlePlaying(true)
-                      }}
-                    />
-                    <video
-                      ref={replyVideoRef}
-                      muted
-                      autoPlay
-                      loop={false}
-                      playsInline
-                      preload="auto"
-                      className={`video-layer reply-layer${!showReply ? ' reply-hiding' : ''}`}
-                      style={{
-                        opacity: showReply ? 1 : 0,
-                        pointerEvents: 'none',
-                        transition: isGenerating ? 'none' : undefined
-                      }}
-                      onPlaying={() => {
-                        if (stallTimeoutRef.current) {
-                          clearTimeout(stallTimeoutRef.current);
-                          stallTimeoutRef.current = null;
-                        }
-                        if (longWaitTimeoutRef.current) {
-                          clearTimeout(longWaitTimeoutRef.current);
-                          longWaitTimeoutRef.current = null;
-                        }
-                        setShowReply(true)
-                        if (perfRef.current.start) {
-                          const tPlay = performance.now()
-                          const dt = (tPlay - perfRef.current.start) / 1000
-                          const dtAfterVideoStart = perfRef.current.videoStart ? (tPlay - perfRef.current.videoStart) / 1000 : null
-                          console.info(`[ttfr] UI playback at ${dt.toFixed(2)}s` + (dtAfterVideoStart != null ? ` (after video_start ${dtAfterVideoStart.toFixed(2)}s)` : ''))
-                        }
-                      }}
-                      onCanPlay={() => {
-                        if (replyVideoRef.current && replyVideoRef.current.readyState >= 2) {
-                          if (stallTimeoutRef.current) {
-                            clearTimeout(stallTimeoutRef.current);
-                            stallTimeoutRef.current = null;
-                          }
-                          if (longWaitTimeoutRef.current) {
-                            clearTimeout(longWaitTimeoutRef.current);
-                            longWaitTimeoutRef.current = null;
-                          }
-                          setShowReply(true);
-                        }
-                      }}
-                      onCanPlayThrough={() => {
-                        if (stallTimeoutRef.current) {
-                          clearTimeout(stallTimeoutRef.current);
-                          stallTimeoutRef.current = null;
-                        }
-                        if (longWaitTimeoutRef.current) {
-                          clearTimeout(longWaitTimeoutRef.current);
-                          longWaitTimeoutRef.current = null;
-                        }
-                        setShowReply(true);
-                      }}
-                      onTimeUpdate={() => {
-                        if (!showReply && replyVideoRef.current && !replyVideoRef.current.paused) {
-                          setShowReply(true)
-                        }
-                      }}
-                      onProgress={() => {
-                        if (isVideoMseAvailable() && mode === 'video') resumeReplyPlayback()
-                      }}
-                      onEnded={handleReplyEnded}
-                      onWaiting={() => {
-                        if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
-                        stallTimeoutRef.current = setTimeout(() => {
-                          resumeReplyPlayback()
-                          stallTimeoutRef.current = null;
-                        }, 500);
-
-                        if (isVideoMseAvailable() && modeRef.current === 'video' && !gotFirstClipRef.current) {
-                          return
-                        }
-
-                        if (longWaitTimeoutRef.current) clearTimeout(longWaitTimeoutRef.current);
-                        longWaitTimeoutRef.current = setTimeout(() => {
-                          setSending(false);
-                          transitionToIdle();
-                        }, 10000);
-                      }}
-                      onStalled={() => {
-                        resumeReplyPlayback()
-                      }}
-                      onError={(e) => {
-                        if (!replyVideoRef.current?.src) return
-                        console.warn('[reply] video error', {
-                          src: replyVideoRef.current?.src,
-                          readyState: replyVideoRef.current?.readyState,
-                          networkState: replyVideoRef.current?.networkState,
-                          mediaError: replyVideoRef.current?.error?.message || replyVideoRef.current?.error?.code || null,
-                        })
-                        console.warn('Reply video error (may recover when MSE buffers data)', e.nativeEvent)
-                      }}
-                    />
-                  </div>
-                </div>
-              </div>
-              <div className="audio-mic-panel">
-                <button
-                  type="button"
-                  className={`mic-btn ${micActive ? 'active' : ''}`}
-                  onClick={handleVideoMicToggle}
-                  disabled={sending}
-                >
-                  {micActive ? 'Mic On' : 'Mic Off'}
-                </button>
-                <div className="audio-mic-hint">{micActive ? 'Speak now…' : 'Tap to talk'}</div>
-                {micError && <p className="stream-error">{micError}</p>}
-              </div>
-            </div>
-            <div className="audio-right">
-              <div className="chat-panel video-chat-panel">
-                <div className="chat-panel-header">
-                  <div className="chat-panel-title">Conversation</div>
-                  {isGenerating && <div className="audio-status">Thinking...</div>}
-                </div>
-                <div className="chat-log" ref={chatLogScrollRef}>
-                  {chatLog.map((m, i) => (
-                    <div key={`${m.role}-${i}`} className={`chat-msg ${m.role}`}>
-                      <span className="chat-role">{m.role === 'user' ? 'You' : persona.name}</span>
-                      <span className="chat-text">{m.text}</span>
-                    </div>
-                  ))}
-                </div>
-                <div className="audio-input-wrap video-input-wrap">
-                  <div className="video-text-toggle-wrap">
-                    <button
-                      type="button"
-                      className="video-text-toggle"
-                      onClick={() => setShowVideoTextInput((v) => !v)}
-                    >
-                      {showVideoTextInput ? 'Hide text input' : 'Type a message instead'}
-                    </button>
-                  </div>
-                  <form onSubmit={sendMessage} className="input-form">
-                    {showVideoTextInput && (
-                      <input
-                        type="text"
-                        value={input}
-                        onChange={(e) => setInput(e.target.value)}
-                        placeholder={micActive ? 'Turn off mic to type…' : 'Type a message…'}
-                        disabled={sending || micActive}
-                      />
-                    )}
-                    {showVideoTextInput && (
-                      <button type="submit" disabled={sending || micActive || !input.trim()}>Send</button>
-                    )}
-                    <button type="button" className="stop-btn" onClick={stopPlayback} disabled={!canStop}>
-                      Stop
-                    </button>
-                  </form>
-                </div>
-              </div>
-            </div>
+      )}
+      {mode === 'video' && (
+        <div className="conv-bottom video-conv-bottom">
+          {streamError && <p className="stream-error">{streamError}</p>}
+          <div className="video-voice-intro">
+            <span className="video-voice-title">Voice conversation</span>
+            <p className="video-voice-sub">
+              Turn the mic on and talk with {persona.name}&rsquo;s talking head. Your speech is transcribed and sent like a typed line; replies come back as lip-synced video with audio.
+            </p>
           </div>
+          <div className="video-voice-controls">
+            <button
+              type="button"
+              className={`mic-btn mic-btn-video ${micActive ? 'active' : ''}`}
+              onClick={handleVideoMicToggle}
+              disabled={sending}
+            >
+              {micActive ? 'Listening…' : 'Microphone'}
+            </button>
+            <div className="video-mic-copy">
+              <div className="video-mic-hint">
+                {micActive
+                  ? 'Speak naturally — pause briefly at the end of a thought so your line is sent.'
+                  : 'Press Microphone and speak; your line is transcribed and sent (no typing needed).'}
+              </div>
+            </div>
+            <button type="button" className="stop-btn" onClick={stopPlayback} disabled={!canStop}>
+              Stop
+            </button>
+          </div>
+          {micError && <p className="stream-error video-mic-error">{micError}</p>}
+          <div className="video-text-toggle-wrap">
+            <button
+              type="button"
+              className="video-text-toggle"
+              onClick={() => setShowVideoTextInput((v) => !v)}
+            >
+              {showVideoTextInput ? 'Hide text input' : 'Type a message instead'}
+            </button>
+          </div>
+          {showVideoTextInput && (
+            <form onSubmit={sendMessage} className="input-form">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder={micActive ? 'Turn off mic to type…' : 'Type a message…'}
+                disabled={sending || micActive}
+              />
+              <button type="submit" disabled={sending || micActive || !input.trim()}>Send</button>
+            </form>
+          )}
         </div>
       )}
       <style>{`
@@ -1339,56 +1311,46 @@ export default function Conversation() {
         .conv-header a { margin-right: 0; color: #a78bfa; }
         .conv h1 { font-family: var(--font-heading); font-size: 0.95rem; font-weight: 600; margin: 0; flex: 1; color: #fff; }
         .conv-header .edit-link { color: #a78bfa; font-size: 0.85rem; }
-        .assistant-audio-el { position: absolute; width: 0; height: 0; opacity: 0; pointer-events: none; }
-        .audio-layout { display: grid; grid-template-columns: 1fr; padding: 1.25rem; flex: 1; min-height: 0; background: radial-gradient(1200px 400px at 20% 0%, rgba(59,130,246,0.12), transparent 60%), radial-gradient(800px 500px at 80% 10%, rgba(16,185,129,0.12), transparent 55%); }
-        .video-layout { background: radial-gradient(1200px 400px at 20% 0%, rgba(16,185,129,0.1), transparent 60%), radial-gradient(800px 500px at 80% 10%, rgba(59,130,246,0.08), transparent 55%); }
-        .audio-shell { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 1.5rem; min-height: 0; }
-        .audio-left { display: flex; flex-direction: column; gap: 1rem; min-width: 0; min-height: 0; height: 100%; }
-        .audio-right { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-        .audio-card { border-radius: 18px; padding: 1rem; background: rgba(15,23,42,0.75); border: 1px solid rgba(148,163,184,0.2); box-shadow: 0 24px 60px rgba(0,0,0,0.35); display: flex; flex-direction: column; min-height: 0; }
-        .audio-persona-card,
-        .video-persona-card { flex: 1; min-height: 0; }
-        .audio-poster-stage { position: relative; flex: 1; min-height: min(52vh, 420px); width: 100%; border-radius: 14px; overflow: hidden; background: #0b0f17; border: 1px solid rgba(148,163,184,0.2); }
-        .audio-poster-stage .audio-poster { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #0b0f17; }
-        .video-card-stage { position: relative; flex: 1; min-height: min(52vh, 420px); width: 100%; border-radius: 14px; overflow: hidden; background: #000; border: 1px solid rgba(148,163,184,0.15); }
-        .video-layout .video-card-stage { border-color: rgba(16,185,129,0.35); }
-        .video-card-stage .video-wrap { position: absolute; inset: 0; z-index: 0; flex: none; min-height: 0; width: 100%; height: 100%; background: #000; overflow: hidden; pointer-events: none; }
+        .video-wrap { position: relative; z-index: 0; flex: 1; min-height: 0; width: 100%; background: #000; overflow: hidden; pointer-events: none; }
         .video-wrap .video-layer { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transition: opacity 0.35s ease-out; pointer-events: none; }
         .video-wrap .video-layer.poster-fallback { z-index: 2; }
         .video-wrap .video-layer.reply-layer { z-index: 1; transition: opacity 0.3s ease-in-out; }
         .video-wrap .video-layer.reply-layer.reply-hiding { transition: opacity 0.35s ease-out; }
-        .audio-card-header { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.75rem; flex-shrink: 0; }
-        .audio-title { font-size: 1.05rem; font-weight: 600; color: #fff; }
-        .audio-mode-pill { font-size: 0.7rem; padding: 0.25rem 0.6rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.08em; background: rgba(148,163,184,0.2); color: rgba(255,255,255,0.8); }
-        .audio-mode-pill.live { background: rgba(16,185,129,0.25); color: #a7f3d0; }
-        .audio-mode-pill-video { background: rgba(16,185,129,0.22); color: #a7f3d0; border: 1px solid rgba(16,185,129,0.4); }
-        .audio-mic-panel { display: flex; flex-direction: column; gap: 0.35rem; align-items: flex-start; padding: 0.75rem 0.85rem; border-radius: 16px; border: 1px solid rgba(148,163,184,0.2); background: rgba(2,6,23,0.6); }
-        .audio-mic-hint { font-size: 0.78rem; color: rgba(148,163,184,0.9); }
-        .audio-status { font-size: 0.78rem; color: rgba(148,163,184,0.9); }
-        .chat-panel { display: flex; flex-direction: column; min-height: 0; height: 100%; background: rgba(8,11,18,0.75); border: 1px solid rgba(148,163,184,0.2); border-radius: 18px; box-shadow: 0 20px 50px rgba(0,0,0,0.35); overflow: hidden; }
-        .video-chat-panel { border-color: rgba(16,185,129,0.28); }
-        .chat-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 0.85rem 1rem; border-bottom: 1px solid rgba(148,163,184,0.2); }
-        .chat-panel-title { font-size: 0.9rem; font-weight: 600; color: rgba(255,255,255,0.9); }
-        .chat-log { display: flex; flex-direction: column; gap: 0.6rem; flex: 1; overflow-y: auto; padding: 0.9rem 1rem; }
-        .video-input-wrap .video-text-toggle-wrap { padding: 0 0 0.35rem; }
+        .conv-bottom { position: relative; z-index: 20; flex-shrink: 0; background: rgba(0,0,0,0.9); border-top: 1px solid rgba(255,255,255,0.1); }
+        .video-conv-bottom { padding-bottom: 0.5rem; }
+        .video-voice-intro { padding: 0.55rem 1rem 0.15rem; }
+        .video-voice-title { display: block; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.14em; color: rgba(148,163,184,0.95); }
+        .video-voice-sub { margin: 0.4rem 0 0; font-size: 0.8rem; line-height: 1.4; color: rgba(226,232,240,0.88); max-width: 40rem; }
+        /* Dedicated bar so styles are not overridden by .audio-mic-panel (later in this stylesheet). */
+        .conv-bottom .video-voice-controls {
+          display: flex;
+          flex-direction: row;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 0.75rem 1rem;
+          margin: 0.55rem 1rem 0;
+          padding: 0.85rem 1rem;
+          border-radius: 16px;
+          border: 1px solid rgba(16, 185, 129, 0.35);
+          background: rgba(6, 78, 59, 0.35);
+          pointer-events: auto;
+        }
+        .mic-btn-video { padding: 0.72rem 1.15rem; font-size: 0.95rem; font-weight: 600; }
+        .video-mic-copy { flex: 1; min-width: 11rem; }
+        .video-mic-hint { font-size: 0.8rem; line-height: 1.35; color: rgba(226, 232, 240, 0.92); }
+        .video-text-toggle-wrap { padding: 0.25rem 1rem 0; }
         .video-text-toggle { background: none; border: none; color: #a78bfa; font-size: 0.78rem; cursor: pointer; text-decoration: underline; padding: 0.15rem 0; }
         .video-text-toggle:hover { color: #c4b5fd; }
-        .audio-input-wrap { padding: 0.75rem 1rem 1rem; border-top: 1px solid rgba(148,163,184,0.2); background: rgba(2,6,23,0.55); }
-        .audio-input-wrap .input-form { background: rgba(15,23,42,0.6); border: 1px solid rgba(148,163,184,0.2); border-radius: 14px; padding: 0.5rem; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
-        .audio-input-wrap .input-form input { flex: 1; background: transparent; border: none; padding: 0.6rem 0.75rem; min-width: 220px; color: #fff; }
-        .audio-input-wrap .input-form input:focus { outline: none; }
-        .audio-input-wrap .input-form button[type="submit"] { padding: 0.6rem 1rem; border-radius: var(--radius); border: none; background: var(--primary); color: #fff; font-weight: 500; cursor: pointer; }
-        .audio-input-wrap .input-form button[type="submit"]:hover:not(:disabled) { background: var(--primary-hover); }
-        .audio-input-wrap .input-form button[type="submit"]:disabled { opacity: 0.5; cursor: not-allowed; }
+        .conv-bottom .video-mic-error { margin: 0.35rem 1rem 0; }
         .input-form { display: flex; gap: 0.5rem; padding: 0.75rem 1rem; width: 100%; }
         .input-form input { flex: 1; padding: 0.6rem 0.75rem; border-radius: var(--radius); border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.08); color: #fff; }
         .input-form input::placeholder { color: rgba(255,255,255,0.5); }
         .input-form input:focus { outline: none; border-color: var(--primary); }
-        .input-form button[type="submit"] { padding: 0.6rem 1rem; border-radius: var(--radius); border: none; background: var(--primary); color: #fff; font-weight: 500; cursor: pointer; }
-        .input-form button[type="submit"]:hover:not(:disabled) { background: var(--primary-hover); }
-        .input-form button[type="submit"]:disabled { opacity: 0.5; cursor: not-allowed; }
+        .input-form button { padding: 0.6rem 1rem; border-radius: var(--radius); border: none; background: var(--primary); color: #fff; font-weight: 500; cursor: pointer; }
+        .input-form button:hover:not(:disabled) { background: var(--primary-hover); }
+        .input-form button:disabled { opacity: 0.5; cursor: not-allowed; }
         .stream-error { color: #f87171; font-size: 0.85rem; padding: 0 1rem; margin: 0 0 0.25rem; }
-        .streaming-status { position: absolute; bottom: 0.75rem; left: 50%; transform: translateX(-50%); z-index: 3; padding: 0.35rem 0.75rem; border-radius: 999px; font-size: 0.8rem; background: rgba(0,0,0,0.75); color: rgba(255,255,255,0.9); pointer-events: none; }
+        .streaming-status { position: absolute; bottom: 0.75rem; left: 50%; transform: translateX(-50%); z-index: 2; padding: 0.35rem 0.75rem; border-radius: 999px; font-size: 0.8rem; background: rgba(0,0,0,0.75); color: rgba(255,255,255,0.9); pointer-events: none; }
         .streaming-status.generating { animation: pulse 1.5s ease-in-out infinite; }
         .streaming-status.next { opacity: 0.85; }
         .mode-toggle { display: flex; align-items: center; gap: 0.45rem; }
@@ -1406,67 +1368,43 @@ export default function Conversation() {
         .stop-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .clear-btn { border: 1px solid rgba(255,255,255,0.2); background: rgba(59,130,246,0.15); color: #fff; padding: 0.25rem 0.6rem; border-radius: 999px; cursor: pointer; }
         .clear-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .audio-layout { display: grid; grid-template-columns: 1fr; padding: 1.25rem; flex: 1; min-height: 0; background: radial-gradient(1200px 400px at 20% 0%, rgba(59,130,246,0.12), transparent 60%), radial-gradient(800px 500px at 80% 10%, rgba(16,185,129,0.12), transparent 55%); }
+        .audio-shell { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 1.5rem; min-height: 0; }
+        .audio-left { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
+        .audio-right { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+        .audio-card { border-radius: 18px; padding: 1rem; background: rgba(15,23,42,0.75); border: 1px solid rgba(148,163,184,0.2); box-shadow: 0 24px 60px rgba(0,0,0,0.35); }
+        .audio-card-header { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.75rem; }
+        .audio-title { font-size: 1.05rem; font-weight: 600; color: #fff; }
+        .audio-mode-pill { font-size: 0.7rem; padding: 0.25rem 0.6rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.08em; background: rgba(148,163,184,0.2); color: rgba(255,255,255,0.8); }
+        .audio-mode-pill.live { background: rgba(16,185,129,0.25); color: #a7f3d0; }
+        .audio-mic-panel { display: flex; flex-direction: column; gap: 0.35rem; align-items: flex-start; padding: 0.75rem 0.85rem; border-radius: 16px; border: 1px solid rgba(148,163,184,0.2); background: rgba(2,6,23,0.6); }
+        .audio-mic-hint { font-size: 0.78rem; color: rgba(148,163,184,0.9); }
+        .audio-status { font-size: 0.78rem; color: rgba(148,163,184,0.9); }
+        .audio-poster { width: 100%; max-height: 62vh; object-fit: contain; background: #0b0f17; border-radius: 14px; border: 1px solid rgba(148,163,184,0.2); }
+        .chat-panel { display: flex; flex-direction: column; min-height: 0; height: 100%; background: rgba(8,11,18,0.75); border: 1px solid rgba(148,163,184,0.2); border-radius: 18px; box-shadow: 0 20px 50px rgba(0,0,0,0.35); overflow: hidden; }
+        .chat-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 0.85rem 1rem; border-bottom: 1px solid rgba(148,163,184,0.2); }
+        .chat-panel-title { font-size: 0.9rem; font-weight: 600; color: rgba(255,255,255,0.9); }
+        .chat-log { display: flex; flex-direction: column; gap: 0.6rem; flex: 1; overflow-y: auto; padding: 0.9rem 1rem; }
         .chat-msg { display: flex; flex-direction: column; gap: 0.2rem; padding: 0.6rem 0.8rem; border-radius: 14px; background: rgba(255,255,255,0.06); }
         .chat-msg.user { align-self: flex-end; background: rgba(59,130,246,0.15); }
         .chat-role { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.7; }
         .chat-text { font-size: 0.9rem; }
+        .audio-input-wrap { padding: 0.75rem 1rem 1rem; border-top: 1px solid rgba(148,163,184,0.2); background: rgba(2,6,23,0.55); }
+        .audio-input-wrap .input-form { background: rgba(15,23,42,0.6); border: 1px solid rgba(148,163,184,0.2); border-radius: 14px; padding: 0.5rem; gap: 0.5rem; flex-wrap: wrap; }
+        .audio-input-wrap .input-form input { background: transparent; border: none; padding: 0.6rem 0.75rem; min-width: 220px; }
+        .audio-input-wrap .input-form input:focus { border: none; }
+        .audio-input-wrap .input-form button { border-radius: 10px; }
         @media (max-width: 980px) {
           .audio-shell { grid-template-columns: 1fr; }
+          .audio-card { order: 1; }
+          .chat-panel { order: 2; }
         }
         @media (max-width: 720px) {
-          .audio-layout {
-            padding: 0.75rem;
-            display: flex;
-            flex-direction: column;
-            flex: 1;
-            min-height: 0;
-          }
-          .audio-shell {
-            display: flex;
-            flex-direction: column;
-            flex: 1;
-            min-height: 0;
-            gap: 0.75rem;
-          }
-          .audio-right {
-            display: none;
-          }
+          .audio-layout { padding: 0.75rem; }
           .chat-panel { display: none; }
-          .audio-left {
-            flex: 1;
-            min-height: 0;
-            gap: 0.75rem;
-            justify-content: flex-start;
-            height: auto;
-          }
+          .audio-left { gap: 0.75rem; }
           .audio-card { padding: 0.85rem; }
           .audio-card-header { flex-direction: column; align-items: flex-start; }
-          .audio-layout .audio-persona-card,
-          .video-layout .video-persona-card {
-            flex: 1 1 auto;
-            min-height: 0;
-          }
-          .audio-poster-stage,
-          .video-card-stage {
-            flex: 1;
-            min-height: min(36vh, 260px);
-          }
-          .audio-mic-panel {
-            flex-shrink: 0;
-            align-self: stretch;
-            align-items: flex-end;
-            flex-direction: column;
-            width: 100%;
-            margin-top: 0;
-          }
-          .audio-mic-panel .mic-btn {
-            align-self: flex-end;
-          }
-          .audio-mic-panel .audio-mic-hint {
-            text-align: right;
-            align-self: flex-end;
-            max-width: 100%;
-          }
           .audio-input-wrap { padding: 0.5rem; border-radius: 16px; border: 1px solid rgba(148,163,184,0.2); background: rgba(2,6,23,0.7); }
           .audio-input-wrap .input-form { padding: 0.4rem; }
           .audio-input-wrap .input-form input { width: 100%; min-width: 0; }
