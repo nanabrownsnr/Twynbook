@@ -489,6 +489,12 @@ class UserLogin(BaseModel):
     password: str
 
 
+class MarketplaceBridgeBody(BaseModel):
+    marketplace_user_id: str
+    email: str
+    name: str | None = None
+
+
 class ValidateLicenseBody(BaseModel):
     license_key: str = ""
 
@@ -557,6 +563,13 @@ PURCHASES_FILE = DATA_DIR / "purchases.json"
 JWT_SECRET = os.environ.get("JWT_SECRET", "twynbook-dev-secret-change-in-production")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 7
+# Shared with MCP marketplace API for POST /api/auth/marketplace-bridge (server-to-server only).
+MARKETPLACE_BRIDGE_SECRET = (os.environ.get("MARKETPLACE_BRIDGE_SECRET") or "").strip()
+# Marketplace catalog MCP listing IDs are UUIDs; allow persona.assigned_mcp_configs keys without a twynbook purchase row.
+_MARKETPLACE_CATALOG_MCP_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.I,
+)
 # Only this email is ever set as admin (in DB at startup). Signup cannot grant admin.
 ADMIN_EMAIL = "n.brown@4th-ir.com"
 http_bearer = HTTPBearer(auto_error=False)
@@ -1087,6 +1100,20 @@ def get_user_by_email(email: str) -> dict | None:
     return None
 
 
+def get_user_by_marketplace_id(marketplace_user_id: str) -> dict | None:
+    mid = (marketplace_user_id or "").strip()
+    if not mid:
+        return None
+    for u in load_users():
+        if (u.get("marketplace_user_id") or "").strip() == mid:
+            return u
+    return None
+
+
+def _is_marketplace_catalog_mcp_id(lid: str) -> bool:
+    return bool(lid and _MARKETPLACE_CATALOG_MCP_ID_RE.match(lid.strip()))
+
+
 def get_user_by_id(user_id: str) -> dict | None:
     for u in load_users():
         if u.get("id") == user_id:
@@ -1430,6 +1457,93 @@ def login(body: UserLogin):
         raise HTTPException(401, "Invalid email or password")
     token = create_access_token(user["id"])
     return {"token": token, "user": {"id": user["id"], "email": user["email"], "name": user["name"], "is_admin": user.get("is_admin", False)}}
+
+
+@app.post("/api/auth/marketplace-bridge")
+def marketplace_bridge(
+    body: MarketplaceBridgeBody,
+    x_marketplace_bridge_secret: str | None = Header(None, alias="X-Marketplace-Bridge-Secret"),
+):
+    """
+    Server-only: MCP marketplace API validates the user's marketplace token, then calls here with
+    X-Marketplace-Bridge-Secret to create or look up a twynbook user keyed by marketplace_user_id.
+    """
+    if not MARKETPLACE_BRIDGE_SECRET:
+        raise HTTPException(503, "Marketplace bridge is not configured (set MARKETPLACE_BRIDGE_SECRET)")
+    got = (x_marketplace_bridge_secret or "").strip()
+    if not got or not secrets.compare_digest(got, MARKETPLACE_BRIDGE_SECRET):
+        raise HTTPException(403, "Invalid bridge credentials")
+
+    mid = (body.marketplace_user_id or "").strip()
+    email = (body.email or "").strip().lower()
+    if not mid or not email or "@" not in email:
+        raise HTTPException(400, "marketplace_user_id and a valid email are required")
+    display_name = (body.name or "").strip() or email.split("@", 1)[0]
+
+    linked = get_user_by_marketplace_id(mid)
+    if linked:
+        users = load_users()
+        updated: dict | None = None
+        for i, u in enumerate(users):
+            if u.get("id") == linked["id"]:
+                users[i]["email"] = email
+                users[i]["name"] = display_name
+                save_users(users)
+                updated = users[i]
+                break
+        u = updated or linked
+        token = create_access_token(u["id"])
+        return {
+            "token": token,
+            "user": {"id": u["id"], "email": u["email"], "name": u["name"], "is_admin": u.get("is_admin", False)},
+        }
+
+    by_email = get_user_by_email(email)
+    if by_email:
+        existing_mid = (by_email.get("marketplace_user_id") or "").strip()
+        if existing_mid == mid:
+            users = load_users()
+            u_out: dict | None = None
+            for i, u in enumerate(users):
+                if u.get("id") == by_email["id"]:
+                    users[i]["email"] = email
+                    users[i]["name"] = display_name
+                    save_users(users)
+                    u_out = users[i]
+                    break
+            u = u_out or by_email
+            token = create_access_token(u["id"])
+            return {
+                "token": token,
+                "user": {"id": u["id"], "email": u["email"], "name": u["name"], "is_admin": u.get("is_admin", False)},
+            }
+        if existing_mid:
+            raise HTTPException(
+                409,
+                "This email is already linked to a different marketplace account.",
+            )
+        raise HTTPException(
+            409,
+            "A Twynbook account with this email already exists. Sign in on Twynbook or use a different email.",
+        )
+
+    user_id = uuid.uuid4().hex
+    raw_pw = secrets.token_urlsafe(32)
+    user = {
+        "id": user_id,
+        "email": email,
+        "name": display_name,
+        "password_hash": bcrypt.hashpw(raw_pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
+        "is_admin": False,
+        "license_key": secrets.token_hex(24),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "marketplace_user_id": mid,
+    }
+    users = load_users()
+    users.append(user)
+    save_users(users)
+    token = create_access_token(user_id)
+    return {"token": token, "user": {"id": user["id"], "email": user["email"], "name": user["name"], "is_admin": False}}
 
 
 @app.get("/api/auth/me")
@@ -2233,15 +2347,16 @@ def update_persona(persona_id: str, body: PersonaUpdate, current_user: dict = De
         for lid, url in (body.assigned_mcp_configs or {}).items():
             lid = str(lid).strip()
             url = (url or "").strip()
-            if not lid or lid not in owned_ids:
-                continue
-            listing = get_listing(lid)
-            if not listing or _listing_type(listing) != "mcp":
+            if not lid:
                 continue
             low = url.lower()
             if not (low.startswith("http://") or low.startswith("https://")):
                 raise HTTPException(400, f"Capability URL must start with http:// or https:// ({lid})")
-            out_mcp[lid] = url
+            listing = get_listing(lid)
+            if lid in owned_ids and listing and _listing_type(listing) == "mcp":
+                out_mcp[lid] = url
+            elif _is_marketplace_catalog_mcp_id(lid):
+                out_mcp[lid] = url
         p["assigned_mcp_configs"] = out_mcp
     personas = load_personas()
     for i, x in enumerate(personas):
@@ -5267,12 +5382,20 @@ async def _run_chat_stream(ctx: dict):
     for lid, user_url in (p.get("assigned_mcp_configs") or {}).items():
         lid = str(lid).strip()
         user_url = (user_url or "").strip()
-        if not lid or not user_url or lid not in owned_mcp:
+        if not lid or not user_url:
             continue
-        listing = get_listing(lid)
-        if not listing or _listing_type(listing) != "mcp":
+        low = user_url.lower()
+        if not (low.startswith("http://") or low.startswith("https://")):
             continue
-        await loop.run_in_executor(None, _add_tools_from_mcp_url, user_url, tools_for_llm, tool_name_to_url)
+        use_url = False
+        if lid in owned_mcp:
+            listing = get_listing(lid)
+            if listing and _listing_type(listing) == "mcp":
+                use_url = True
+        elif _is_marketplace_catalog_mcp_id(lid):
+            use_url = True
+        if use_url:
+            await loop.run_in_executor(None, _add_tools_from_mcp_url, user_url, tools_for_llm, tool_name_to_url)
     if tools_for_llm and not OLLAMA_NATIVE_TOOLS:
         tool_descs = "; ".join(
             f"{t['function']['name']}: {t['function'].get('description', '') or 'No description'}"
