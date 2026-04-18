@@ -6953,7 +6953,7 @@ def get_reply_audio_clip(persona_id: str, reply_id: str, clip_index: int):
 if STATIC_DIR and STATIC_DIR.is_dir():
     app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
 
-    @app.get("/{full_path:path}")
+    @app.api_route("/{full_path:path}", methods=["GET", "HEAD"])
     async def serve_frontend(full_path: str):
         """Serve built SPA: static files or index.html for client-side routes."""
         if full_path.startswith("api/") or full_path.startswith("webrtc/"):
