@@ -1,13 +1,8 @@
-import { useParams, Link } from 'react-router-dom'
+import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useEffect, useRef, useState } from 'react'
 import { apiFetch, getToken } from '../auth'
 
 const API = '/api'
-const USE_MSE = !(
-  typeof import.meta !== 'undefined' &&
-  import.meta.env &&
-  import.meta.env.VITE_DITTO_STREAMING === '0'
-)
 const AUDIO_CODECS = 'audio/mp4; codecs="mp4a.40.2"'
 const AUDIO_SAMPLE_RATE = 16000
 const AUDIO_START_PAD_SEC = 0.05
@@ -62,6 +57,7 @@ function muxedBufferedAheadSec(v) {
 
 export default function Conversation() {
   const { personaId } = useParams()
+  const navigate = useNavigate()
   const [persona, setPersona] = useState(null)
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
@@ -77,11 +73,28 @@ export default function Conversation() {
   const [idleVideoError, setIdleVideoError] = useState(false)
   const [idlePlaying, setIdlePlaying] = useState(false)
   const [streamError, setStreamError] = useState(null)
+  /** WebRTC voice session is up (until end chat, leave page, or mode switch). */
   const [micActive, setMicActive] = useState(false)
+  /** When session is up: actually send mic audio for STT (false = muted, connection stays open). */
+  const [micListening, setMicListening] = useState(false)
   const [audioSpeaking, setAudioSpeaking] = useState(false)
   const [micError, setMicError] = useState(null)
   /** Video mode: voice-first UI; text field revealed on demand. */
   const [showVideoTextInput, setShowVideoTextInput] = useState(false)
+  /** Video mode: right-hand chat panel (reference layout). */
+  const [showChatPanel, setShowChatPanel] = useState(true)
+  /** Floating bar: mode + actions (Audio / Avatar dropdown). */
+  const [barMenuOpen, setBarMenuOpen] = useState(false)
+  const waveCanvasRef = useRef(null)
+  const waveWrapRef = useRef(null)
+  const waveRafRef = useRef(null)
+  const micAnalyserRef = useRef(null)
+  const micVizCtxRef = useRef(null)
+  const micVizSourceRef = useRef(null)
+  const micVizStreamRef = useRef(null)
+  const micActiveRef = useRef(false)
+  const micListeningRef = useRef(false)
+  const audioSpeakingRef = useRef(false)
   const idleVideoRef = useRef(null)
   const replyVideoRef = useRef(null)
   const audioRef = useRef(null)
@@ -117,6 +130,9 @@ export default function Conversation() {
   const isGenerating = sending && !firstClipReceived
   const canStop = sending || (mode === 'audio' ? !!audioState.current : !!replyState.current)
   const chatKey = personaId ? `twynbook:chat:${personaId}` : null
+  const integrationBlocked = !!(persona && persona.integration_ready === false)
+  const integrationMessage =
+    (persona && typeof persona.integration_message === 'string' && persona.integration_message.trim()) || ''
 
   const resetTimers = () => {
     if (clearReplyTimeoutRef.current) {
@@ -319,35 +335,24 @@ export default function Conversation() {
       if (data?.text && !hasStreamedTextRef.current) {
         setChatLog((prev) => [...prev, { role: 'assistant', text: data.text }])
       }
-      if (USE_MSE) {
-        // Streaming Ditto sends fMP4 binary; this event is metadata only.
-        if (data?.streaming !== false) return
-        // Non-streaming Ditto (e.g. DITTO_STREAMING unset): no segments — play the MP4 URL instead of an empty MediaSource.
-        const rel = data?.url
-        if (!rel) return
-        const abs =
-          rel.startsWith('http') ? rel : rel.startsWith('/') ? rel : `${API}/${rel}`
-        try {
-          mseRef.current.revoke?.()
-        } catch (_) {}
-        mseRef.current = { byIndex: {}, revoke: () => {} }
-        setReplyState((prev) => {
-          if (!prev.current) return { ...prev, current: abs }
-          return { ...prev, queue: [...prev.queue, abs] }
-        })
-        gotFirstClipRef.current = true
-        setFirstClipReceived(true)
-        setShowReply(true)
-        return
-      }
-      const url = data?.url
-      if (!url) return
+      // Streaming Ditto: fMP4 arrives on the WebSocket as binary; this event is metadata only.
+      if (data?.streaming !== false) return
+      // Non-streaming Ditto: play the MP4 URL instead of an empty MediaSource.
+      const rel = data?.url
+      if (!rel) return
+      const abs =
+        rel.startsWith('http') ? rel : rel.startsWith('/') ? rel : `${API}/${rel}`
+      try {
+        mseRef.current.revoke?.()
+      } catch (_) {}
+      mseRef.current = { byIndex: {}, revoke: () => {} }
       setReplyState((prev) => {
-        if (!prev.current) {
-          return { ...prev, current: url }
-        }
-        return { ...prev, queue: [...prev.queue, url] }
+        if (!prev.current) return { ...prev, current: abs }
+        return { ...prev, queue: [...prev.queue, abs] }
       })
+      gotFirstClipRef.current = true
+      setFirstClipReceived(true)
+      setShowReply(true)
     } else if (event === 'done') {
       streamDoneRef.current = true
       if (hasStreamedTextRef.current) {
@@ -571,13 +576,24 @@ export default function Conversation() {
     }
     if (sending) {
       if (overrideText != null) {
+        const tt = String(overrideText).trim()
+        if (tt) {
+          setChatLog((prev) => [...prev, { role: 'user', text: tt }])
+        }
         setStreamError('Wait for the current reply to finish, then speak again.')
       }
       return
     }
-    // Typing is blocked while the mic is on; STT calls sendMessage(null, transcript) with mic still active.
-    if (micActive && overrideText == null) {
-      setStreamError('Turn off the mic to type a message.')
+    // Typing is blocked while actively listening; STT uses sendMessage(null, transcript) with session still open.
+    if (micListening && overrideText == null) {
+      setStreamError('Mute the mic to type a message.')
+      return
+    }
+    if (integrationBlocked) {
+      setStreamError(
+        integrationMessage ||
+          'This persona is incomplete or linked services no longer have its voice or face. Delete it and create a new one, or fix it in Edit persona.'
+      )
       return
     }
 
@@ -631,7 +647,7 @@ export default function Conversation() {
     setShowReply(false)
     idleVideoRef.current?.play().catch(() => { })
 
-    if (modeRef.current === 'video' && USE_MSE) {
+    if (modeRef.current === 'video') {
       // 2) Setup NEW MediaSource for this specific response
       const ms = new MediaSource()
       const blobUrl = URL.createObjectURL(ms)
@@ -720,7 +736,24 @@ export default function Conversation() {
   const sendMessageRef = useRef(sendMessage)
   sendMessageRef.current = sendMessage
 
+  const disposeMicWave = () => {
+    try {
+      micVizSourceRef.current?.disconnect()
+    } catch (_) { }
+    micVizSourceRef.current = null
+    micAnalyserRef.current = null
+    try {
+      micVizStreamRef.current?.getTracks().forEach((t) => t.stop())
+    } catch (_) { }
+    micVizStreamRef.current = null
+    try {
+      micVizCtxRef.current?.close()
+    } catch (_) { }
+    micVizCtxRef.current = null
+  }
+
   const stopMic = () => {
+    disposeMicWave()
     const curr = audioRtcRef.current
     try { curr.dc && curr.dc.close && curr.dc.close() } catch (_) { }
     try { curr.pc && curr.pc.close && curr.pc.close() } catch (_) { }
@@ -736,11 +769,37 @@ export default function Conversation() {
       }
     } catch (_) { }
     audioRtcRef.current = { pc: null, ws: null, dc: null, stream: null, remoteStream: null, pingTimer: null, sttOnly: null }
+    micActiveRef.current = false
+    micListeningRef.current = false
+    setMicListening(false)
     setMicActive(false)
+  }
+
+  const toggleMicListening = () => {
+    const curr = audioRtcRef.current
+    const track = curr.stream?.getAudioTracks?.()?.[0]
+    if (!track || !curr.pc) return
+    const next = !micListeningRef.current
+    track.enabled = next
+    try {
+      if (curr.dc && curr.dc.readyState === 'open') {
+        curr.dc.send(JSON.stringify({ event: next ? 'mic_resume' : 'mic_pause' }))
+      }
+    } catch (_) { }
+    micListeningRef.current = next
+    setMicListening(next)
   }
 
   const startMic = async ({ sttOnly = null } = {}) => {
     if (!personaId || micActive) return
+    if (persona && persona.integration_ready === false) {
+      const msg =
+        (typeof persona.integration_message === 'string' && persona.integration_message.trim()) ||
+        'This persona is incomplete. Fix it in Edit persona or delete and recreate before using the mic.'
+      setMicError(msg)
+      setStreamError(msg)
+      return
+    }
     const resolvedSttOnly = sttOnly == null ? (modeRef.current === 'video') : !!sttOnly
     setMicError(null)
     console.info(resolvedSttOnly ? '[video-stt] startMic' : '[audio] startMic begin')
@@ -756,6 +815,26 @@ export default function Conversation() {
       }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       console.info('[audio] got user media')
+      if (!resolvedSttOnly) {
+        try {
+          disposeMicWave()
+          const clone = stream.clone()
+          micVizStreamRef.current = clone
+          const VizCtx = window.AudioContext || window.webkitAudioContext
+          const vctx = new VizCtx()
+          await vctx.resume().catch(() => { })
+          micVizCtxRef.current = vctx
+          const src = vctx.createMediaStreamSource(clone)
+          micVizSourceRef.current = src
+          const analyser = vctx.createAnalyser()
+          analyser.fftSize = 512
+          analyser.smoothingTimeConstant = 0.62
+          src.connect(analyser)
+          micAnalyserRef.current = analyser
+        } catch (e) {
+          console.warn('[wave] mic analyser setup failed', e)
+        }
+      }
       const pc = new RTCPeerConnection({ iceServers: iceServersRef.current })
       const dc = pc.createDataChannel('events')
       const pendingRemote = []
@@ -807,12 +886,17 @@ export default function Conversation() {
             } else {
               await pc.addIceCandidate(rtcCand)
             }
+          } else if (msg.event === 'error' && msg.data && msg.data.error) {
+            const errText = String(msg.data.error)
+            setMicError(errText)
+            setStreamError(errText)
+            stopMic()
           }
         } catch (_) { }
       }
       ws.onclose = () => {
         console.warn('[audio] ws closed')
-        if (micActive) stopMic()
+        if (micActiveRef.current) stopMic()
       }
       ws.onerror = () => {
         setMicError('Mic connection failed')
@@ -867,7 +951,10 @@ export default function Conversation() {
       }
 
       audioRtcRef.current = { pc, ws, dc, stream, remoteStream: null, pingTimer: null, sttOnly: resolvedSttOnly }
+      micActiveRef.current = true
+      micListeningRef.current = true
       setMicActive(true)
+      setMicListening(true)
     } catch (e) {
       setMicError(e?.message || 'Could not access microphone')
       console.error('[audio] startMic failed', e)
@@ -876,6 +963,93 @@ export default function Conversation() {
   }
 
   useEffect(() => () => stopMic(), [])
+
+  useEffect(() => {
+    if (!barMenuOpen) return
+    const close = (e) => {
+      if (!e.target.closest?.('.vf-bar-menu-wrap')) setBarMenuOpen(false)
+    }
+    document.addEventListener('click', close)
+    return () => document.removeEventListener('click', close)
+  }, [barMenuOpen])
+
+  useEffect(() => {
+    if (mode !== 'audio') {
+      if (waveRafRef.current) {
+        cancelAnimationFrame(waveRafRef.current)
+        waveRafRef.current = null
+      }
+      return
+    }
+    const canvas = waveCanvasRef.current
+    const wrap = waveWrapRef.current
+    if (!canvas || !wrap) return
+    const ctx2d = canvas.getContext('2d')
+    if (!ctx2d) return
+    const freq = new Uint8Array(256)
+    let t = 0
+    const resize = () => {
+      const dpr = window.devicePixelRatio || 1
+      const r = wrap.getBoundingClientRect()
+      const w = Math.max(280, Math.floor(r.width))
+      const h = Math.max(200, Math.floor(r.height))
+      canvas.width = Math.floor(w * dpr)
+      canvas.height = Math.floor(h * dpr)
+      canvas.style.width = `${w}px`
+      canvas.style.height = `${h}px`
+      ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0)
+    }
+    resize()
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(resize) : null
+    ro?.observe(wrap)
+    const nBars = 80
+    const draw = () => {
+        const r = wrap.getBoundingClientRect()
+        const cw = Math.max(280, r.width)
+        const ch = Math.max(200, r.height)
+        ctx2d.clearRect(0, 0, cw, ch)
+        const baseY = ch * 0.58
+        const micOn = micListeningRef.current && !!micAnalyserRef.current
+        const speaking = audioSpeakingRef.current
+        const analyser = micAnalyserRef.current
+        if (micOn && analyser) analyser.getByteFrequencyData(freq)
+        t += 0.042
+        const grad = ctx2d.createLinearGradient(0, 0, cw, 0)
+        grad.addColorStop(0, 'rgba(124, 58, 237, 0.35)')
+        grad.addColorStop(0.5, 'rgba(168, 85, 247, 0.55)')
+        grad.addColorStop(1, 'rgba(59, 130, 246, 0.35)')
+        ctx2d.fillStyle = grad
+        const hw = cw / nBars
+        for (let i = 0; i < nBars; i++) {
+          const x = i * hw + hw * 0.18
+          const wBar = hw * 0.64
+          let mag = 0
+          if (micOn) {
+            const step = Math.max(1, Math.floor(freq.length / nBars))
+            let acc = 0
+            for (let j = 0; j < step; j++) acc += freq[i * step + j] || 0
+            mag = (acc / step / 255) ** 1.15
+          } else {
+            const phase = t + i * 0.09
+            const idle = 0.08 + Math.sin(phase) * 0.05 + Math.sin(phase * 1.7 + i * 0.2) * 0.04
+            mag = speaking ? Math.min(0.95, idle + 0.35 + Math.sin(phase * 2.2) * 0.12) : idle
+          }
+          const maxH = ch * 0.42
+          const hBar = Math.max(4, mag * maxH)
+          const y = baseY - hBar
+          ctx2d.fillRect(x, y, wBar, hBar)
+        }
+        waveRafRef.current = requestAnimationFrame(draw)
+      }
+    waveRafRef.current = requestAnimationFrame(draw)
+    return () => {
+      ro?.disconnect()
+      if (waveRafRef.current) {
+        cancelAnimationFrame(waveRafRef.current)
+        waveRafRef.current = null
+      }
+    }
+  }, [mode])
 
   const stopPlayback = () => {
     abortRef.current = true
@@ -928,6 +1102,7 @@ export default function Conversation() {
 
   const handleModeChange = (nextMode) => {
     if (nextMode === mode) return
+    setBarMenuOpen(false)
     // Avoid leaking an audio-mode RTC session into video mode (or vice-versa).
     if (micActive) stopMic()
     stopPlayback()
@@ -937,7 +1112,7 @@ export default function Conversation() {
 
   const handleVideoMicToggle = async () => {
     if (micActive) {
-      stopMic()
+      toggleMicListening()
       return
     }
     // Defensive: video mic must always run STT-only session.
@@ -945,6 +1120,12 @@ export default function Conversation() {
       stopMic()
     }
     await startMic({ sttOnly: true })
+  }
+
+  const handleEndChat = () => {
+    stopMic()
+    stopPlayback()
+    navigate('/app')
   }
 
 
@@ -978,6 +1159,10 @@ export default function Conversation() {
     setAudioSpeaking(false)
   }
 
+  micActiveRef.current = micActive
+  micListeningRef.current = micListening
+  audioSpeakingRef.current = audioSpeaking
+
   if (!persona && personaId) {
     return (
       <div className="conv">
@@ -996,352 +1181,958 @@ export default function Conversation() {
 
   return (
     <div className="conv">
-      <header className="conv-header">
+      <header className={`conv-header ${mode === 'audio' ? 'conv-header-light' : ''}`}>
         <Link to="/app">← Back</Link>
-        <h1>{persona.name}</h1>
-        <div className="mode-toggle">
-          <span className={`mode-label ${mode === 'audio' ? 'active' : ''}`}>Audio</span>
-          <button
-            type="button"
-            className={`toggle-switch ${mode}`}
-            onClick={() => handleModeChange(mode === 'audio' ? 'video' : 'audio')}
-            role="switch"
-            aria-checked={mode === 'video'}
-            disabled={sending}
-          >
-            <span className="toggle-thumb" />
-          </button>
-          <span className={`mode-label ${mode === 'video' ? 'active' : ''}`}>Video</span>
-        </div>
-        <button
-          type="button"
-          className="clear-btn"
-          onClick={clearChat}
-          disabled={sending}
-        >
-          New Chat
-        </button>
+        <h1 className="conv-header-title">{persona.name}</h1>
         <Link to={`/persona/${personaId}/edit`} className="edit-link">Edit</Link>
       </header>
+      {integrationBlocked && (
+        <div className="integration-banner" role="alert">
+          <p className="integration-banner-text">
+            {integrationMessage ||
+              'This persona is incomplete or linked services (voice / video) no longer have its data. Delete this persona and create a new one, or open Edit to re-upload voice or face.'}
+          </p>
+          <p className="integration-banner-actions">
+            <Link to={`/persona/${personaId}/edit`}>Edit persona</Link>
+            <span aria-hidden="true"> · </span>
+            <Link to="/app">Back to list</Link>
+          </p>
+        </div>
+      )}
       {mode === 'video' ? (
-      <div className="video-wrap" aria-hidden="true">
-        {isGenerating && (
-          <div className="streaming-status generating">Thinking...</div>
-        )}
-        {isStreaming && !isGenerating && replyState.queue.length > 0 && (
-          <div className="streaming-status next">Next clip ready</div>
-        )}
-        {previewUrl && !showReply && (
-          <img
-            src={previewUrl}
-            alt=""
-            className="video-layer poster-fallback"
-            style={{ opacity: idlePlaying && !idleVideoError ? 0 : 1 }}
-          />
-        )}
-        <video
-          ref={idleVideoRef}
-          src={idleUrl && !idleVideoError ? idleUrl : undefined}
-          muted
-          loop
-          playsInline
-          autoPlay
-          preload="auto"
-          poster={previewUrl || undefined}
-          className="video-layer"
-          style={{ opacity: 1 }}
-          onError={() => setIdleVideoError(true)}
-          onPlaying={() => {
-            setIdlePlaying(true)
-            if (clearReplyPendingRef.current) {
-              clearReplyPendingRef.current = false
-              setShowReply(false)
-            }
-          }}
-          onPause={() => {
-            setIdlePlaying(false)
-            idleVideoRef.current?.play().catch(() => { })
-          }}
-          onWaiting={() => setIdlePlaying(false)}
-          onTimeUpdate={() => {
-            if (!idlePlaying) setIdlePlaying(true)
-          }}
-        />
-        <video
-          ref={replyVideoRef}
-          muted
-          autoPlay
-          loop={false}
-          playsInline
-          preload="auto"
-          className={`video-layer reply-layer${!showReply ? ' reply-hiding' : ''}`}
-          style={{
-            opacity: showReply ? 1 : 0,
-            pointerEvents: 'none',
-            // Kill transition instantly when starting a new message to avoid black flash
-            transition: isGenerating ? 'none' : undefined
-          }}
-          onPlaying={() => {
-            if (stallTimeoutRef.current) {
-              clearTimeout(stallTimeoutRef.current);
-              stallTimeoutRef.current = null;
-            }
-            if (longWaitTimeoutRef.current) {
-              clearTimeout(longWaitTimeoutRef.current);
-              longWaitTimeoutRef.current = null;
-            }
-            setShowReply(true)
-            if (perfRef.current.start) {
-              const tPlay = performance.now()
-              const dt = (tPlay - perfRef.current.start) / 1000
-              const dtAfterVideoStart = perfRef.current.videoStart ? (tPlay - perfRef.current.videoStart) / 1000 : null
-              console.info(`[ttfr] UI playback at ${dt.toFixed(2)}s` + (dtAfterVideoStart != null ? ` (after video_start ${dtAfterVideoStart.toFixed(2)}s)` : ''))
-            }
-          }}
-          onCanPlay={() => {
-            // Some browsers need this to recover from a deep stall
-            if (replyVideoRef.current && replyVideoRef.current.readyState >= 2) {
-              if (stallTimeoutRef.current) {
-                clearTimeout(stallTimeoutRef.current);
-                stallTimeoutRef.current = null;
-              }
-              if (longWaitTimeoutRef.current) {
-                clearTimeout(longWaitTimeoutRef.current);
-                longWaitTimeoutRef.current = null;
-              }
-              setShowReply(true);
-            }
-          }}
-          onCanPlayThrough={() => {
-            if (stallTimeoutRef.current) {
-              clearTimeout(stallTimeoutRef.current);
-              stallTimeoutRef.current = null;
-            }
-            if (longWaitTimeoutRef.current) {
-              clearTimeout(longWaitTimeoutRef.current);
-              longWaitTimeoutRef.current = null;
-            }
-            setShowReply(true);
-          }}
-          onTimeUpdate={() => {
-            if (!showReply && replyVideoRef.current && !replyVideoRef.current.paused) {
-              setShowReply(true)
-            }
-          }}
-          onProgress={() => {
-            if (USE_MSE && mode === 'video') resumeReplyPlayback()
-          }}
-          onEnded={handleReplyEnded}
-          onWaiting={() => {
-            // Fade back to idle if we stall FOR LONG, to avoid black screen
-            // but ignore short micro-stalls during buffer transitions.
-            if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
-            stallTimeoutRef.current = setTimeout(() => {
-              resumeReplyPlayback()
-              stallTimeoutRef.current = null;
-            }, 500);
+      <div className="video-stage-layout">
+        <div className="video-stage-main">
+          <div className="video-wrap" aria-hidden="true">
+            {isGenerating && (
+              <div className="streaming-status generating">Thinking...</div>
+            )}
+            {isStreaming && !isGenerating && replyState.queue.length > 0 && (
+              <div className="streaming-status next">Next clip ready</div>
+            )}
+            {previewUrl && !showReply && (
+              <img
+                src={previewUrl}
+                alt=""
+                className="video-layer poster-fallback"
+                style={{ opacity: idlePlaying && !idleVideoError ? 0 : 1 }}
+              />
+            )}
+            <video
+              ref={idleVideoRef}
+              src={idleUrl && !idleVideoError ? idleUrl : undefined}
+              muted
+              loop
+              playsInline
+              autoPlay
+              preload="auto"
+              poster={previewUrl || undefined}
+              className="video-layer"
+              style={{ opacity: 1 }}
+              onError={() => setIdleVideoError(true)}
+              onPlaying={() => {
+                setIdlePlaying(true)
+                if (clearReplyPendingRef.current) {
+                  clearReplyPendingRef.current = false
+                  setShowReply(false)
+                }
+              }}
+              onPause={() => {
+                setIdlePlaying(false)
+                idleVideoRef.current?.play().catch(() => { })
+              }}
+              onWaiting={() => setIdlePlaying(false)}
+              onTimeUpdate={() => {
+                if (!idlePlaying) setIdlePlaying(true)
+              }}
+            />
+            <video
+              ref={replyVideoRef}
+              muted
+              autoPlay
+              loop={false}
+              playsInline
+              preload="auto"
+              className={`video-layer reply-layer${!showReply ? ' reply-hiding' : ''}`}
+              style={{
+                opacity: showReply ? 1 : 0,
+                pointerEvents: 'none',
+                transition: isGenerating ? 'none' : undefined
+              }}
+              onPlaying={() => {
+                if (stallTimeoutRef.current) {
+                  clearTimeout(stallTimeoutRef.current);
+                  stallTimeoutRef.current = null;
+                }
+                if (longWaitTimeoutRef.current) {
+                  clearTimeout(longWaitTimeoutRef.current);
+                  longWaitTimeoutRef.current = null;
+                }
+                setShowReply(true)
+                if (perfRef.current.start) {
+                  const tPlay = performance.now()
+                  const dt = (tPlay - perfRef.current.start) / 1000
+                  const dtAfterVideoStart = perfRef.current.videoStart ? (tPlay - perfRef.current.videoStart) / 1000 : null
+                  console.info(`[ttfr] UI playback at ${dt.toFixed(2)}s` + (dtAfterVideoStart != null ? ` (after video_start ${dtAfterVideoStart.toFixed(2)}s)` : ''))
+                }
+              }}
+              onCanPlay={() => {
+                if (replyVideoRef.current && replyVideoRef.current.readyState >= 2) {
+                  if (stallTimeoutRef.current) {
+                    clearTimeout(stallTimeoutRef.current);
+                    stallTimeoutRef.current = null;
+                  }
+                  if (longWaitTimeoutRef.current) {
+                    clearTimeout(longWaitTimeoutRef.current);
+                    longWaitTimeoutRef.current = null;
+                  }
+                  setShowReply(true);
+                }
+              }}
+              onCanPlayThrough={() => {
+                if (stallTimeoutRef.current) {
+                  clearTimeout(stallTimeoutRef.current);
+                  stallTimeoutRef.current = null;
+                }
+                if (longWaitTimeoutRef.current) {
+                  clearTimeout(longWaitTimeoutRef.current);
+                  longWaitTimeoutRef.current = null;
+                }
+                setShowReply(true);
+              }}
+              onTimeUpdate={() => {
+                if (!showReply && replyVideoRef.current && !replyVideoRef.current.paused) {
+                  setShowReply(true)
+                }
+              }}
+              onProgress={() => {
+                if (mode === 'video') resumeReplyPlayback()
+              }}
+              onEnded={handleReplyEnded}
+              onWaiting={() => {
+                if (stallTimeoutRef.current) clearTimeout(stallTimeoutRef.current);
+                stallTimeoutRef.current = setTimeout(() => {
+                  resumeReplyPlayback()
+                  stallTimeoutRef.current = null;
+                }, 500);
 
-            // CRITICAL (video + MSE): the reply <video> fires `waiting` immediately while the
-            // MediaSource has zero bytes — normal for many seconds while Ditto encodes.  Do not
-            // replace sendMessage's 90s RECOVERY timer with this 10s fallback, or we set
-            // sending=false mid-stream, STT can open a new chat WS, and the pipeline cancels
-            // before any fMP4 arrives (looks like "video never worked").
-            if (USE_MSE && modeRef.current === 'video' && !gotFirstClipRef.current) {
-              return
-            }
+                if (modeRef.current === 'video' && !gotFirstClipRef.current) {
+                  return
+                }
 
-            // After the first segment exists: if we stall hard for 10s, unlock the UI.
-            if (longWaitTimeoutRef.current) clearTimeout(longWaitTimeoutRef.current);
-            longWaitTimeoutRef.current = setTimeout(() => {
-              setSending(false);
-              transitionToIdle();
-            }, 10000);
-          }}
-          onStalled={() => {
-            resumeReplyPlayback()
-          }}
-          onError={(e) => {
-            if (!replyVideoRef.current?.src) return
-            console.warn('[reply] video error', {
-              src: replyVideoRef.current?.src,
-              readyState: replyVideoRef.current?.readyState,
-              networkState: replyVideoRef.current?.networkState,
-              mediaError: replyVideoRef.current?.error?.message || replyVideoRef.current?.error?.code || null,
-            })
-            console.warn('Reply video error (may recover when MSE buffers data)', e.nativeEvent)
-          }}
-        />
-      </div>
-      ) : (
-        <div className="audio-layout">
-          <div className="audio-shell">
-          <div className="audio-left">
-            <div className="audio-card">
-              <div className="audio-card-header">
-                <div className="audio-title">{persona?.name || 'Persona'}</div>
-                <div className={`audio-mode-pill ${micActive ? 'live' : ''}`}>
-                  {audioSpeaking ? 'Speaking' : micActive ? 'Listening' : 'Idle'}
-                </div>
+                if (longWaitTimeoutRef.current) clearTimeout(longWaitTimeoutRef.current);
+                longWaitTimeoutRef.current = setTimeout(() => {
+                  setSending(false);
+                  transitionToIdle();
+                }, 10000);
+              }}
+              onStalled={() => {
+                resumeReplyPlayback()
+              }}
+              onError={(e) => {
+                if (!replyVideoRef.current?.src) return
+                console.warn('[reply] video error', {
+                  src: replyVideoRef.current?.src,
+                  readyState: replyVideoRef.current?.readyState,
+                  networkState: replyVideoRef.current?.networkState,
+                  mediaError: replyVideoRef.current?.error?.message || replyVideoRef.current?.error?.code || null,
+                })
+                console.warn('Reply video error (may recover when MSE buffers data)', e.nativeEvent)
+              }}
+            />
+          </div>
+
+          <div className="video-floating-bar" role="toolbar" aria-label="Conversation controls">
+            <div className="video-floating-bar-inner">
+              <div className="vf-bar-menu-wrap">
+                <button
+                  type="button"
+                  className="vf-persona-btn"
+                  aria-expanded={barMenuOpen}
+                  aria-haspopup="menu"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setBarMenuOpen((o) => !o)
+                  }}
+                >
+                  <span className="vf-persona-label">Avatar</span>
+                  <span className="vf-chevron" aria-hidden>▾</span>
+                </button>
+                {barMenuOpen && (
+                  <div className="vf-persona-menu" role="menu" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className={mode === 'video' ? 'vf-menu-current' : ''}
+                      aria-current={mode === 'video' ? 'true' : undefined}
+                      onClick={() => { setBarMenuOpen(false); handleModeChange('video') }}
+                    >
+                      Avatar (video)
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className={mode === 'audio' ? 'vf-menu-current' : ''}
+                      aria-current={mode === 'audio' ? 'true' : undefined}
+                      onClick={() => { setBarMenuOpen(false); handleModeChange('audio') }}
+                    >
+                      Audio
+                    </button>
+                  </div>
+                )}
               </div>
-              {previewUrl && (
-                <img src={previewUrl} alt="" className="audio-poster" />
-              )}
-            </div>
-            <div className="audio-mic-panel">
               <button
                 type="button"
-                className={`mic-btn ${micActive ? 'active' : ''}`}
-                onClick={() => (micActive ? stopMic() : startMic())}
+                className={`vf-icon-btn ${micListening ? 'vf-on' : ''} ${micActive && !micListening ? 'vf-muted' : ''}`}
+                onClick={handleVideoMicToggle}
+                disabled={sending || (!micActive && integrationBlocked)}
+                aria-label={
+                  !micActive
+                    ? 'Start voice session'
+                    : micListening
+                      ? 'Mute microphone (stay connected)'
+                      : 'Unmute microphone'
+                }
+                title={
+                  !micActive
+                    ? 'Tap to speak — opens voice connection'
+                    : micListening
+                      ? 'Listening — tap to mute (connection stays open)'
+                      : 'Muted — tap to listen again'
+                }
               >
-                {micActive ? 'Mic On' : 'Mic Off'}
+                {!micActive ? (
+                  <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden>
+                    <path fill="currentColor" d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z" />
+                  </svg>
+                ) : micListening ? (
+                  <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden>
+                    <path fill="currentColor" d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z" />
+                  </svg>
+                ) : (
+                  <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden>
+                    <path fill="currentColor" d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z" />
+                  </svg>
+                )}
               </button>
-              <div className="audio-mic-hint">{micActive ? 'Speak now…' : 'Tap to talk'}</div>
-              {micError && <p className="stream-error">{micError}</p>}
+              <button
+                type="button"
+                className={`vf-icon-btn ${showChatPanel ? 'vf-on' : ''}`}
+                onClick={() => setShowChatPanel((v) => !v)}
+                aria-pressed={showChatPanel}
+                aria-label={showChatPanel ? 'Hide chat panel' : 'Show chat panel'}
+                title="Chat"
+              >
+                <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden>
+                  <path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z" />
+                </svg>
+              </button>
+              <button type="button" className="vf-end-chat" onClick={handleEndChat}>
+                <svg className="vf-svg vf-end-icon" viewBox="0 0 24 24" aria-hidden>
+                  <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+                </svg>
+                <span>End chat</span>
+              </button>
             </div>
-          <audio
-            ref={audioRef}
-            onEnded={handleAudioEnded}
-            onPlaying={() => {
-              if (perfRef.current.start) {
-                const tPlay = performance.now()
-                const dt = (tPlay - perfRef.current.start) / 1000
-                const dtAfterStart = perfRef.current.audioStart ? (tPlay - perfRef.current.audioStart) / 1000 : null
-                console.info(`[ttfr] audio_playback at ${dt.toFixed(2)}s` + (dtAfterStart != null ? ` (after audio_start ${dtAfterStart.toFixed(2)}s)` : ''))
-              }
-            }}
-          />
           </div>
-          <div className="audio-right">
-            <div className="chat-panel">
-              <div className="chat-panel-header">
-                <div className="chat-panel-title">Conversation</div>
-                {isGenerating && <div className="audio-status">Thinking...</div>}
+        </div>
+
+        <aside className={`video-chat-drawer ${showChatPanel ? 'open' : 'collapsed'}`} aria-hidden={!showChatPanel}>
+          <div className="video-chat-drawer-head">
+            <button
+              type="button"
+              className="video-chat-collapse"
+              onClick={() => setShowChatPanel(false)}
+              aria-label="Hide chat panel"
+              title="Hide chat"
+            >
+              <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden><path fill="currentColor" d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z" /></svg>
+            </button>
+            <span className="video-chat-title">{persona.name}</span>
+          </div>
+          <div className="video-chat-sub">Voice + talking head · messages also appear here</div>
+          <div className="video-chat-log video-chat-log-light" ref={chatLogScrollRef}>
+            {isGenerating && (
+              <div className="video-chat-thinking">Thinking…</div>
+            )}
+            {chatLog.map((m, i) => (
+              <div key={`${m.role}-${i}`} className={`video-chat-row ${m.role}`}>
+                {m.role === 'assistant' && (
+                  previewUrl ? (
+                    <img src={previewUrl} alt="" className="video-chat-avatar" width={32} height={32} />
+                  ) : (
+                    <span className="video-chat-avatar video-chat-avatar-fallback" aria-hidden>{(persona.name || '?').slice(0, 1)}</span>
+                  )
+                )}
+                <div className={`video-chat-bubble ${m.role}`}>
+                  <span className="video-chat-bubble-text">{m.text}{m.streaming ? '…' : ''}</span>
+                </div>
               </div>
-              <div className="chat-log" ref={chatLogScrollRef}>
+            ))}
+          </div>
+          <div className="video-chat-footer">
+            {streamError && <p className="video-chat-error">{streamError}</p>}
+            {micError && <p className="video-chat-error">{micError}</p>}
+            <p className="video-chat-hint">
+              {!micActive
+                ? 'Use the mic button on the video bar, or type below.'
+                : micListening
+                  ? 'Speak naturally — pause briefly so your line is sent.'
+                  : 'Mic muted — connection stays open. Unmute to speak, or type below.'}
+            </p>
+            <button
+              type="button"
+              className="video-chat-type-toggle"
+              onClick={() => setShowVideoTextInput((v) => !v)}
+            >
+              {showVideoTextInput ? 'Hide keyboard' : 'Type a message'}
+            </button>
+            {showVideoTextInput && (
+              <form onSubmit={sendMessage} className="video-chat-form">
+                <input
+                  type="text"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  placeholder={micListening ? 'Mute mic to type…' : 'Message…'}
+                  disabled={sending || micListening || integrationBlocked}
+                />
+                <button type="submit" disabled={sending || micListening || !input.trim() || integrationBlocked}>Send</button>
+              </form>
+            )}
+            <div className="video-chat-footer-actions">
+              <button type="button" className="video-chat-stop" onClick={stopPlayback} disabled={!canStop}>Stop reply</button>
+            </div>
+          </div>
+        </aside>
+      </div>
+      ) : (
+        <div className="audio-stage-layout">
+          <div className="audio-stage-main">
+            <div className={`audio-wave-wrap${isGenerating ? ' audio-wave-wrap-thinking' : ''}`} ref={waveWrapRef}>
+              <div className="audio-wave-glow" aria-hidden />
+              {isGenerating && (
+                <div className="audio-wave-thinking" aria-live="polite">Thinking…</div>
+              )}
+              <canvas ref={waveCanvasRef} className="audio-wave-canvas" aria-label="Audio level visualizer" />
+              <div className="audio-wave-status" aria-live="polite">
+                {audioSpeaking ? 'Speaking' : micListening ? 'Listening' : micActive ? 'Muted' : 'Ready'}
+              </div>
+            </div>
+            <audio
+              ref={audioRef}
+              className="audio-hidden-element"
+              onEnded={handleAudioEnded}
+              onPlaying={() => {
+                if (perfRef.current.start) {
+                  const tPlay = performance.now()
+                  const dt = (tPlay - perfRef.current.start) / 1000
+                  const dtAfterStart = perfRef.current.audioStart ? (tPlay - perfRef.current.audioStart) / 1000 : null
+                  console.info(`[ttfr] audio_playback at ${dt.toFixed(2)}s` + (dtAfterStart != null ? ` (after audio_start ${dtAfterStart.toFixed(2)}s)` : ''))
+                }
+              }}
+            />
+
+            <div className="audio-floating-bar" role="toolbar" aria-label="Audio conversation controls">
+              <div className="audio-floating-bar-inner">
+                <div className="vf-bar-menu-wrap">
+                  <button
+                    type="button"
+                    className="vf-persona-btn"
+                    aria-expanded={barMenuOpen}
+                    aria-haspopup="menu"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setBarMenuOpen((o) => !o)
+                    }}
+                  >
+                    <span className="vf-persona-label">Audio</span>
+                    <span className="vf-chevron" aria-hidden>▾</span>
+                  </button>
+                  {barMenuOpen && (
+                    <div className="vf-persona-menu" role="menu" onClick={(e) => e.stopPropagation()}>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className={mode === 'video' ? 'vf-menu-current' : ''}
+                        aria-current={mode === 'video' ? 'true' : undefined}
+                        onClick={() => { setBarMenuOpen(false); handleModeChange('video') }}
+                      >
+                        Avatar (video)
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className={mode === 'audio' ? 'vf-menu-current' : ''}
+                        aria-current={mode === 'audio' ? 'true' : undefined}
+                        onClick={() => { setBarMenuOpen(false); handleModeChange('audio') }}
+                      >
+                        Audio
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className={`vf-icon-btn ${micListening ? 'vf-on' : ''} ${micActive && !micListening ? 'vf-muted' : ''}`}
+                  onClick={() => (micActive ? toggleMicListening() : startMic())}
+                  disabled={!micActive && integrationBlocked}
+                  aria-label={
+                    !micActive
+                      ? 'Start voice session'
+                      : micListening
+                        ? 'Mute microphone (stay connected)'
+                        : 'Unmute microphone'
+                  }
+                  title={
+                    !micActive
+                      ? 'Tap to speak — opens voice connection'
+                      : micListening
+                        ? 'Listening — tap to mute (connection stays open)'
+                        : 'Muted — tap to listen again'
+                  }
+                >
+                  {!micActive ? (
+                    <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden>
+                      <path fill="currentColor" d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z" />
+                    </svg>
+                  ) : micListening ? (
+                    <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden>
+                      <path fill="currentColor" d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z" />
+                    </svg>
+                  ) : (
+                    <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden>
+                      <path fill="currentColor" d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z" />
+                    </svg>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  className={`vf-icon-btn ${showChatPanel ? 'vf-on' : ''}`}
+                  onClick={() => setShowChatPanel((v) => !v)}
+                  aria-pressed={showChatPanel}
+                  aria-label={showChatPanel ? 'Hide chat panel' : 'Show chat panel'}
+                  title="Chat"
+                >
+                  <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden>
+                    <path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z" />
+                  </svg>
+                </button>
+                <button type="button" className="vf-end-chat" onClick={handleEndChat}>
+                  <svg className="vf-svg vf-end-icon" viewBox="0 0 24 24" aria-hidden>
+                    <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+                  </svg>
+                  <span>End chat</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <aside className={`video-chat-drawer ${showChatPanel ? 'open' : 'collapsed'}`} aria-hidden={!showChatPanel}>
+            <div className="video-chat-drawer-head">
+              <button
+                type="button"
+                className="video-chat-collapse"
+                onClick={() => setShowChatPanel(false)}
+                aria-label="Hide chat panel"
+                title="Hide chat"
+              >
+                <svg className="vf-svg" viewBox="0 0 24 24" aria-hidden><path fill="currentColor" d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z" /></svg>
+              </button>
+              <span className="video-chat-title">{persona.name}</span>
+            </div>
+            <div className="video-chat-sub">Voice conversation · live audio with optional typing</div>
+            <div className="video-chat-log video-chat-log-light" ref={chatLogScrollRef}>
+              {isGenerating && (
+                <div className="video-chat-thinking">Thinking…</div>
+              )}
               {chatLog.map((m, i) => (
-                <div key={`${m.role}-${i}`} className={`chat-msg ${m.role}`}>
-                  <span className="chat-role">{m.role === 'user' ? 'You' : persona.name}</span>
-                  <span className="chat-text">{m.text}</span>
+                <div key={`${m.role}-${i}`} className={`video-chat-row ${m.role}`}>
+                  {m.role === 'assistant' && (
+                    previewUrl ? (
+                      <img src={previewUrl} alt="" className="video-chat-avatar" width={32} height={32} />
+                    ) : (
+                      <span className="video-chat-avatar video-chat-avatar-fallback" aria-hidden>{(persona.name || '?').slice(0, 1)}</span>
+                    )
+                  )}
+                  <div className={`video-chat-bubble ${m.role}`}>
+                    <span className="video-chat-bubble-text">{m.text}{m.streaming ? '…' : ''}</span>
+                  </div>
                 </div>
               ))}
-              </div>
-              <div className="audio-input-wrap">
-                {streamError && <p className="stream-error">{streamError}</p>}
-                <form onSubmit={sendMessage} className="input-form">
+            </div>
+            <div className="video-chat-footer">
+              {streamError && <p className="video-chat-error">{streamError}</p>}
+              {micError && <p className="video-chat-error">{micError}</p>}
+              <p className="video-chat-hint">
+                {!micActive
+                  ? 'Use the mic on the bar, or type below.'
+                  : micListening
+                    ? 'Speak now — your line is sent when you pause.'
+                    : 'Mic muted — connection stays open. Unmute to speak, or type below.'}
+              </p>
+              <button
+                type="button"
+                className="video-chat-type-toggle"
+                onClick={() => setShowVideoTextInput((v) => !v)}
+              >
+                {showVideoTextInput ? 'Hide keyboard' : 'Type a message'}
+              </button>
+              {showVideoTextInput && (
+                <form onSubmit={sendMessage} className="video-chat-form">
                   <input
                     type="text"
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
-                    placeholder="Type a message…"
-                    disabled={sending}
+                    placeholder="Message…"
+                    disabled={sending || integrationBlocked}
                   />
-                  <button type="submit" disabled={sending || !input.trim()}>Send</button>
-                  <button
-                    type="button"
-                    className="stop-btn"
-                    onClick={stopPlayback}
-                    disabled={!canStop}
-                  >
-                    Stop
-                  </button>
+                  <button type="submit" disabled={sending || !input.trim() || integrationBlocked}>Send</button>
                 </form>
+              )}
+              <div className="video-chat-footer-actions">
+                <button type="button" className="video-chat-stop" onClick={stopPlayback} disabled={!canStop}>Stop reply</button>
               </div>
             </div>
-          </div>
-          </div>
-        </div>
-      )}
-      {mode === 'video' && (
-        <div className="conv-bottom video-conv-bottom">
-          {streamError && <p className="stream-error">{streamError}</p>}
-          <div className="video-voice-intro">
-            <span className="video-voice-title">Voice conversation</span>
-            <p className="video-voice-sub">
-              Turn the mic on and talk with {persona.name}&rsquo;s talking head. Your speech is transcribed and sent like a typed line; replies come back as lip-synced video with audio.
-            </p>
-          </div>
-          <div className="video-voice-controls">
-            <button
-              type="button"
-              className={`mic-btn mic-btn-video ${micActive ? 'active' : ''}`}
-              onClick={handleVideoMicToggle}
-              disabled={sending}
-            >
-              {micActive ? 'Listening…' : 'Microphone'}
-            </button>
-            <div className="video-mic-copy">
-              <div className="video-mic-hint">
-                {micActive
-                  ? 'Speak naturally — pause briefly at the end of a thought so your line is sent.'
-                  : 'Press Microphone and speak; your line is transcribed and sent (no typing needed).'}
-              </div>
-            </div>
-            <button type="button" className="stop-btn" onClick={stopPlayback} disabled={!canStop}>
-              Stop
-            </button>
-          </div>
-          {micError && <p className="stream-error video-mic-error">{micError}</p>}
-          <div className="video-text-toggle-wrap">
-            <button
-              type="button"
-              className="video-text-toggle"
-              onClick={() => setShowVideoTextInput((v) => !v)}
-            >
-              {showVideoTextInput ? 'Hide text input' : 'Type a message instead'}
-            </button>
-          </div>
-          {showVideoTextInput && (
-            <form onSubmit={sendMessage} className="input-form">
-              <input
-                type="text"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder={micActive ? 'Turn off mic to type…' : 'Type a message…'}
-                disabled={sending || micActive}
-              />
-              <button type="submit" disabled={sending || micActive || !input.trim()}>Send</button>
-            </form>
-          )}
+          </aside>
         </div>
       )}
       <style>{`
         .conv { position: fixed; inset: 0; display: flex; flex-direction: column; background: #000; color: #e4e4e7; }
         .conv a { color: #a78bfa; }
         .conv-header { position: relative; z-index: 20; flex-shrink: 0; padding: 0.5rem 0.75rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; background: rgba(0,0,0,0.85); border-bottom: 1px solid rgba(255,255,255,0.1); }
+        .conv-header-light { background: rgba(250,250,250,0.96); border-bottom-color: #e4e4e7; color: #18181b; }
+        .conv-header-light .conv-header-title { color: #18181b; }
+        .conv-header-light a { color: #7c3aed !important; }
+        .conv-header-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .integration-banner { flex-shrink: 0; margin: 0; padding: 0.65rem 1rem; background: rgba(127,29,29,0.35); border-bottom: 1px solid rgba(248,113,113,0.35); font-size: 0.82rem; line-height: 1.45; color: #fecaca; }
+        .integration-banner-text { margin: 0 0 0.35rem; }
+        .integration-banner-actions { margin: 0; font-size: 0.8rem; }
+        .integration-banner-actions a { color: #fde68a; }
         .conv-header a { margin-right: 0; color: #a78bfa; }
-        .conv h1 { font-family: var(--font-heading); font-size: 0.95rem; font-weight: 600; margin: 0; flex: 1; color: #fff; }
+        .conv h1 { font-family: var(--font-heading); font-size: 0.95rem; font-weight: 600; margin: 0; color: #fff; }
         .conv-header .edit-link { color: #a78bfa; font-size: 0.85rem; }
-        .video-wrap { position: relative; z-index: 0; flex: 1; min-height: 0; width: 100%; background: #000; overflow: hidden; pointer-events: none; }
-        .video-wrap .video-layer { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transition: opacity 0.35s ease-out; pointer-events: none; }
+        .video-stage-layout {
+          position: relative;
+          flex: 1;
+          display: flex;
+          min-height: 0;
+          width: 100%;
+          background: #09090b;
+        }
+        .video-stage-main {
+          flex: 1;
+          min-width: 0;
+          min-height: 0;
+          position: relative;
+          display: flex;
+          flex-direction: column;
+        }
+        .audio-stage-layout {
+          position: relative;
+          flex: 1;
+          display: flex;
+          min-height: 0;
+          width: 100%;
+          background: linear-gradient(165deg, #fafafa 0%, #f4f4f5 40%, #ececf0 100%);
+        }
+        .audio-stage-main {
+          flex: 1;
+          min-width: 0;
+          min-height: 0;
+          position: relative;
+          display: flex;
+          flex-direction: column;
+        }
+        .audio-wave-wrap {
+          flex: 1;
+          min-height: 0;
+          position: relative;
+          display: flex;
+          align-items: stretch;
+          justify-content: center;
+          overflow: hidden;
+        }
+        .audio-wave-glow {
+          position: absolute;
+          left: 50%;
+          top: 42%;
+          transform: translate(-50%, -50%);
+          width: min(90vw, 520px);
+          height: min(55vh, 380px);
+          border-radius: 50%;
+          background: radial-gradient(ellipse at center, rgba(167, 139, 250, 0.35) 0%, rgba(124, 58, 237, 0.12) 45%, transparent 70%);
+          filter: blur(36px);
+          pointer-events: none;
+          z-index: 0;
+        }
+        .audio-wave-canvas {
+          position: relative;
+          z-index: 1;
+          width: 100%;
+          height: 100%;
+          min-height: 220px;
+          display: block;
+        }
+        .audio-wave-thinking {
+          position: absolute;
+          bottom: 5.25rem;
+          left: 50%;
+          transform: translateX(-50%);
+          z-index: 4;
+          padding: 0.4rem 0.9rem;
+          border-radius: 999px;
+          font-size: 0.8rem;
+          font-weight: 500;
+          background: rgba(24, 24, 27, 0.88);
+          color: #fafafa;
+          pointer-events: none;
+          box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+          animation: pulse 1.5s ease-in-out infinite;
+        }
+        .audio-wave-status {
+          position: absolute;
+          left: 50%;
+          bottom: 5.25rem;
+          transform: translateX(-50%);
+          z-index: 3;
+          font-size: 0.72rem;
+          font-weight: 600;
+          letter-spacing: 0.12em;
+          text-transform: uppercase;
+          color: #71717a;
+          pointer-events: none;
+        }
+        .audio-wave-wrap-thinking .audio-wave-status {
+          bottom: 6.85rem;
+        }
+        .audio-hidden-element {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          margin: -1px;
+          padding: 0;
+          border: 0;
+          clip: rect(0 0 0 0);
+          overflow: hidden;
+          white-space: nowrap;
+          opacity: 0;
+          pointer-events: none;
+          left: 0;
+          bottom: 0;
+        }
+        .audio-floating-bar {
+          position: absolute;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          z-index: 25;
+          display: flex;
+          justify-content: center;
+          padding: 1rem 1rem 1.35rem;
+          pointer-events: none;
+          background: linear-gradient(to top, rgba(244,244,245,0.98) 0%, rgba(250,250,250,0.55) 50%, transparent 100%);
+        }
+        .audio-floating-bar-inner {
+          pointer-events: auto;
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 0.5rem 0.65rem;
+          padding: 0.45rem 0.55rem 0.45rem 0.85rem;
+          border-radius: 999px;
+          background: linear-gradient(135deg, rgba(109, 40, 217, 0.92) 0%, rgba(91, 33, 182, 0.95) 50%, rgba(76, 29, 149, 0.98) 100%);
+          box-shadow: 0 12px 40px rgba(124, 58, 237, 0.25), 0 0 0 1px rgba(255,255,255,0.12) inset;
+        }
+        .video-wrap {
+          position: absolute;
+          inset: 0;
+          z-index: 0;
+          width: 100%;
+          background: #000;
+          overflow: hidden;
+          pointer-events: none;
+        }
+        .video-wrap .video-layer {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          object-fit: contain;
+          transition: opacity 0.35s ease-out;
+          pointer-events: none;
+        }
         .video-wrap .video-layer.poster-fallback { z-index: 2; }
         .video-wrap .video-layer.reply-layer { z-index: 1; transition: opacity 0.3s ease-in-out; }
         .video-wrap .video-layer.reply-layer.reply-hiding { transition: opacity 0.35s ease-out; }
-        .conv-bottom { position: relative; z-index: 20; flex-shrink: 0; background: rgba(0,0,0,0.9); border-top: 1px solid rgba(255,255,255,0.1); }
-        .video-conv-bottom { padding-bottom: 0.5rem; }
-        .video-voice-intro { padding: 0.55rem 1rem 0.15rem; }
-        .video-voice-title { display: block; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.14em; color: rgba(148,163,184,0.95); }
-        .video-voice-sub { margin: 0.4rem 0 0; font-size: 0.8rem; line-height: 1.4; color: rgba(226,232,240,0.88); max-width: 40rem; }
-        /* Dedicated bar so styles are not overridden by .audio-mic-panel (later in this stylesheet). */
-        .conv-bottom .video-voice-controls {
+        .video-floating-bar {
+          position: absolute;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          z-index: 25;
           display: flex;
-          flex-direction: row;
+          justify-content: center;
+          padding: 1rem 1rem 1.35rem;
+          pointer-events: none;
+          background: linear-gradient(to top, rgba(0,0,0,0.82) 0%, rgba(0,0,0,0.35) 45%, transparent 100%);
+        }
+        .video-floating-bar-inner {
+          pointer-events: auto;
+          display: flex;
           flex-wrap: wrap;
           align-items: center;
-          gap: 0.75rem 1rem;
-          margin: 0.55rem 1rem 0;
-          padding: 0.85rem 1rem;
-          border-radius: 16px;
-          border: 1px solid rgba(16, 185, 129, 0.35);
-          background: rgba(6, 78, 59, 0.35);
-          pointer-events: auto;
+          gap: 0.5rem 0.65rem;
+          padding: 0.45rem 0.55rem 0.45rem 0.85rem;
+          border-radius: 999px;
+          background: linear-gradient(135deg, rgba(109, 40, 217, 0.92) 0%, rgba(91, 33, 182, 0.95) 50%, rgba(76, 29, 149, 0.98) 100%);
+          box-shadow: 0 12px 40px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.12) inset;
         }
-        .mic-btn-video { padding: 0.72rem 1.15rem; font-size: 0.95rem; font-weight: 600; }
-        .video-mic-copy { flex: 1; min-width: 11rem; }
-        .video-mic-hint { font-size: 0.8rem; line-height: 1.35; color: rgba(226, 232, 240, 0.92); }
-        .video-text-toggle-wrap { padding: 0.25rem 1rem 0; }
-        .video-text-toggle { background: none; border: none; color: #a78bfa; font-size: 0.78rem; cursor: pointer; text-decoration: underline; padding: 0.15rem 0; }
-        .video-text-toggle:hover { color: #c4b5fd; }
-        .conv-bottom .video-mic-error { margin: 0.35rem 1rem 0; }
+        .vf-persona-wrap { position: relative; }
+        .vf-bar-menu-wrap { position: relative; }
+        .vf-persona-btn {
+          display: flex;
+          align-items: center;
+          gap: 0.35rem;
+          border: none;
+          background: rgba(255,255,255,0.14);
+          color: #fff;
+          font-size: 0.88rem;
+          font-weight: 600;
+          padding: 0.5rem 0.85rem;
+          border-radius: 999px;
+          cursor: pointer;
+          max-width: 11rem;
+        }
+        .vf-persona-btn:hover { background: rgba(255,255,255,0.22); }
+        .vf-persona-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .vf-chevron { font-size: 0.65rem; opacity: 0.85; }
+        .vf-persona-menu {
+          position: absolute;
+          bottom: calc(100% + 8px);
+          left: 0;
+          min-width: 11rem;
+          padding: 0.35rem 0;
+          border-radius: 12px;
+          background: #18181b;
+          border: 1px solid rgba(255,255,255,0.12);
+          box-shadow: 0 16px 48px rgba(0,0,0,0.5);
+          z-index: 40;
+        }
+        .vf-persona-menu a, .vf-persona-menu button {
+          display: block;
+          width: 100%;
+          text-align: left;
+          padding: 0.55rem 1rem;
+          border: none;
+          background: none;
+          color: #fafafa;
+          font-size: 0.85rem;
+          cursor: pointer;
+          text-decoration: none;
+        }
+        .vf-persona-menu a:hover, .vf-persona-menu button:hover { background: rgba(255,255,255,0.08); }
+        .vf-persona-menu button.vf-menu-current {
+          background: rgba(124, 58, 237, 0.35);
+          color: #fafafa;
+        }
+        .vf-icon-btn {
+          width: 44px;
+          height: 44px;
+          border-radius: 50%;
+          border: none;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: rgba(255,255,255,0.12);
+          color: #fff;
+          cursor: pointer;
+        }
+        .vf-icon-btn:hover:not(:disabled) { background: rgba(255,255,255,0.22); }
+        .vf-icon-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+        .vf-icon-btn.vf-on { background: rgba(255,255,255,0.28); box-shadow: 0 0 0 2px rgba(255,255,255,0.35); }
+        .vf-icon-btn.vf-muted { background: rgba(250,204,21,0.12); box-shadow: 0 0 0 2px rgba(250,204,21,0.4); }
+        .vf-svg { width: 22px; height: 22px; display: block; }
+        .vf-end-chat {
+          display: flex;
+          align-items: center;
+          gap: 0.4rem;
+          border: none;
+          border-radius: 999px;
+          padding: 0.5rem 1rem 0.5rem 0.65rem;
+          background: rgba(0,0,0,0.22);
+          color: #fff;
+          font-size: 0.82rem;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .vf-end-chat:hover { background: rgba(0,0,0,0.35); }
+        .vf-end-icon { width: 20px; height: 20px; opacity: 0.95; }
+        .video-chat-drawer {
+          flex-shrink: 0;
+          width: min(380px, 100vw);
+          display: flex;
+          flex-direction: column;
+          min-height: 0;
+          background: #fafafa;
+          color: #18181b;
+          border-left: 1px solid #e4e4e7;
+          box-shadow: -12px 0 40px rgba(0,0,0,0.12);
+          transition: width 0.28s ease, opacity 0.22s ease, border-color 0.2s ease;
+          overflow: hidden;
+        }
+        .video-chat-drawer.collapsed {
+          width: 0 !important;
+          min-width: 0 !important;
+          opacity: 0;
+          border-left-color: transparent;
+          pointer-events: none;
+        }
+        .video-chat-drawer-head {
+          display: flex;
+          align-items: center;
+          gap: 0.5rem;
+          padding: 0.85rem 1rem 0.35rem;
+          border-bottom: 1px solid #e4e4e7;
+          flex-shrink: 0;
+        }
+        .video-chat-collapse {
+          border: none;
+          background: #f4f4f5;
+          border-radius: 10px;
+          width: 36px;
+          height: 36px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          color: #3f3f46;
+        }
+        .video-chat-collapse:hover { background: #e4e4e7; }
+        .video-chat-title { font-weight: 700; font-size: 1rem; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .video-chat-sub { font-size: 0.72rem; color: #71717a; padding: 0 1rem 0.65rem; flex-shrink: 0; }
+        .video-chat-log-light {
+          flex: 1;
+          min-height: 0;
+          overflow-y: auto;
+          padding: 0.75rem 1rem 1rem;
+          display: flex;
+          flex-direction: column;
+          gap: 0.65rem;
+        }
+        .video-chat-thinking { font-size: 0.85rem; color: #71717a; font-style: italic; }
+        .video-chat-row { display: flex; align-items: flex-end; gap: 0.5rem; max-width: 100%; }
+        .video-chat-row.user { justify-content: flex-end; flex-direction: row-reverse; }
+        .video-chat-row.assistant { justify-content: flex-start; }
+        .video-chat-avatar {
+          width: 32px;
+          height: 32px;
+          border-radius: 50%;
+          object-fit: cover;
+          flex-shrink: 0;
+          border: 2px solid #fff;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+        }
+        .video-chat-avatar-fallback {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: linear-gradient(135deg, #7c3aed, #5b21b6);
+          color: #fff;
+          font-size: 0.75rem;
+          font-weight: 700;
+        }
+        .video-chat-bubble {
+          max-width: calc(100% - 44px);
+          padding: 0.65rem 0.85rem;
+          border-radius: 18px;
+          line-height: 1.45;
+          font-size: 0.9rem;
+        }
+        .video-chat-bubble.user {
+          background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%);
+          color: #fff;
+          border-bottom-right-radius: 6px;
+        }
+        .video-chat-bubble.assistant {
+          background: #f4f4f5;
+          color: #18181b;
+          border-bottom-left-radius: 6px;
+          border: 1px solid #e4e4e7;
+        }
+        .video-chat-bubble-text { word-break: break-word; }
+        .video-chat-footer {
+          flex-shrink: 0;
+          padding: 0.75rem 1rem 1rem;
+          border-top: 1px solid #e4e4e7;
+          background: #fff;
+        }
+        .video-chat-error { color: #b91c1c; font-size: 0.8rem; margin: 0 0 0.35rem; }
+        .video-chat-hint { font-size: 0.75rem; color: #71717a; margin: 0 0 0.5rem; line-height: 1.4; }
+        .video-chat-type-toggle {
+          border: none;
+          background: none;
+          color: #7c3aed;
+          font-size: 0.8rem;
+          font-weight: 600;
+          cursor: pointer;
+          padding: 0.25rem 0;
+          margin-bottom: 0.5rem;
+        }
+        .video-chat-type-toggle:hover { text-decoration: underline; }
+        .video-chat-form { display: flex; gap: 0.5rem; margin-top: 0.25rem; }
+        .video-chat-form input {
+          flex: 1;
+          min-width: 0;
+          padding: 0.55rem 0.75rem;
+          border-radius: 12px;
+          border: 1px solid #d4d4d8;
+          font-size: 0.9rem;
+        }
+        .video-chat-form input:focus { outline: none; border-color: #7c3aed; box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.15); }
+        .video-chat-form button {
+          padding: 0.55rem 1rem;
+          border-radius: 12px;
+          border: none;
+          background: #7c3aed;
+          color: #fff;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .video-chat-form button:disabled { opacity: 0.45; cursor: not-allowed; }
+        .video-chat-footer-actions { margin-top: 0.5rem; }
+        .video-chat-stop {
+          border: 1px solid #d4d4d8;
+          background: #fafafa;
+          color: #3f3f46;
+          padding: 0.45rem 0.85rem;
+          border-radius: 10px;
+          font-size: 0.8rem;
+          cursor: pointer;
+        }
+        .video-chat-stop:disabled { opacity: 0.4; cursor: not-allowed; }
+        @media (max-width: 720px) {
+          .video-chat-drawer {
+            position: absolute;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            width: min(100vw - 12px, 360px);
+            z-index: 30;
+            box-shadow: -8px 0 32px rgba(0,0,0,0.22);
+            transition: transform 0.28s ease, opacity 0.22s ease, box-shadow 0.2s ease;
+          }
+          .video-chat-drawer.open {
+            transform: translateX(0);
+            opacity: 1;
+            pointer-events: auto;
+          }
+          .video-chat-drawer.collapsed {
+            transform: translateX(104%);
+            opacity: 0;
+            pointer-events: none;
+            width: min(100vw - 12px, 360px) !important;
+            min-width: unset !important;
+          }
+        }
         .input-form { display: flex; gap: 0.5rem; padding: 0.75rem 1rem; width: 100%; }
         .input-form input { flex: 1; padding: 0.6rem 0.75rem; border-radius: var(--radius); border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.08); color: #fff; }
         .input-form input::placeholder { color: rgba(255,255,255,0.5); }

@@ -2,7 +2,6 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 httpx==0.28.1
 python-multipart==0.0.17
-openai==1.58.1
 python-dotenv==1.0.1
 pydub==0.25.1
 websockets>=14.0

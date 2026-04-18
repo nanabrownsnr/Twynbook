@@ -1,0 +1,14 @@
+# Pin Ditto talking-head to physical GPU 2 (CUDA device index 2).
+#
+# Use with the existing streaming stack (compose project "streaming", service "ditto-service").
+# From the directory that contains that stack's compose.yaml, e.g.:
+#   /home/twynity-staging/avatar-ditto-talkinghead/4th-ir_changes/streaming
+# run:
+#   docker compose -f compose.yaml -f /path/to/twynbook/docker-compose.ditto-streaming.gpu2.override.yml up -d --force-recreate ditto-service
+#
+# Requires the Ditto container to be removable (if `docker kill`/`rm` hang, restart Docker or the host first).
+
+services:
+  ditto-service:
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "2"

@@ -1,6 +1,10 @@
 .env
 data/
+docker-data/
 *.pyc
 __pycache__/
 node_modules/
 frontend/dist/
+
+# Local audio scratch files under scripts (keep out of git)
+backend/scripts/*.wav

@@ -5,7 +5,7 @@ no longer exists (404). Uses same DATA_DIR and DITTO_API_URL as main.py.
 
 Usage (from repo root or backend/):
   python backend/scripts/cleanup_personas.py [--dry-run] [--clear]
-  Set DITTO_API_URL if Ditto is not at http://localhost:8080.
+  Set DITTO_API_URL if Ditto is not at the default host/port.
 
   --dry-run   Only print what would be removed/cleared.
   --clear     Clear image_id/preview_url for broken personas (keep persona).
@@ -24,7 +24,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(REPO_ROOT / "data")))
 PERSONAS_FILE = DATA_DIR / "personas.json"
-DITTO_API_URL = (os.environ.get("DITTO_API_URL", "http://localhost:8080")).rstrip("/")
+DITTO_API_URL = (os.environ.get("DITTO_API_URL", "http://localhost:8082")).rstrip("/")
 
 
 def load_personas() -> list[dict]:

@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
-import { apiFetch, getUser } from '../auth'
+import { apiFetch, getUser, getToken } from '../auth'
 
 const API = '/api'
 const KNOWLEDGE_PACK_MAX_DOCS = 5
+const PROMO_HINT = 'Paid items: enter promo code twins to redeem for free (beta).'
 
 export default function Marketplace() {
   const user = getUser()
@@ -12,15 +13,24 @@ export default function Marketplace() {
   const [listings, setListings] = useState([])
   const [purchases, setPurchases] = useState([])
   const [loading, setLoading] = useState(true)
-  const [typeFilter, setTypeFilter] = useState('all') // 'all' | 'avatar' | 'integration' | 'role_pack' | 'knowledge_pack' | 'twyn'
+  const [typeFilter, setTypeFilter] = useState('all')
   const [modalListing, setModalListing] = useState(null)
+  const [modalPromo, setModalPromo] = useState('')
   const [buying, setBuying] = useState(null)
+  const [buyError, setBuyError] = useState(null)
   const [showAdminForm, setShowAdminForm] = useState(false)
   const [editingListing, setEditingListing] = useState(null)
-  const [form, setForm] = useState({ name: '', description: '', logo_url: '', price: '', mcp_server_url: '', listing_type: 'integration', role_prompt: '' })
-  const [avatarFaceFile, setAvatarFaceFile] = useState(null)
-  const [avatarVoiceFile, setAvatarVoiceFile] = useState(null)
+  const [form, setForm] = useState({
+    name: '',
+    description: '',
+    price: '',
+    listing_type: 'knowledge_pack',
+  })
+  const [logoFile, setLogoFile] = useState(null)
+  const [logoPreviewUrl, setLogoPreviewUrl] = useState(null)
   const [knowledgePackFiles, setKnowledgePackFiles] = useState([])
+  const [mcpBinaryFile, setMcpBinaryFile] = useState(null)
+  const [mcpSetupInstructions, setMcpSetupInstructions] = useState('')
   const [formSaving, setFormSaving] = useState(false)
   const [formError, setFormError] = useState(null)
 
@@ -43,53 +53,83 @@ export default function Marketplace() {
 
   useEffect(() => { loadAll() }, [])
 
-  const isOwned = (id) => purchases.includes(id)
+  useEffect(() => () => {
+    if (logoPreviewUrl) URL.revokeObjectURL(logoPreviewUrl)
+  }, [logoPreviewUrl])
 
-  const handleBuy = async (listing) => {
-    setBuying(listing.id)
-    try {
-      const res = await apiFetch(`${API}/marketplace/${listing.id}/purchase`, { method: 'POST' })
-      if (res.ok) {
-        setPurchases((prev) => prev.includes(listing.id) ? prev : [...prev, listing.id])
-        setModalListing(null)
-      }
-    } catch (e) {
-      console.error(e)
-    } finally {
-      setBuying(null)
-    }
+  const clearLogoPick = useCallback(() => {
+    setLogoFile(null)
+    setLogoPreviewUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return null
+    })
+  }, [])
+
+  const onLogoFileChange = (e) => {
+    const f = e.target.files?.[0] || null
+    setLogoFile(f)
+    setLogoPreviewUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return f ? URL.createObjectURL(f) : null
+    })
   }
 
+  const isOwned = (id) => purchases.includes(id)
+
   const listingType = (l) => l.listing_type || 'integration'
+
+  const listingTypeLabel = (l) => (listingType(l) === 'mcp' ? 'Capability' : 'Knowledge')
 
   const filteredListings = typeFilter === 'all'
     ? listings
     : listings.filter((l) => listingType(l) === typeFilter)
 
+  const handleBuy = async (listing) => {
+    setBuyError(null)
+    setBuying(listing.id)
+    try {
+      const res = await apiFetch(`${API}/marketplace/${listing.id}/purchase`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ promo_code: modalPromo.trim() || undefined }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(typeof data.detail === 'string' ? data.detail : (data.detail?.[0]?.msg || 'Purchase failed'))
+      }
+      setPurchases((prev) => (prev.includes(listing.id) ? prev : [...prev, listing.id]))
+      setModalListing(null)
+      setModalPromo('')
+    } catch (e) {
+      setBuyError(e.message || 'Purchase failed')
+    } finally {
+      setBuying(null)
+    }
+  }
+
   const openAdminNew = () => {
     setEditingListing(null)
-    setForm({ name: '', description: '', logo_url: '', price: '', mcp_server_url: '', listing_type: 'integration', role_prompt: '' })
-    setAvatarFaceFile(null)
-    setAvatarVoiceFile(null)
+    clearLogoPick()
+    setForm({ name: '', description: '', price: '', listing_type: 'knowledge_pack' })
     setKnowledgePackFiles([])
+    setMcpBinaryFile(null)
+    setMcpSetupInstructions('')
     setFormError(null)
     setShowAdminForm(true)
   }
 
   const openAdminEdit = (l) => {
     setEditingListing(l)
+    clearLogoPick()
     setForm({
       name: l.name,
       description: l.description || '',
-      logo_url: l.logo_url || '',
       price: String(l.price || 0),
-      mcp_server_url: l.mcp_server_url || '',
       listing_type: listingType(l),
-      role_prompt: l.role_prompt || '',
     })
-    setAvatarFaceFile(null)
-    setAvatarVoiceFile(null)
     setKnowledgePackFiles([])
+    setMcpBinaryFile(null)
+    setMcpSetupInstructions(l.setup_instructions || '')
     setFormError(null)
     setShowAdminForm(true)
   }
@@ -103,10 +143,8 @@ export default function Marketplace() {
   const handleFormSubmit = async (e) => {
     e.preventDefault()
     setFormError(null)
-    const type = (form.listing_type || 'integration').trim()
+    const type = (form.listing_type || 'knowledge_pack').trim()
     if (!form.name.trim()) { setFormError('Name is required'); return }
-    if (type === 'integration' && !form.mcp_server_url.trim()) { setFormError('MCP server URL is required for integrations'); return }
-    if (type === 'role_pack' && !form.role_prompt.trim()) { setFormError('Role prompt is required for role packs'); return }
     if (type === 'knowledge_pack' && !editingListing) {
       if (!knowledgePackFiles.length) { setFormError('Add at least one PDF or TXT file for a knowledge pack'); return }
       if (knowledgePackFiles.length > KNOWLEDGE_PACK_MAX_DOCS) {
@@ -114,8 +152,9 @@ export default function Marketplace() {
         return
       }
     }
-    if (type === 'avatar' && !editingListing) {
-      if (!avatarFaceFile || !avatarVoiceFile) { setFormError('Face image and voice sample are required for new avatars'); return }
+    if (type === 'mcp' && !editingListing && !mcpBinaryFile) {
+      setFormError('Binary file is required for a new capability')
+      return
     }
     setFormSaving(true)
     try {
@@ -124,45 +163,57 @@ export default function Marketplace() {
         fd.set('name', form.name.trim())
         fd.set('description', form.description.trim())
         fd.set('price', String(parseFloat(form.price) || 0))
-        fd.set('logo_url', form.logo_url.trim())
+        if (logoFile) fd.set('logo', logoFile)
         knowledgePackFiles.forEach((file) => fd.append('files', file))
         const res = await apiFetch(`${API}/admin/marketplace/knowledge-pack`, { method: 'POST', body: fd })
         if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Knowledge pack creation failed') }
         const saved = await res.json()
         setListings((prev) => [...prev, saved])
+        clearLogoPick()
         setShowAdminForm(false)
-      } else if (type === 'avatar' && !editingListing && avatarFaceFile && avatarVoiceFile) {
+      } else if (type === 'mcp' && !editingListing && mcpBinaryFile) {
         const fd = new FormData()
         fd.set('name', form.name.trim())
         fd.set('description', form.description.trim())
         fd.set('price', String(parseFloat(form.price) || 0))
-        fd.set('face', avatarFaceFile)
-        fd.set('voice', avatarVoiceFile)
-        const res = await apiFetch(`${API}/admin/marketplace/avatar`, { method: 'POST', body: fd })
-        if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Avatar creation failed') }
+        if (logoFile) fd.set('logo', logoFile)
+        fd.set('setup_instructions', mcpSetupInstructions.trim())
+        fd.set('required_env_keys', '[]')
+        fd.set('binary', mcpBinaryFile)
+        const res = await apiFetch(`${API}/admin/marketplace/mcp`, { method: 'POST', body: fd })
+        if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Capability creation failed') }
         const saved = await res.json()
         setListings((prev) => [...prev, saved])
+        clearLogoPick()
         setShowAdminForm(false)
-      } else {
+      } else if (editingListing) {
         const body = {
           name: form.name.trim(),
           description: form.description.trim(),
-          logo_url: form.logo_url.trim(),
           price: parseFloat(form.price) || 0,
-          mcp_server_url: type === 'integration' ? form.mcp_server_url.trim() : '',
+          mcp_server_url: '',
           listing_type: type,
-          role_prompt: type === 'role_pack' ? form.role_prompt.trim() : '',
+          role_prompt: '',
         }
-        const res = editingListing
-          ? await apiFetch(`${API}/admin/marketplace/${editingListing.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-          : await apiFetch(`${API}/admin/marketplace`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        const res = await apiFetch(`${API}/admin/marketplace/${editingListing.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
         if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Save failed') }
-        const saved = await res.json()
-        if (editingListing) {
-          setListings((prev) => prev.map((l) => l.id === saved.id ? saved : l))
-        } else {
-          setListings((prev) => [...prev, saved])
+        let saved = await res.json()
+        if (logoFile) {
+          const lfd = new FormData()
+          lfd.set('logo', logoFile)
+          const logoRes = await apiFetch(`${API}/admin/marketplace/${editingListing.id}/logo`, { method: 'POST', body: lfd })
+          if (!logoRes.ok) {
+            const d = await logoRes.json().catch(() => ({}))
+            throw new Error(typeof d.detail === 'string' ? d.detail : (d.detail?.[0]?.msg || 'Logo upload failed'))
+          }
+          saved = await logoRes.json()
         }
+        setListings((prev) => prev.map((l) => (l.id === saved.id ? saved : l)))
+        clearLogoPick()
         setShowAdminForm(false)
       }
     } catch (err) {
@@ -172,34 +223,35 @@ export default function Marketplace() {
     }
   }
 
+  const filterEmptyLabel = typeFilter === 'knowledge_pack' ? 'knowledge packs' : typeFilter === 'mcp' ? 'capabilities' : 'listings'
+
   return (
     <div className="marketplace-page">
       <header className="marketplace-header">
         <div className="marketplace-header-left">
           <Link to="/app" className="marketplace-back">← Back to app</Link>
           <h1 className="marketplace-title">Marketplace</h1>
-          <p className="marketplace-tagline">Skills and integrations for your digital twin</p>
+          <p className="marketplace-tagline">Capabilities and knowledge packs for your twyns</p>
         </div>
         {isAdmin && (
-          <button className="marketplace-admin-btn" onClick={openAdminNew}>+ Add listing</button>
+          <button type="button" className="marketplace-admin-btn" onClick={openAdminNew}>+ Add listing</button>
         )}
       </header>
+
+      <p className="marketplace-promo-banner">{PROMO_HINT}</p>
 
       {loading ? (
         <p className="marketplace-loading">Loading…</p>
       ) : listings.length === 0 ? (
         <div className="marketplace-empty">
-          <p>No tools in the marketplace yet{isAdmin ? '. Click "Add listing" to add one.' : '.'}</p>
+          <p>No listings yet{isAdmin ? '. Add a capability or knowledge pack.' : '.'}</p>
         </div>
       ) : (
         <>
           <div className="marketplace-filters">
             {[
               { key: 'all', label: 'All' },
-              { key: 'twyn', label: 'Twyns' },
-              { key: 'avatar', label: 'Avatars' },
-              { key: 'integration', label: 'Tools' },
-              { key: 'role_pack', label: 'Roles' },
+              { key: 'mcp', label: 'Capabilities' },
               { key: 'knowledge_pack', label: 'Knowledge' },
             ].map(({ key, label }) => (
               <button
@@ -215,45 +267,40 @@ export default function Marketplace() {
           <div className="marketplace-grid">
             {filteredListings.map((listing) => (
               <div key={listing.id} className="marketplace-card-wrap">
-                <button type="button" className="marketplace-card" onClick={() => setModalListing(listing)}>
-                  <span className={`marketplace-card-type marketplace-card-type-${listingType(listing)}`}>{listingType(listing) === 'integration' ? 'Tool' : listingType(listing) === 'role_pack' ? 'Role' : listingType(listing) === 'knowledge_pack' ? 'Knowledge' : listingType(listing) === 'twyn' ? 'Twyn' : 'Avatar'}</span>
-                  <div className={`marketplace-card-thumb ${listingType(listing) === 'avatar' || listingType(listing) === 'twyn' ? 'marketplace-card-thumb-avatar' : ''}`}>
-                  {listingType(listing) === 'avatar' || listingType(listing) === 'twyn'
-                    ? <><img src={`${API}/marketplace/${listing.id}/preview`} alt="" onError={(e) => { e.target.style.display = 'none'; e.target.nextElementSibling?.classList.add('show'); }} /><span className="marketplace-card-icon fallback">{listing.name[0]}</span></>
-                    : listing.logo_url
+                <button type="button" className="marketplace-card" onClick={() => { setModalListing(listing); setModalPromo(''); setBuyError(null) }}>
+                  <span className={`marketplace-card-type marketplace-card-type-${listingType(listing)}`}>{listingTypeLabel(listing)}</span>
+                  <div className="marketplace-card-thumb">
+                    {listing.logo_url
                       ? <img src={listing.logo_url} alt="" />
                       : <span className="marketplace-card-icon">{listing.name[0]}</span>}
-                </div>
-                <span className="marketplace-card-name">{listing.name}</span>
-                {listing.price > 0 && <span className="marketplace-card-price">${listing.price.toFixed(2)}/mo</span>}
-                {isOwned(listing.id) && <span className="marketplace-card-owned">Owned</span>}
-              </button>
-              {isAdmin && (
-                <div className="marketplace-card-admin">
-                  <button className="mkt-admin-edit" onClick={() => openAdminEdit(listing)}>Edit</button>
-                  <button className="mkt-admin-delete" onClick={() => handleAdminDelete(listing.id)}>Delete</button>
-                </div>
-              )}
-            </div>
-          ))}
+                  </div>
+                  <span className="marketplace-card-name">{listing.name}</span>
+                  {listing.price > 0 && <span className="marketplace-card-price">${listing.price.toFixed(2)}/mo</span>}
+                  {isOwned(listing.id) && <span className="marketplace-card-owned">Owned</span>}
+                </button>
+                {isAdmin && (
+                  <div className="marketplace-card-admin">
+                    <button type="button" className="mkt-admin-edit" onClick={() => openAdminEdit(listing)}>Edit</button>
+                    <button type="button" className="mkt-admin-delete" onClick={() => handleAdminDelete(listing.id)}>Delete</button>
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
           {filteredListings.length === 0 && (
-            <p className="marketplace-no-results">No {typeFilter === 'integration' ? 'tools' : typeFilter === 'role_pack' ? 'roles' : typeFilter === 'knowledge_pack' ? 'knowledge packs' : typeFilter === 'avatar' ? 'avatars' : typeFilter === 'twyn' ? 'twyns' : 'listings'} match this filter.</p>
+            <p className="marketplace-no-results">No {filterEmptyLabel} match this filter.</p>
           )}
         </>
       )}
 
-      {/* Detail modal */}
       {modalListing && (
         <div className="marketplace-modal-overlay" onClick={() => setModalListing(null)}>
           <div className="marketplace-modal" onClick={(e) => e.stopPropagation()}>
             <div className="marketplace-modal-header">
-              <div className={`marketplace-modal-thumb ${listingType(modalListing) === 'avatar' || listingType(modalListing) === 'twyn' ? 'marketplace-modal-thumb-avatar' : ''}`}>
-                  {listingType(modalListing) === 'avatar' || listingType(modalListing) === 'twyn'
-                    ? <><img src={`${API}/marketplace/${modalListing.id}/preview`} alt="" onError={(e) => { e.target.style.display = 'none'; e.target.nextElementSibling?.classList.add('show'); }} /><span className="marketplace-card-icon fallback">{modalListing.name[0]}</span></>
-                  : modalListing.logo_url
-                    ? <img src={modalListing.logo_url} alt="" />
-                    : <span className="marketplace-card-icon">{modalListing.name[0]}</span>}
+              <div className="marketplace-modal-thumb">
+                {modalListing.logo_url
+                  ? <img src={modalListing.logo_url} alt="" />
+                  : <span className="marketplace-card-icon">{modalListing.name[0]}</span>}
               </div>
               <div>
                 <h2 className="marketplace-modal-title">{modalListing.name}</h2>
@@ -263,15 +310,40 @@ export default function Marketplace() {
             </div>
             <p className="marketplace-modal-desc">
               {modalListing.description
-                || (listingType(modalListing) === 'role_pack'
-                  ? 'Role pack: prompt only (RAG + documents later).'
-                  : listingType(modalListing) === 'knowledge_pack'
-                    ? `Knowledge pack: ${modalListing.knowledge_pack_file_count ?? '?'} document(s). Attach when creating a persona (copied into your twyn’s knowledge base).`
-                    : 'No description.')}
+                || (listingType(modalListing) === 'knowledge_pack'
+                  ? `Knowledge pack: ${modalListing.knowledge_pack_file_count ?? '?'} document(s). Copied into your twyn’s knowledge base when attached.`
+                  : 'Self-hosted capability: download the binary, run with your license key, then add the MCP URL when editing your twyn.')}
             </p>
+            {listingType(modalListing) === 'mcp' && modalListing.setup_instructions && (
+              <pre className="marketplace-mcp-setup">{modalListing.setup_instructions}</pre>
+            )}
+            {!isOwned(modalListing.id) && modalListing.price > 0 && (
+              <label className="marketplace-modal-promo">
+                Promo code
+                <input
+                  type="text"
+                  value={modalPromo}
+                  onChange={(e) => setModalPromo(e.target.value)}
+                  placeholder="twins"
+                  autoComplete="off"
+                />
+              </label>
+            )}
+            {buyError && <p className="marketplace-buy-error">{buyError}</p>}
             <div className="marketplace-modal-actions">
               {isOwned(modalListing.id) ? (
-                <span className="marketplace-owned-badge">✓ Owned</span>
+                <>
+                  {listingType(modalListing) === 'mcp' && (
+                    <a
+                      className="btn-marketplace btn-buy"
+                      href={`${API}/marketplace/${modalListing.id}/binary?token=${encodeURIComponent(getToken() || '')}`}
+                      download
+                    >
+                      Download binary
+                    </a>
+                  )}
+                  <span className="marketplace-owned-badge">✓ Owned</span>
+                </>
               ) : (
                 <button
                   type="button"
@@ -287,7 +359,6 @@ export default function Marketplace() {
         </div>
       )}
 
-      {/* Admin form modal */}
       {showAdminForm && (
         <div className="marketplace-modal-overlay" onClick={() => setShowAdminForm(false)}>
           <div className="marketplace-modal marketplace-admin-modal" onClick={(e) => e.stopPropagation()}>
@@ -298,32 +369,56 @@ export default function Marketplace() {
             {formError && <p className="marketplace-form-error">{formError}</p>}
             <form onSubmit={handleFormSubmit} className="marketplace-admin-form">
               <label>Listing type
-                <select value={form.listing_type} onChange={(e) => setForm((f) => ({ ...f, listing_type: e.target.value }))} disabled={!!editingListing}>
-                  <option value="integration">Integration (MCP tools)</option>
-                  <option value="role_pack">Role pack (prompt)</option>
+                <select
+                  value={form.listing_type}
+                  onChange={(e) => setForm((f) => ({ ...f, listing_type: e.target.value }))}
+                  disabled={!!editingListing}
+                >
                   <option value="knowledge_pack">Knowledge pack (PDF/TXT bundle)</option>
-                  <option value="avatar">Avatar (face + voice)</option>
+                  <option value="mcp">Capability (self-hosted binary)</option>
                 </select>
                 {editingListing && <span className="form-hint">Type cannot be changed when editing.</span>}
               </label>
               <label>Name *
-                <input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required placeholder="e.g. Excel / Sales coach / Alex" />
+                <input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required placeholder="Name" />
               </label>
               <label>Description
                 <textarea value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} rows={2} placeholder="What this listing is for…" />
               </label>
-              {form.listing_type !== 'avatar' && (
-                <label>Logo URL
-                  <input value={form.logo_url} onChange={(e) => setForm((f) => ({ ...f, logo_url: e.target.value }))} placeholder="https://…" />
-                </label>
-              )}
+              <label className="marketplace-logo-field">Logo (optional)
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/jpg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif"
+                  onChange={onLogoFileChange}
+                />
+                {(logoPreviewUrl || editingListing?.logo_url) && (
+                  <div className="marketplace-logo-preview-wrap">
+                    <img
+                      src={logoPreviewUrl || editingListing.logo_url}
+                      alt=""
+                      className="marketplace-logo-preview"
+                    />
+                  </div>
+                )}
+                <span className="form-hint">PNG, JPG, WebP, or GIF — max 2MB. Leave empty to keep the current logo when editing.</span>
+              </label>
               <label>Price ($/mo, 0 = free)
                 <input type="number" min="0" step="0.01" value={form.price} onChange={(e) => setForm((f) => ({ ...f, price: e.target.value }))} placeholder="9.99" />
               </label>
-              {form.listing_type === 'integration' && (
-                <label>MCP server URL *
-                  <input value={form.mcp_server_url} onChange={(e) => setForm((f) => ({ ...f, mcp_server_url: e.target.value }))} required={!editingListing} placeholder="http://74.161.41.130:8010/mcp" />
-                </label>
+              <p className="form-hint admin-price-hint">Buyers use promo code <strong>twins</strong> to redeem paid listings for free during beta.</p>
+              {form.listing_type === 'mcp' && !editingListing && (
+                <>
+                  <label>Binary file *
+                    <input type="file" onChange={(e) => setMcpBinaryFile(e.target.files?.[0] || null)} />
+                    {mcpBinaryFile && <span className="form-hint">Selected: {mcpBinaryFile.name}</span>}
+                  </label>
+                  <label>Setup instructions
+                    <textarea value={mcpSetupInstructions} onChange={(e) => setMcpSetupInstructions(e.target.value)} rows={4} placeholder="How to run the binary, license flag, port, …" />
+                  </label>
+                </>
+              )}
+              {form.listing_type === 'mcp' && editingListing && (
+                <p className="form-hint">Binary is fixed after creation. Edit name, description, logo, and price.</p>
               )}
               {form.listing_type === 'knowledge_pack' && !editingListing && (
                 <label>Documents * (PDF or TXT, 1–{KNOWLEDGE_PACK_MAX_DOCS} files)
@@ -350,26 +445,6 @@ export default function Marketplace() {
               {form.listing_type === 'knowledge_pack' && editingListing && (
                 <p className="form-hint">Files are fixed after creation. Edit name, description, logo, or price only.</p>
               )}
-              {form.listing_type === 'role_pack' && (
-                <label>Role prompt * (well-written prompt for this role; RAG + documents later)
-                  <textarea value={form.role_prompt} onChange={(e) => setForm((f) => ({ ...f, role_prompt: e.target.value }))} rows={6} required={!editingListing} placeholder="You are acting as a… Be concise. …" />
-                </label>
-              )}
-              {form.listing_type === 'avatar' && !editingListing && (
-                <>
-                  <label>Face image *
-                    <input type="file" accept="image/png,image/jpeg,image/jpg,image/webp" onChange={(e) => setAvatarFaceFile(e.target.files?.[0] || null)} />
-                    {avatarFaceFile && <span className="form-hint">Selected: {avatarFaceFile.name}</span>}
-                  </label>
-                  <label>Voice sample * (WAV or other audio)
-                    <input type="file" accept="audio/*,.wav" onChange={(e) => setAvatarVoiceFile(e.target.files?.[0] || null)} />
-                    {avatarVoiceFile && <span className="form-hint">Selected: {avatarVoiceFile.name}</span>}
-                  </label>
-                </>
-              )}
-              {form.listing_type === 'avatar' && editingListing && (
-                <p className="form-hint">Avatar image and voice cannot be changed. Edit name, description, or price only.</p>
-              )}
               <button type="submit" className="marketplace-form-save" disabled={formSaving}>
                 {formSaving ? 'Saving…' : editingListing ? 'Save changes' : 'Add listing'}
               </button>
@@ -380,10 +455,10 @@ export default function Marketplace() {
 
       <style>{`
         .marketplace-page { padding: 2rem; max-width: 1000px; margin: 0 auto; min-height: 100vh; background: var(--bg-page); }
-        .marketplace-header { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 2rem; }
+        .marketplace-promo-banner { font-size: 0.9rem; color: var(--text-secondary); margin: 0 0 1.25rem; padding: 0.65rem 0.9rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-card); }
+        .marketplace-header { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
         .marketplace-header-left { flex: 1; min-width: 0; }
         .marketplace-back { display: inline-block; margin-bottom: 0.5rem; color: var(--primary); font-size: 0.95rem; }
-        .marketplace-back:hover { text-decoration: none; }
         .marketplace-title { font-family: var(--font-heading); font-size: 1.5rem; font-weight: 700; margin: 0 0 0.25rem; color: var(--text-primary); }
         .marketplace-tagline { font-size: 0.95rem; color: var(--text-muted); margin: 0; }
         .marketplace-admin-btn { padding: 0.5rem 1rem; background: var(--primary); color: #fff; border: none; border-radius: var(--radius); font-weight: 600; cursor: pointer; white-space: nowrap; font-size: 0.9rem; }
@@ -396,8 +471,6 @@ export default function Marketplace() {
         .marketplace-card:hover { box-shadow: var(--shadow); transform: translateY(-2px); }
         .marketplace-card-thumb { width: 48px; height: 48px; min-width: 48px; min-height: 48px; display: flex; align-items: center; justify-content: center; margin-bottom: 0.5rem; overflow: hidden; }
         .marketplace-card-thumb img { width: 100%; height: 100%; object-fit: contain; object-position: center; }
-        .marketplace-card-thumb-avatar { border-radius: 50%; }
-        .marketplace-card-thumb-avatar img { object-fit: cover; object-position: center; }
         .marketplace-card-icon { font-size: 1.5rem; font-weight: 700; color: var(--primary); }
         .marketplace-card-name { font-size: 0.85rem; font-weight: 600; color: var(--text-primary); line-height: 1.2; }
         .marketplace-card-price { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.2rem; }
@@ -410,18 +483,19 @@ export default function Marketplace() {
         .marketplace-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 1rem; }
         .marketplace-modal { background: var(--bg-card); border-radius: var(--radius-lg); padding: 1.5rem; max-width: 440px; width: 100%; box-shadow: 0 8px 32px rgba(0,0,0,0.15); position: relative; max-height: 90vh; overflow-y: auto; }
         .marketplace-modal-header { display: flex; align-items: flex-start; gap: 0.75rem; margin-bottom: 1rem; }
-        .marketplace-modal-thumb { width: 40px; height: 40px; min-width: 40px; min-height: 40px; flex-shrink: 0; overflow: hidden; }
+        .marketplace-modal-thumb { width: 40px; height: 40px; min-width: 40px; min-height: 40px; flex-shrink: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; }
         .marketplace-modal-thumb img { width: 100%; height: 100%; object-fit: contain; object-position: center; }
-        .marketplace-modal-thumb-avatar { border-radius: 50%; }
-        .marketplace-modal-thumb-avatar img { object-fit: cover; object-position: center; }
         .marketplace-modal-title { font-family: var(--font-heading); font-size: 1.2rem; font-weight: 600; margin: 0; color: var(--text-primary); flex: 1; }
         .marketplace-modal-price { font-size: 0.85rem; color: var(--text-muted); margin: 0.15rem 0 0; }
         .marketplace-modal-close { background: none; border: none; font-size: 1.5rem; color: var(--text-muted); cursor: pointer; padding: 0 0.25rem; line-height: 1; flex-shrink: 0; }
         .marketplace-modal-close:hover { color: var(--text-primary); }
         .marketplace-modal-desc { font-size: 0.95rem; color: var(--text-secondary); line-height: 1.5; margin: 0 0 1.25rem; }
-        .marketplace-modal-actions { display: flex; gap: 0.75rem; align-items: center; }
+        .marketplace-modal-promo { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.9rem; margin-bottom: 0.75rem; color: var(--text-primary); }
+        .marketplace-modal-promo input { padding: 0.5rem 0.75rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-page); color: var(--text-primary); }
+        .marketplace-buy-error { color: var(--error, #c00); font-size: 0.88rem; margin: 0 0 0.75rem; }
+        .marketplace-modal-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
         .marketplace-owned-badge { font-weight: 600; color: #22c55e; font-size: 0.95rem; }
-        .btn-marketplace { padding: 0.6rem 1.2rem; border-radius: var(--radius); font-weight: 600; cursor: pointer; font-size: 0.95rem; border: none; }
+        .btn-marketplace { padding: 0.6rem 1.2rem; border-radius: var(--radius); font-weight: 600; cursor: pointer; font-size: 0.95rem; border: none; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
         .btn-buy { background: var(--primary); color: #fff; }
         .btn-buy:disabled { opacity: 0.7; cursor: not-allowed; }
         .btn-buy:not(:disabled):hover { background: var(--primary-hover); }
@@ -434,6 +508,7 @@ export default function Marketplace() {
         .marketplace-form-save:disabled { opacity: 0.7; cursor: not-allowed; }
         .marketplace-form-save:not(:disabled):hover { background: var(--primary-hover); }
         .form-hint { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.2rem; }
+        .admin-price-hint { margin: -0.25rem 0 0; }
         .marketplace-admin-form select { padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-page); color: var(--text-primary); font-size: 0.95rem; }
         .marketplace-filters { display: flex; gap: 0.5rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
         .marketplace-filter-btn { padding: 0.4rem 0.9rem; font-size: 0.85rem; font-weight: 600; border-radius: 999px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-secondary); cursor: pointer; transition: background 0.15s, color 0.15s, border-color 0.15s; }
@@ -441,15 +516,12 @@ export default function Marketplace() {
         .marketplace-filter-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
         .marketplace-no-results { color: var(--text-muted); padding: 2rem 0; margin: 0; font-size: 0.95rem; }
         .marketplace-card-type { display: block; font-size: 0.65rem; font-weight: 700; text-transform: uppercase; padding: 0.15rem 0.4rem; border-radius: 999px; background: var(--border); color: var(--text-muted); margin-bottom: 0.5rem; }
-        .marketplace-card-type-role_pack { background: rgba(139, 92, 246, 0.2); color: #8b5cf6; }
-        .marketplace-card-type-avatar { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
-        .marketplace-card-type-twyn { background: rgba(14, 165, 233, 0.15); color: #0284c7; }
-        .marketplace-card-type-integration { background: rgba(100, 116, 139, 0.2); color: var(--text-secondary); }
         .marketplace-card-type-knowledge_pack { background: rgba(245, 158, 11, 0.2); color: #d97706; }
-        .marketplace-card-thumb .fallback { display: none; width: 100%; height: 100%; align-items: center; justify-content: center; }
-        .marketplace-card-thumb .fallback.show { display: flex; }
-        .marketplace-modal-thumb .fallback { display: none; width: 100%; height: 100%; align-items: center; justify-content: center; }
-        .marketplace-modal-thumb .fallback.show { display: flex; }
+        .marketplace-card-type-mcp { background: rgba(59, 130, 246, 0.2); color: #2563eb; }
+        .marketplace-mcp-setup { font-size: 0.85rem; white-space: pre-wrap; background: var(--bg-page); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.75rem; max-height: 200px; overflow-y: auto; margin: 0 0 0.75rem; color: var(--text-secondary); }
+        .marketplace-logo-field input[type="file"] { font-size: 0.85rem; }
+        .marketplace-logo-preview-wrap { margin-top: 0.35rem; }
+        .marketplace-logo-preview { width: 64px; height: 64px; object-fit: contain; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-page); }
       `}</style>
     </div>
   )

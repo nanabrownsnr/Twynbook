@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { apiFetch } from '../auth'
+import { apiFetch, getToken } from '../auth'
 
 const API = '/api'
 
@@ -13,8 +13,9 @@ export default function EditPersona() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [purchases, setPurchases] = useState([])
-  const [assignedIds, setAssignedIds] = useState([])
   const [assignedRolePackId, setAssignedRolePackId] = useState('')
+  /** @type {Record<string, string>} listing_id -> MCP base URL */
+  const [assignedMcpConfigs, setAssignedMcpConfigs] = useState({})
   const [documents, setDocuments] = useState([])
   const [documentsLoading, setDocumentsLoading] = useState(false)
   const [uploadingDoc, setUploadingDoc] = useState(false)
@@ -22,20 +23,20 @@ export default function EditPersona() {
   const [shareUrl, setShareUrl] = useState('')
   const [shareLoading, setShareLoading] = useState(false)
   const [shareError, setShareError] = useState(null)
-  /** @type {Record<string, Record<string, string>>} listing_id -> { param_key: value } (secrets; only send non-empty fields on save) */
-  const [toolCredentials, setToolCredentials] = useState({})
   const [marketplaceOpen, setMarketplaceOpen] = useState(false)
-  const [marketplaceTab, setMarketplaceTab] = useState('tools')
+  const [marketplaceTab, setMarketplaceTab] = useState('knowledge')
   const [marketplaceListings, setMarketplaceListings] = useState([])
   const [marketplaceLoading, setMarketplaceLoading] = useState(false)
   const [panelBuying, setPanelBuying] = useState(null)
+  const [panelPromo, setPanelPromo] = useState('')
+  const [panelBuyError, setPanelBuyError] = useState(null)
   const [panelSelectedPackIds, setPanelSelectedPackIds] = useState([])
   const [packAttachLoading, setPackAttachLoading] = useState(false)
   const [packAttachError, setPackAttachError] = useState(null)
 
   const listingType = (l) => l.listing_type || 'integration'
-  const toolListings = purchases.filter((l) => listingType(l) === 'integration')
   const rolePackListings = purchases.filter((l) => listingType(l) === 'role_pack')
+  const capabilityListings = purchases.filter((l) => listingType(l) === 'mcp')
 
   const loadDocuments = () => {
     if (!personaId) return
@@ -62,9 +63,12 @@ export default function EditPersona() {
         setPersona(p)
         setName(p.name || '')
         setSystemPrompt(p.system_prompt || '')
-        setAssignedIds(p.assigned_listing_ids || [])
         setAssignedRolePackId(p.assigned_role_pack_id || '')
-        setToolCredentials({})
+        setAssignedMcpConfigs(
+          p.assigned_mcp_configs && typeof p.assigned_mcp_configs === 'object'
+            ? { ...p.assigned_mcp_configs }
+            : {}
+        )
       })
       .catch(() => setPersona(null))
   }, [personaId])
@@ -83,33 +87,20 @@ export default function EditPersona() {
     if (personaId && persona) loadDocuments()
   }, [personaId, persona])
 
-  const toggleTool = (id) => {
-    setAssignedIds((prev) => {
-      if (prev.includes(id)) {
-        setToolCredentials((c) => {
-          const next = { ...c }
-          delete next[id]
-          return next
-        })
-        return prev.filter((x) => x !== id)
+  const toggleCapabilityEnabled = (listingId, enabled) => {
+    setAssignedMcpConfigs((prev) => {
+      const next = { ...prev }
+      if (enabled) {
+        next[listingId] = prev[listingId] ?? ''
+      } else {
+        delete next[listingId]
       }
-      return [...prev, id]
+      return next
     })
   }
 
-  const schemaProps = (listing) => {
-    const s = listing.tool_params_schema
-    if (!s || typeof s !== 'object') return []
-    const props = s.properties
-    if (!props || typeof props !== 'object') return []
-    return Object.keys(props)
-  }
-
-  const setToolCredField = (listingId, key, value) => {
-    setToolCredentials((c) => ({
-      ...c,
-      [listingId]: { ...(c[listingId] || {}), [key]: value },
-    }))
+  const setMcpUrl = (listingId, url) => {
+    setAssignedMcpConfigs((prev) => ({ ...prev, [listingId]: url }))
   }
 
   const handleUploadDocument = (e) => {
@@ -139,16 +130,29 @@ export default function EditPersona() {
     setMarketplaceTab(tab)
     setMarketplaceOpen(true)
     setPackAttachError(null)
+    setPanelBuyError(null)
   }
 
   const isOwnedId = (id) => purchases.some((p) => p.id === id)
 
   const handlePanelBuy = (listing) => {
     setPanelBuying(listing.id)
-    apiFetch(`${API}/marketplace/${listing.id}/purchase`, { method: 'POST' })
-      .then((r) => {
-        if (r.ok) loadPurchases()
+    setPanelBuyError(null)
+    apiFetch(`${API}/marketplace/${listing.id}/purchase`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ promo_code: panelPromo.trim() || undefined }),
+    })
+      .then(async (r) => {
+        const data = await r.json().catch(() => ({}))
+        if (!r.ok) {
+          const det = data.detail
+          const msg = typeof det === 'string' ? det : Array.isArray(det) ? det.map((e) => e.msg || e).join('; ') : 'Purchase failed'
+          throw new Error(msg)
+        }
+        loadPurchases()
       })
+      .catch((e) => setPanelBuyError(e.message || 'Purchase failed'))
       .finally(() => setPanelBuying(null))
   }
 
@@ -166,15 +170,26 @@ export default function EditPersona() {
       body: JSON.stringify({ listing_ids: panelSelectedPackIds }),
     })
       .then(async (r) => {
-        const d = await r.json().catch(() => ({}))
+        const raw = await r.text()
+        let d = {}
+        try {
+          d = raw ? JSON.parse(raw) : {}
+        } catch {
+          d = {}
+        }
         if (!r.ok) {
           const det = d.detail
-          const msg = typeof det === 'string'
-            ? det
-            : Array.isArray(det)
-              ? det.map((e) => (e && (e.msg || e.message)) || String(e)).join('; ')
-              : 'Failed to add packs'
-          throw new Error(msg)
+          let msg
+          if (typeof det === 'string') {
+            msg = det
+          } else if (Array.isArray(det)) {
+            msg = det.map((e) => (e && (e.msg || e.message)) || String(e)).join('; ')
+          } else if (det && typeof det === 'object') {
+            msg = det.msg || det.message || JSON.stringify(det)
+          } else {
+            msg = raw?.slice(0, 200) || `Request failed (${r.status})`
+          }
+          throw new Error(msg || 'Failed to add packs')
         }
         return d
       })
@@ -186,34 +201,32 @@ export default function EditPersona() {
       .finally(() => setPackAttachLoading(false))
   }
 
-  const integrationMarketListings = marketplaceListings.filter((l) => listingType(l) === 'integration')
+  const capabilityMarketListings = marketplaceListings.filter((l) => listingType(l) === 'mcp')
   const knowledgeMarketListings = marketplaceListings.filter((l) => listingType(l) === 'knowledge_pack')
+
+  const downloadBinaryUrl = (listingId) => {
+    const t = getToken()
+    if (!t) return '#'
+    return `${API}/marketplace/${listingId}/binary?token=${encodeURIComponent(t)}`
+  }
 
   const handleSubmit = (e) => {
     e.preventDefault()
     setSaving(true)
     setError(null)
+    const trimmedMcp = {}
+    for (const [lid, url] of Object.entries(assignedMcpConfigs)) {
+      const u = (url || '').trim()
+      if (u) trimmedMcp[lid] = u
+    }
     apiFetch(`${API}/personas/${personaId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: name.trim() || undefined,
         system_prompt: systemPrompt.trim() || undefined,
-        assigned_listing_ids: assignedIds,
         assigned_role_pack_id: assignedRolePackId.trim() || null,
-        tool_credentials: (() => {
-          const out = {}
-          for (const lid of assignedIds) {
-            const row = toolCredentials[lid]
-            if (row && typeof row === 'object') {
-              const filtered = Object.fromEntries(
-                Object.entries(row).filter(([, v]) => v != null && String(v).trim() !== '')
-              )
-              if (Object.keys(filtered).length > 0) out[lid] = filtered
-            }
-          }
-          return out
-        })(),
+        assigned_mcp_configs: trimmedMcp,
       }),
     })
       .then((r) => {
@@ -272,6 +285,15 @@ export default function EditPersona() {
               </button>
             </div>
           </header>
+          {persona.integration_ready === false && (
+            <div className="integration-banner" role="alert">
+              <strong>Persona incomplete</strong>
+              <p>
+                {persona.integration_message ||
+                  'Linked services no longer have this persona’s voice or face. Delete the persona and create a new one, or re-upload a voice sample and face photo here.'}
+              </p>
+            </div>
+          )}
           <form onSubmit={handleSubmit} className="edit-form">
         <label>
           Name
@@ -304,66 +326,57 @@ export default function EditPersona() {
         )}
         <div className="edit-tools-section">
           <div className="edit-section-head">
-            <h3 className="edit-tools-title">Tools for this twyn</h3>
-            <button type="button" className="edit-marketplace-open-btn" onClick={() => openMarketplace('tools')}>
+            <h3 className="edit-tools-title">Capabilities</h3>
+            <button type="button" className="edit-marketplace-open-btn" onClick={() => openMarketplace('capabilities')}>
               Add from marketplace
             </button>
           </div>
-          {toolListings.length === 0 ? (
+          {capabilityListings.length === 0 ? (
             <div className="edit-tools-empty">
-              <p>No tools purchased yet.</p>
-              <p className="edit-tools-empty-sub">Open the marketplace panel on the right to buy tools, or visit the full marketplace.</p>
-              <button type="button" className="edit-tools-link-btn" onClick={() => openMarketplace('tools')}>Open marketplace panel →</button>
+              <p>No capabilities purchased yet.</p>
+              <p className="edit-tools-empty-sub">Open the marketplace panel to add self-hosted MCP binaries, then paste your public server URL.</p>
+              <button type="button" className="edit-tools-link-btn" onClick={() => openMarketplace('capabilities')}>Open marketplace panel →</button>
               <Link to="/marketplace" className="edit-tools-link">Full marketplace →</Link>
             </div>
           ) : (
             <>
               <div className="edit-tools-list">
-                {toolListings.map((listing) => {
-                  const isOn = assignedIds.includes(listing.id)
-                  const keys = schemaProps(listing)
-                  const configured = persona?.tool_credentials_configured && persona.tool_credentials_configured[listing.id]
+                {capabilityListings.map((listing) => {
+                  const enabled = Object.prototype.hasOwnProperty.call(assignedMcpConfigs, listing.id)
+                  const urlVal = assignedMcpConfigs[listing.id] ?? ''
                   return (
                     <div key={listing.id} className="edit-tool-block">
                       <label className="edit-tool-row">
                         <input
                           type="checkbox"
-                          checked={isOn}
-                          onChange={() => toggleTool(listing.id)}
+                          checked={enabled}
+                          onChange={(e) => toggleCapabilityEnabled(listing.id, e.target.checked)}
                         />
                         <div className="edit-tool-info">
                           {listing.logo_url && <img src={listing.logo_url} alt="" className="edit-tool-logo" />}
                           <span className="edit-tool-name">{listing.name}</span>
-                          {configured && <span className="edit-tool-cred-badge" title="Credentials saved">Saved</span>}
                         </div>
                       </label>
-                      {isOn && keys.length > 0 && (
+                      {enabled && (
                         <div className="edit-tool-creds">
-                          {keys.map((key) => {
-                            const field = (listing.tool_params_schema.properties || {})[key] || {}
-                            const isSecret = field.secret === true
-                            const label = field.label || field.title || key
-                            return (
-                              <label key={key} className="edit-tool-cred-field">
-                                {label}
-                                <input
-                                  type={isSecret ? 'password' : 'text'}
-                                  autoComplete="off"
-                                  value={(toolCredentials[listing.id] || {})[key] || ''}
-                                  onChange={(e) => setToolCredField(listing.id, key, e.target.value)}
-                                  placeholder={field.description || ''}
-                                />
-                              </label>
-                            )
-                          })}
-                          <p className="edit-tool-cred-hint">Saved credentials are not shown again; enter new values to replace.</p>
+                          <label className="edit-tool-cred-field">
+                            Your MCP server URL (public)
+                            <input
+                              type="url"
+                              value={urlVal}
+                              onChange={(e) => setMcpUrl(listing.id, e.target.value)}
+                              placeholder="https://your-host.example.com/mcp"
+                              autoComplete="off"
+                            />
+                          </label>
+                          <p className="edit-tool-cred-hint">Run the downloaded binary with your license key, then paste the reachable MCP endpoint here.</p>
                         </div>
                       )}
                     </div>
                   )
                 })}
               </div>
-              <p className="edit-tools-panel-hint">Need another tool? <button type="button" className="edit-tools-link-btn" onClick={() => openMarketplace('tools')}>Open marketplace panel</button></p>
+              <p className="edit-tools-panel-hint">Need another capability? <button type="button" className="edit-tools-link-btn" onClick={() => openMarketplace('capabilities')}>Open marketplace panel</button></p>
             </>
           )}
         </div>
@@ -421,25 +434,39 @@ export default function EditPersona() {
             <h2 className="edit-market-title">Marketplace</h2>
             <button type="button" className="edit-market-close" onClick={() => setMarketplaceOpen(false)} aria-label="Close marketplace panel">×</button>
           </div>
+          <div className="edit-market-promo-row">
+            <label className="edit-market-promo-label">
+              Promo code <span className="edit-market-promo-hint">(paid items: use twins)</span>
+              <input
+                type="text"
+                value={panelPromo}
+                onChange={(e) => setPanelPromo(e.target.value)}
+                placeholder="twins"
+                autoComplete="off"
+              />
+            </label>
+          </div>
+          {panelBuyError && <p className="edit-market-panel-error">{panelBuyError}</p>}
           <div className="edit-market-tabs">
-            <button type="button" className={marketplaceTab === 'tools' ? 'active' : ''} onClick={() => { setMarketplaceTab('tools'); setPanelSelectedPackIds([]); setPackAttachError(null) }}>Tools</button>
             <button type="button" className={marketplaceTab === 'knowledge' ? 'active' : ''} onClick={() => { setMarketplaceTab('knowledge'); setPackAttachError(null) }}>Knowledge packs</button>
+            <button type="button" className={marketplaceTab === 'capabilities' ? 'active' : ''} onClick={() => { setMarketplaceTab('capabilities'); setPanelSelectedPackIds([]); setPackAttachError(null) }}>Capabilities</button>
           </div>
           <p className="edit-market-intro">
-            {marketplaceTab === 'tools'
-              ? 'Buy tools or assign ones you already own to this twyn.'
+            {marketplaceTab === 'capabilities'
+              ? 'Buy a capability, download the binary, run it with your license key, then enable it here and paste your MCP URL.'
               : 'Buy packs, then select owned packs and add their documents to this twyn’s knowledge base.'}
           </p>
           {marketplaceLoading ? (
             <p className="edit-market-loading">Loading marketplace…</p>
-          ) : marketplaceTab === 'tools' ? (
-            integrationMarketListings.length === 0 ? (
-              <p className="edit-market-empty">No tools in the marketplace yet.</p>
+          ) : marketplaceTab === 'capabilities' ? (
+            capabilityMarketListings.length === 0 ? (
+              <p className="edit-market-empty">No capabilities in the marketplace yet.</p>
             ) : (
               <ul className="edit-market-list">
-                {integrationMarketListings.map((listing) => {
+                {capabilityMarketListings.map((listing) => {
                   const owned = isOwnedId(listing.id)
-                  const assigned = assignedIds.includes(listing.id)
+                  const enabled = Object.prototype.hasOwnProperty.call(assignedMcpConfigs, listing.id)
+                  const urlVal = assignedMcpConfigs[listing.id] ?? ''
                   return (
                     <li key={listing.id} className="edit-market-card">
                       <div className="edit-market-card-top">
@@ -449,8 +476,13 @@ export default function EditPersona() {
                           {listing.description && <span className="edit-market-card-desc">{listing.description}</span>}
                         </div>
                       </div>
-                      <div className="edit-market-card-actions">
+                      <div className="edit-market-card-actions edit-market-card-actions--stack">
                         {listing.price > 0 && <span className="edit-market-price">${Number(listing.price).toFixed(2)}/mo</span>}
+                        {owned && (
+                          <a className="edit-market-download" href={downloadBinaryUrl(listing.id)} download>
+                            Download binary
+                          </a>
+                        )}
                         {!owned ? (
                           <button
                             type="button"
@@ -461,14 +493,25 @@ export default function EditPersona() {
                             {panelBuying === listing.id ? '…' : listing.price > 0 ? 'Buy' : 'Add free'}
                           </button>
                         ) : (
-                          <label className="edit-market-assign">
-                            <input
-                              type="checkbox"
-                              checked={assigned}
-                              onChange={() => toggleTool(listing.id)}
-                            />
-                            <span>Use on this twyn</span>
-                          </label>
+                          <div className="edit-mcp-panel-fields">
+                            <label className="edit-market-assign">
+                              <input
+                                type="checkbox"
+                                checked={enabled}
+                                onChange={(e) => toggleCapabilityEnabled(listing.id, e.target.checked)}
+                              />
+                              <span>Use on this twyn</span>
+                            </label>
+                            {enabled && (
+                              <input
+                                type="url"
+                                className="edit-mcp-url-input"
+                                value={urlVal}
+                                onChange={(e) => setMcpUrl(listing.id, e.target.value)}
+                                placeholder="https://…/mcp"
+                              />
+                            )}
+                          </div>
                         )}
                       </div>
                     </li>
@@ -542,10 +585,14 @@ export default function EditPersona() {
 
       <style>{`
         .edit-shell { display: flex; align-items: stretch; min-height: 100vh; background: var(--bg-page); width: 100%; }
-        .edit-shell--panel .edit-main-col { flex: 1; min-width: 0; border-right: 1px solid var(--border); }
+        .edit-shell--panel .edit-main-col { flex: 1 1 50%; min-width: 0; border-right: 1px solid var(--border); }
+        .edit-shell--panel .edit-page { max-width: none; margin: 0; width: 100%; }
         .edit-main-col { flex: 1; min-width: 0; }
         .edit-page { padding: 2rem; max-width: 560px; margin: 0 auto; background: var(--bg-page); min-height: 100vh; }
         .edit-page header { margin-bottom: 1.5rem; }
+        .integration-banner { margin: 0 0 1.25rem; padding: 0.85rem 1rem; border-radius: var(--radius); border: 1px solid var(--error); background: rgba(220, 38, 38, 0.12); color: var(--text-primary); }
+        .integration-banner strong { display: block; margin-bottom: 0.35rem; color: var(--error); font-size: 0.9rem; }
+        .integration-banner p { margin: 0; font-size: 0.88rem; line-height: 1.45; color: var(--text-secondary); }
         .edit-header-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
         .edit-share-btn { padding: 0.45rem 0.9rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-card); color: var(--text-primary); font-weight: 600; cursor: pointer; }
         .edit-share-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
@@ -578,7 +625,6 @@ export default function EditPersona() {
         .edit-tool-logo { width: 24px; height: 24px; object-fit: contain; }
         .edit-tool-name { font-size: 0.9rem; font-weight: 500; color: var(--text-primary); }
         .edit-tool-block { display: flex; flex-direction: column; gap: 0.35rem; }
-        .edit-tool-cred-badge { font-size: 0.7rem; font-weight: 600; color: var(--primary); margin-left: 0.35rem; }
         .edit-tool-creds { margin: 0 0 0.5rem 1.85rem; padding: 0.6rem 0.75rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-page); }
         .edit-tool-cred-field { display: block; margin-bottom: 0.6rem; font-size: 0.8rem; color: var(--text-muted); }
         .edit-tool-cred-field input { width: 100%; margin-top: 0.2rem; padding: 0.4rem 0.5rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-input); color: var(--text-primary); }
@@ -608,7 +654,12 @@ export default function EditPersona() {
         .edit-tools-empty-sub { font-size: 0.85rem; color: var(--text-muted); margin: 0; }
         .edit-tools-link-btn { align-self: flex-start; background: none; border: none; color: var(--primary); font-weight: 600; cursor: pointer; font-size: 0.9rem; padding: 0; text-align: left; }
         .edit-tools-link-btn:hover { text-decoration: underline; }
-        .edit-market-col { width: min(380px, 100%); flex-shrink: 0; padding: 1rem 1rem 2rem; background: var(--bg-card); border-left: 1px solid var(--border); position: sticky; top: 0; align-self: flex-start; max-height: 100vh; overflow-y: auto; }
+        .edit-market-col { flex: 1 1 50%; min-width: 0; padding: 1rem 1rem 2rem; background: var(--bg-card); border-left: 1px solid var(--border); position: sticky; top: 0; align-self: flex-start; max-height: 100vh; overflow-y: auto; }
+        .edit-market-promo-row { margin-bottom: 0.75rem; }
+        .edit-market-promo-label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.8rem; font-weight: 600; color: var(--text-primary); }
+        .edit-market-promo-hint { font-weight: 400; color: var(--text-muted); font-size: 0.75rem; }
+        .edit-market-promo-label input { padding: 0.4rem 0.5rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-input); color: var(--text-primary); font-size: 0.85rem; }
+        .edit-market-panel-error { color: var(--error); font-size: 0.85rem; margin: 0 0 0.5rem; }
         .edit-market-header { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.75rem; }
         .edit-market-title { font-family: var(--font-heading); font-size: 1.1rem; font-weight: 700; margin: 0; color: var(--text-primary); }
         .edit-market-close { background: none; border: none; font-size: 1.5rem; line-height: 1; color: var(--text-muted); cursor: pointer; padding: 0 0.25rem; }
@@ -627,10 +678,15 @@ export default function EditPersona() {
         .edit-market-card-meta { font-size: 0.75rem; color: var(--text-muted); }
         .edit-market-card-desc { font-size: 0.75rem; color: var(--text-muted); line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
         .edit-market-card-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid var(--border); }
+        .edit-market-card-actions--stack { flex-direction: column; align-items: stretch; }
         .edit-market-price { font-size: 0.8rem; color: var(--text-muted); }
         .edit-market-buy { padding: 0.35rem 0.65rem; font-size: 0.8rem; font-weight: 600; border-radius: var(--radius); border: none; background: var(--primary); color: #fff; cursor: pointer; }
         .edit-market-buy:hover:not(:disabled) { background: var(--primary-hover); }
         .edit-market-buy:disabled { opacity: 0.6; cursor: not-allowed; }
+        .edit-market-download { font-size: 0.8rem; font-weight: 600; color: var(--primary); text-decoration: none; align-self: flex-start; }
+        .edit-market-download:hover { text-decoration: underline; }
+        .edit-mcp-panel-fields { display: flex; flex-direction: column; gap: 0.4rem; width: 100%; }
+        .edit-mcp-url-input { width: 100%; padding: 0.35rem 0.5rem; font-size: 0.8rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-input); color: var(--text-primary); }
         .edit-market-assign { display: flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; color: var(--text-primary); cursor: pointer; }
         .edit-market-assign input { accent-color: var(--primary); }
         .edit-market-pack-footer { margin-top: 1rem; }

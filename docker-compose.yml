@@ -1,5 +1,5 @@
 # TwynBook: single container (frontend + backend)
-# Uses .env in this folder for OPENAI_API_KEY, CHATTERBOX_BASE_URL, DITTO_API_URL, etc.
+# Uses .env in this folder for OLLAMA_URL, CHATTERBOX_BASE_URL, DITTO_API_URL, etc.
 # Build: docker compose build
 # Run:   docker compose up -d
 # App:   http://localhost:8087  (API at /api, frontend at /)
@@ -10,7 +10,7 @@
 # the host's real IP (e.g. 192.168.x.x or your public IP). App listens on host:8087.
 #
 # To reach Ditto/Chatterbox on the host from inside the container, use 127.0.0.1 when
-# using host network (same machine). In .env set e.g. DITTO_API_URL=http://127.0.0.1:8080.
+# using host network (same machine). Ditto: local `ditto-api` from ditto-talkinghead compose is published on host 8082 (see DITTO_API_URL below).
 
 services:
   app:
@@ -25,7 +25,11 @@ services:
       - DATA_DIR=/app/data
       - STATIC_DIR=/app/static
       - DITTO_STREAMING=1
-      - DITTO_API_URLS=http://127.0.0.1:8080,http://127.0.0.1:8081
+      - DITTO_API_URL=http://127.0.0.1:8082
+      - DITTO_API_URLS=http://127.0.0.1:8082
+      # Streaming Ditto: faces saved under DATA_DIR/ditto_faces; Ditto fetches via HTTP from the host (see env.example).
+      - DITTO_FACE_FETCH_BASE_URL=${DITTO_FACE_FETCH_BASE_URL:-http://172.17.0.1:8087}
+      - DITTO_INTERNAL_FACE_SECRET=${DITTO_INTERNAL_FACE_SECRET:-}
       # WebRTC media server is same process at /webrtc; backend pushes segments here
       - MEDIA_SERVER_WS_URL=ws://localhost:8087/webrtc
       - STT_BASE_URL=http://127.0.0.1:8090
@@ -54,8 +58,13 @@ services:
       - AUDIO_CONTINUOUS=0
       - AUDIO_CLIP_MIN_CHARS=0
       - AUDIO_FIRST_CLIP_SENTENCES=1
+      # Video: merge LLM sentences until at least VIDEO_CLIP_MIN_CHARS (short "Hi." + "How are you?" → one Ditto clip).
+      - VIDEO_CLIP_MIN_CHARS=52
+      - VIDEO_CLIP_MAX_SENTENCES=8
+      # If VIDEO_CLIP_MIN_CHARS=0, fall back to fixed batch size:
+      - VIDEO_SENTENCES_PER_CLIP=2
       - AUDIO_SENTENCES_PER_CLIP=1
-      - VIDEO_FIRST_CLIP_SENTENCES=2
+      # Video uses the same sentence batching as audio (AUDIO_FIRST_*); Ditto runs after TTS only.
       - XTTS_BASE_URL=http://127.0.0.1:8002
       - CHATTERBOX_BASE_URL=http://127.0.0.1:8000
       - TURN_URL=turn:178.194.34.219:3478?transport=udp,turn:178.194.34.219:3478?transport=tcp
@@ -63,11 +72,26 @@ services:
       - TURN_PASSWORD=twynbook
       - OLLAMA_URL=http://127.0.0.1:11434
       - OLLAMA_MODEL=qwen2.5:3b
-      # KB embeddings use qwen2.5:3b via RAG_OLLAMA_EMBED_MODEL default (same as OLLAMA_MODEL)
-      - RAG_OLLAMA_EMBED_MODEL=qwen2.5:3b
-      - RAG_EMBED_BACKEND=auto
+      # Trim WebSocket chat context (excluding system): last N user/assistant pairs worth of messages.
+      - CHAT_HISTORY_MAX=5
+      # Ask Ollama to keep the chat model loaded between requests (OpenAI compat keep_alive); pairs with server OLLAMA_KEEP_ALIVE.
+      - OLLAMA_KEEP_ALIVE_REQUEST=15m
+      # KB embeddings default to OLLAMA_MODEL in app code. Override with RAG_OLLAMA_EMBED_MODEL only if you use a dedicated embed model.
       - OLLAMA_ENABLE_TOOLS=1
       - OLLAMA_MAX_TOOL_ROUNDS=3
+      # LLM first-token / per-sentence wait (default 120s in code); avoids 0-clip video when Ollama is slow.
+      - CHAT_LLM_QUEUE_TIMEOUT_SEC=180
+      # RTC STT VAD: min_ms alone cannot be huge or short words never flush; use fallback with stricter long silence + noise_min.
+      - RTC_VAD_RMS_THRESHOLD=0.020
+      - RTC_VAD_MIN_SPEECH_MS=550
+      # Silence needed before a segment is cut and sent to STT; too low = cuts you off mid-thought on short pauses.
+      - RTC_VAD_SILENCE_MS=980
+      - RTC_VAD_LONG_SILENCE_MS=2200
+      - RTC_VAD_NOISE_MIN_MS=380
+      - RTC_VAD_ENABLE_SHORT_FALLBACK=1
+      # TTS→Ditto f32 pads (ms). Default off in code; enable only if clip-boundary mux pops return.
+      - DITTO_SILENCE_PRE_MS=0
+      - DITTO_SILENCE_POST_MS=0
     volumes:
       - twynbook-data:/app/data
     restart: unless-stopped
@@ -85,6 +109,7 @@ services:
       - STT_DEVICE=cuda
       - STT_COMPUTE_TYPE=float16
       - STT_VAD_FILTER=false
+      # GPU 0 with ditto-api (ditto-talkinghead). Ollama runs on GPU 2 (local-ai-stack); Chatterbox on GPU 1.
       - NVIDIA_VISIBLE_DEVICES=0
 
   turn:
@@ -109,19 +134,34 @@ services:
     volumes:
       - mongodb-data:/data/db
 
+  # Chatterbox voice clones live under /app/uploaded_voices and /app/voices — mount host dirs so container
+  # restarts do not wipe voices. Image name matches common local build (override with CHATTERBOX_IMAGE if needed).
+  #
+  # If TTS returns HTTP 500 with "CUDA out of memory" in chatterbox logs, Chatterbox is sharing a GPU with
+  # Ditto/streaming — keep NVIDIA_VISIBLE_DEVICES on a different GPU than Ditto, or stop other GPU workloads.
+  # "Connection refused" to localhost:27017 means MongoDB is not listening on the host; start the `mongodb`
+  # service above or fix MONGODB_URI in docker-data/.env.chatterbox.runtime.
   chatterbox:
-    image: voice-cloning-chatterbox:latest
-    container_name: chatterbox-voice-cloning
+    image: ${CHATTERBOX_IMAGE:-app-chatterbox-api:latest}
+    container_name: chatterbox-api
     runtime: nvidia
     network_mode: host
     restart: unless-stopped
+    # Regenerate before first `compose up chatterbox`: see scripts/export-chatterbox-env.sh
+    env_file:
+      - ./docker-data/.env.chatterbox.runtime
     environment:
       - MONGODB_URI=mongodb://localhost:27017
-      - NVIDIA_VISIBLE_DEVICES=0
-    depends_on:
-      - mongodb
+      # GPU 1: Chatterbox only. Ollama is on GPU 2 (local-ai-stack); Ditto+STT on GPU 0.
+      - NVIDIA_VISIBLE_DEVICES=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # Host dirs must be writable by the container user (often uid 1000). If Chatterbox crashes on startup
+    # with PermissionError on /app/logs, run once: chmod -R a+rwx ./docker-data/chatterbox
     volumes:
-      - /home/nbrown/twynbook/backend/scripts:/voices
+      - ./docker-data/chatterbox/uploaded_voices:/app/uploaded_voices
+      - ./docker-data/chatterbox/voices:/app/voices
+      - ./docker-data/chatterbox/uploads:/app/uploads
+      - ./docker-data/chatterbox/logs:/app/logs
 
 volumes:
   twynbook-data:

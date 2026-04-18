@@ -1,9 +1,10 @@
 """
-TwynBook backend: personas (JSON store), Ditto + Chatterbox + OpenAI.
-Endpoints: personas CRUD, create persona (face→Ditto, voice→Chatterbox, idle video), chat (OpenAI→TTS→Ditto).
+TwynBook backend: personas (JSON store), Ditto + Chatterbox + Ollama (local LLM).
+Endpoints: personas CRUD, create persona (face→Ditto, voice→Chatterbox, idle video), chat (Ollama→TTS→Ditto).
 """
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import io
 import itertools
 import json
@@ -32,7 +33,7 @@ from websockets.exceptions import ConnectionClosed
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 try:
@@ -58,7 +59,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
-from openai import OpenAI
 
 # Chatterbox TTS has a 1000-character limit per request
 TTS_MAX_CHARS = 240
@@ -72,9 +72,11 @@ SENTENCES_PER_CLIP = 2
 # Audio-mode sentence grouping (reduce TTS gaps between clips).
 AUDIO_FIRST_CLIP_SENTENCES = int(os.environ.get("AUDIO_FIRST_CLIP_SENTENCES", "1"))
 AUDIO_SENTENCES_PER_CLIP = int(os.environ.get("AUDIO_SENTENCES_PER_CLIP", "1"))
-# Video mode: first clip uses more sentences so the longer audio gives Ditto time to
-# pre-render clip 1 before clip 0 finishes playing (avoids the clip-0→1 stall gap).
-VIDEO_FIRST_CLIP_SENTENCES = int(os.environ.get("VIDEO_FIRST_CLIP_SENTENCES", str(AUDIO_FIRST_CLIP_SENTENCES)))
+# Video: when VIDEO_CLIP_MIN_CHARS<=0, batch exactly this many sentences per clip (legacy).
+VIDEO_SENTENCES_PER_CLIP = max(1, min(int(os.environ.get("VIDEO_SENTENCES_PER_CLIP", "2") or 2), 8))
+# Video: merge consecutive short sentences until at least this many chars (e.g. "Hi." + "How are you?"); one long sentence still forms one clip.
+VIDEO_CLIP_MIN_CHARS = int(os.environ.get("VIDEO_CLIP_MIN_CHARS", "52") or 52)
+VIDEO_CLIP_MAX_SENTENCES = max(1, min(int(os.environ.get("VIDEO_CLIP_MAX_SENTENCES", "8") or 8), 16))
 # Audio-mode continuous chunking (no sentence boundaries)
 AUDIO_CONTINUOUS = os.environ.get("AUDIO_CONTINUOUS", "0").lower() in ("1", "true", "yes", "on")
 AUDIO_CHUNK_CHARS = int(os.environ.get("AUDIO_CHUNK_CHARS", "60"))
@@ -82,6 +84,8 @@ AUDIO_CHUNK_CHARS = int(os.environ.get("AUDIO_CHUNK_CHARS", "60"))
 AUDIO_HISTORY_MAX = int(os.environ.get("AUDIO_HISTORY_MAX", "6"))
 # Video / typed WebSocket chat: max messages to send to the LLM (0 = no trim — full persona conversation).
 CHAT_HISTORY_MAX = int(os.environ.get("CHAT_HISTORY_MAX", "0"))
+# Max seconds to wait for each sentence from the LLM worker queue (cold Ollama / huge context can exceed 30s).
+CHAT_LLM_QUEUE_TIMEOUT_SEC = float(os.environ.get("CHAT_LLM_QUEUE_TIMEOUT_SEC", "120") or 120)
 # Audio-mode max chars per clip (optional; when unset, keep full sentence).
 AUDIO_CLIP_MAX_CHARS = int(os.environ.get("AUDIO_CLIP_MAX_CHARS", "240"))
 # TTS provider selection for audio mode
@@ -104,9 +108,10 @@ F5_TTS_BASE_URL = os.environ.get("F5_TTS_BASE_URL", "").strip().rstrip("/")
 QWEN3_TTS_BASE_URL = os.environ.get("QWEN3_TTS_BASE_URL", "").strip().rstrip("/")
 QWEN3_TTS_LANGUAGE = (os.environ.get("QWEN3_TTS_LANGUAGE", "English") or "English").strip()
 XTTS_LANGUAGE = os.environ.get("XTTS_LANGUAGE", "en").strip()
-# Add a small silence pad to smooth starts/ends of video clips (video mode only).
-DITTO_SILENCE_PRE_MS = int(os.environ.get("DITTO_SILENCE_PRE_MS", "120"))
-DITTO_SILENCE_POST_MS = int(os.environ.get("DITTO_SILENCE_POST_MS", "180"))
+# Optional f32 silence before/after each TTS clip fed to Ditto (video mode only). Default 0 — pads can hurt lip-sync;
+# set small values (e.g. 40–80) only if you see A/V pops at fMP4 clip joins.
+DITTO_SILENCE_PRE_MS = int(os.environ.get("DITTO_SILENCE_PRE_MS", "0") or 0)
+DITTO_SILENCE_POST_MS = int(os.environ.get("DITTO_SILENCE_POST_MS", "0") or 0)
 # Chatterbox TTS streaming (TwynBook-only; does not affect other providers)
 CB_FFMPEG_LOW_LATENCY = os.environ.get("CB_FFMPEG_LOW_LATENCY", "1").strip().lower() in ("1", "true", "yes", "on")
 CB_HTTP_CHUNK_SIZE = max(4096, int(os.environ.get("CB_HTTP_CHUNK_SIZE", "32768")))
@@ -461,6 +466,8 @@ class PersonaUpdate(BaseModel):
     system_prompt: str | None = None
     assigned_listing_ids: list[str] | None = None
     assigned_role_pack_id: str | None = None  # one role pack per twyn
+    # Self-hosted capability (mcp listing) -> user's public MCP endpoint URL
+    assigned_mcp_configs: dict[str, str] | None = None
 
 
 class KnowledgePacksAttach(BaseModel):
@@ -480,6 +487,14 @@ class UserSignup(BaseModel):
 class UserLogin(BaseModel):
     email: str
     password: str
+
+
+class ValidateLicenseBody(BaseModel):
+    license_key: str = ""
+
+
+class PurchaseBody(BaseModel):
+    promo_code: str | None = None
 
 
 class ListingCreate(BaseModel):
@@ -533,6 +548,8 @@ app.add_middleware(
 # Config (needed before optional webrtc mount)
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+DITTO_FACES_DIR = DATA_DIR / "ditto_faces"
+DITTO_FACES_DIR.mkdir(parents=True, exist_ok=True)
 PERSONAS_FILE = DATA_DIR / "personas.json"
 USERS_FILE = DATA_DIR / "users.json"
 LISTINGS_FILE = DATA_DIR / "listings.json"
@@ -544,17 +561,101 @@ JWT_EXPIRY_DAYS = 7
 ADMIN_EMAIL = "n.brown@4th-ir.com"
 http_bearer = HTTPBearer(auto_error=False)
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", ""))  # When set (e.g. in Docker), serve frontend from here
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OLLAMA_URL = (os.environ.get("OLLAMA_URL", "") or "").strip().rstrip("/")  # e.g. http://ollama:11434
+OLLAMA_URL = (os.environ.get("OLLAMA_URL", "") or "").strip().rstrip("/")  # e.g. http://127.0.0.1:11434
 OLLAMA_MODEL = (os.environ.get("OLLAMA_MODEL", "") or "llama3.2:3b").strip() or "llama3.2:3b"
+# Ollama /api/embeddings model (pull separately, e.g. nomic-embed-text); defaults to chat model if unset
+RAG_OLLAMA_EMBED_MODEL = (
+    (os.environ.get("RAG_OLLAMA_EMBED_MODEL") or os.environ.get("OLLAMA_MODEL") or "nomic-embed-text").strip()
+    or "nomic-embed-text"
+)
+# When 1, MCP tools use Ollama OpenAI-compatible /v1/chat/completions with tools; when 0, tool names are only described in the system prompt.
+OLLAMA_NATIVE_TOOLS = (os.environ.get("OLLAMA_NATIVE_TOOLS") or "1").strip().lower() in ("1", "true", "yes")
+# Optional OpenAI-compat field for /v1/chat/completions (e.g. "15m") — keeps the loaded model in memory between requests.
+OLLAMA_KEEP_ALIVE_REQUEST = (os.environ.get("OLLAMA_KEEP_ALIVE_REQUEST") or "").strip() or None
 CHATTERBOX_BASE_URL = (os.environ.get("CHATTERBOX_BASE_URL", "http://85.4.52.192:8000")).rstrip("/")
 STT_BASE_URL = (os.environ.get("STT_BASE_URL", "") or "").strip().rstrip("/")
-DITTO_API_URL = (os.environ.get("DITTO_API_URL", "http://localhost:8080")).rstrip("/")
+DITTO_API_URL = (os.environ.get("DITTO_API_URL", "http://localhost:8082")).rstrip("/")
 DITTO_API_URLS = [
     u.strip().rstrip("/")
     for u in (os.environ.get("DITTO_API_URLS", "") or "").split(",")
     if u.strip()
 ]
+# Ditto persona REST collection URL (no trailing /{id}). Newer Ditto builds often mount at /api/personas; older at /personas.
+DITTO_PERSONAS_BASE_URL = (os.environ.get("DITTO_PERSONAS_BASE_URL") or "").strip().rstrip("/")
+# Streaming Ditto (no REST /personas): store face on disk here; Ditto pulls it over HTTP from TwynBook using DITTO_FACE_FETCH_BASE_URL + shared secret.
+DITTO_FACE_FETCH_BASE_URL = (os.environ.get("DITTO_FACE_FETCH_BASE_URL") or "").strip().rstrip("/")
+DITTO_INTERNAL_FACE_SECRET = (os.environ.get("DITTO_INTERNAL_FACE_SECRET") or "").strip()
+_ditto_personas_collection_resolved: str | None = None
+
+
+def _streaming_local_face(d: dict | None) -> bool:
+    """Face stored locally for streaming Ditto (no REST /personas). Legacy value file_storage kept for old records."""
+    return (d or {}).get("ditto_face_mode") in ("ditto_streaming_local", "file_storage")
+
+
+def _ditto_persona_collection_candidates() -> list[str]:
+    global _ditto_personas_collection_resolved
+    if _ditto_personas_collection_resolved:
+        return [_ditto_personas_collection_resolved]
+    if DITTO_PERSONAS_BASE_URL:
+        return [DITTO_PERSONAS_BASE_URL]
+    root = (DITTO_API_URL or "").strip().rstrip("/")
+    if not root:
+        return []
+    return [f"{root}/api/personas", f"{root}/personas"]
+
+
+def _ditto_mark_persona_collection(collection_url: str) -> None:
+    global _ditto_personas_collection_resolved
+    _ditto_personas_collection_resolved = collection_url.rstrip("/")
+
+
+def _ditto_preview_url_for_image(image_id: str) -> str:
+    """Absolute Ditto preview URL for storage/UI fallback (uses resolved or preferred candidate)."""
+    bases = _ditto_persona_collection_candidates()
+    root = (DITTO_API_URL or "").strip().rstrip("/") or ""
+    base = bases[0] if bases else f"{root}/personas"
+    return f"{base.rstrip('/')}/{image_id}/preview"
+
+
+def _ditto_get_persona_resource(image_id: str, resource: str, timeout: float = 10.0) -> httpx.Response:
+    """GET {collection}/{image_id}/{resource}. Tries each collection until non-404 success or raises."""
+    candidates = _ditto_persona_collection_candidates()
+    if not candidates:
+        raise httpx.ConnectError("Ditto persona endpoints not configured (DITTO_API_URL empty)")
+    last_r: httpx.Response | None = None
+    for coll in candidates:
+        url = f"{coll.rstrip('/')}/{image_id}/{resource}"
+        with httpx.Client(timeout=timeout) as client:
+            last_r = client.get(url)
+        if last_r.status_code == 404:
+            continue
+        last_r.raise_for_status()
+        _ditto_mark_persona_collection(coll)
+        return last_r
+    assert last_r is not None
+    last_r.raise_for_status()
+    return last_r
+
+
+def _ditto_post_persona_subresource(image_id: str, resource: str, timeout: float = 12.0) -> httpx.Response:
+    """POST {collection}/{image_id}/{resource} (e.g. prime). Tries each collection until non-404."""
+    candidates = _ditto_persona_collection_candidates()
+    if not candidates:
+        raise httpx.ConnectError("Ditto persona endpoints not configured (DITTO_API_URL empty)")
+    last_r: httpx.Response | None = None
+    for coll in candidates:
+        url = f"{coll.rstrip('/')}/{image_id}/{resource}"
+        with httpx.Client(timeout=timeout) as client:
+            last_r = client.post(url)
+        if last_r.status_code == 404:
+            continue
+        if last_r.is_success:
+            _ditto_mark_persona_collection(coll)
+        return last_r
+    assert last_r is not None
+    return last_r
+
 
 # WebRTC media server (signaling + push) on same process at /webrtc; optional so app starts if aiortc/av fail
 MEDIA_SERVER_WS_URL = (os.environ.get("MEDIA_SERVER_WS_URL", "ws://localhost:8087/webrtc")).rstrip("/")
@@ -573,20 +674,46 @@ KB_DIR = DATA_DIR / "kb"
 KB_DIR.mkdir(parents=True, exist_ok=True)
 KB_PACKS_DIR = DATA_DIR / "kb_packs"
 KB_PACKS_DIR.mkdir(parents=True, exist_ok=True)
+# Sync FastAPI routes run in a thread pool — no asyncio loop; use threads for KB embedding jobs.
+_KB_PROCESS_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="kb_doc")
+MCP_BINARIES_DIR = DATA_DIR / "mcp_binaries"
+MCP_BINARIES_DIR.mkdir(parents=True, exist_ok=True)
+LISTING_LOGOS_DIR = DATA_DIR / "listing_logos"
+LISTING_LOGOS_DIR.mkdir(parents=True, exist_ok=True)
+LISTING_LOGO_MAX_BYTES = 2 * 1024 * 1024
+LISTING_LOGO_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+LISTING_LOGO_MEDIA = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _ollama_payload_with_keepalive(payload: dict) -> dict:
+    """Merge keep_alive into Ollama chat payloads when OLLAMA_KEEP_ALIVE_REQUEST is set."""
+    if not OLLAMA_KEEP_ALIVE_REQUEST:
+        return payload
+    out = dict(payload)
+    out["keep_alive"] = OLLAMA_KEEP_ALIVE_REQUEST
+    return out
 
 
 def _ollama_warmup():
     if not OLLAMA_URL:
         return
     url = f"{OLLAMA_URL}/v1/chat/completions"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Say hi."},
-        ],
-        "stream": False,
-    }
+    payload = _ollama_payload_with_keepalive(
+        {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Say hi."},
+            ],
+            "stream": False,
+        }
+    )
     try:
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(url, json=payload)
@@ -623,12 +750,13 @@ async def _startup_warmup():
                 except Exception as e:
                     log.warning("CosyVoice startup cache failed: %s", e)
             threading.Thread(target=_cosyvoice_cache_all, daemon=True).start()
-RAG_EMBED_MODEL = "text-embedding-3-small"
 RAG_CHUNK_TOKENS = 500
 RAG_OVERLAP_TOKENS = 50
 RAG_TOP_K = 5
 RAG_RELEVANCE_THRESHOLD = 0.25  # min cosine similarity to inject context; below = use general knowledge only
 KNOWLEDGE_PACK_MAX_DOCS = 5
+# Redeem paid listings without payment (case-insensitive). Override via MARKETPLACE_PROMO_CODE.
+MARKETPLACE_PROMO_CODE = (os.environ.get("MARKETPLACE_PROMO_CODE") or "twins").strip().lower()
 
 
 def _kb_persona_dir(persona_id: str) -> Path:
@@ -639,6 +767,50 @@ def _kb_persona_dir(persona_id: str) -> Path:
 
 def _kb_pack_dir(listing_id: str) -> Path:
     return KB_PACKS_DIR / listing_id
+
+
+def _mcp_binary_dir(listing_id: str) -> Path:
+    return MCP_BINARIES_DIR / listing_id
+
+
+def _listing_logo_disk_path(listing_id: str) -> Path | None:
+    d = LISTING_LOGOS_DIR / listing_id
+    if not d.is_dir():
+        return None
+    for ext in LISTING_LOGO_EXTS:
+        p = d / f"logo{ext}"
+        if p.is_file():
+            return p
+    return None
+
+
+def _delete_listing_logo_files(listing_id: str) -> None:
+    d = LISTING_LOGOS_DIR / listing_id
+    if d.is_dir():
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _public_listing_logo_url(listing_id: str) -> str:
+    return f"/api/marketplace/{listing_id}/logo"
+
+
+async def _save_listing_logo_upload(listing_id: str, upload: UploadFile) -> str:
+    """Write uploaded image to disk; returns logo_url value for the listing JSON."""
+    raw = await upload.read()
+    if not raw:
+        raise HTTPException(400, "Empty logo file")
+    if len(raw) > LISTING_LOGO_MAX_BYTES:
+        raise HTTPException(400, f"Logo must be at most {LISTING_LOGO_MAX_BYTES // (1024 * 1024)}MB")
+    name = (upload.filename or "logo").lower()
+    ext = Path(name).suffix.lower()
+    if ext not in LISTING_LOGO_EXTS:
+        raise HTTPException(400, "Logo must be PNG, JPG, JPEG, WebP, or GIF")
+    _delete_listing_logo_files(listing_id)
+    d = LISTING_LOGOS_DIR / listing_id
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"logo{ext}"
+    path.write_bytes(raw)
+    return _public_listing_logo_url(listing_id)
 
 
 def _load_pack_manifest(listing_id: str) -> list[dict]:
@@ -689,12 +861,28 @@ def _chunk_text_by_tokens(text: str, max_tokens: int = RAG_CHUNK_TOKENS, overlap
     return chunks
 
 
-def _embed_texts(client: OpenAI, texts: list[str]) -> list[list[float]]:
-    if not texts:
-        return []
-    resp = client.embeddings.create(model=RAG_EMBED_MODEL, input=texts)
-    by_index = {e.index: e.embedding for e in resp.data}
-    return [by_index.get(i, []) for i in range(len(texts))]
+def _embed_texts_ollama(texts: list[str]) -> list[list[float]]:
+    """Embeddings via Ollama POST /api/embeddings (one request per text)."""
+    if not texts or not OLLAMA_URL:
+        return [[] for _ in texts]
+    url = f"{OLLAMA_URL}/api/embeddings"
+    model = RAG_OLLAMA_EMBED_MODEL
+    out: list[list[float]] = []
+    try:
+        with httpx.Client(timeout=120.0) as h:
+            for t in texts:
+                r = h.post(url, json={"model": model, "prompt": t})
+                r.raise_for_status()
+                data = r.json()
+                emb = data.get("embedding")
+                if isinstance(emb, list):
+                    out.append([float(x) for x in emb])
+                else:
+                    out.append([])
+    except Exception as e:
+        log.warning("Ollama embeddings failed model=%s: %s", model, e)
+        return [[] for _ in texts]
+    return out
 
 
 def _load_persona_chunks(persona_id: str) -> list[dict]:
@@ -734,8 +922,7 @@ def _process_document_sync(persona_id: str, doc_id: str, file_path: Path, filena
     chunks_text = _chunk_text_by_tokens(text.strip())
     if not chunks_text:
         return
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    embeddings = _embed_texts(client, chunks_text)
+    embeddings = _embed_texts_ollama(chunks_text)
     existing = _load_persona_chunks(persona_id)
     for i, (ct, emb) in enumerate(zip(chunks_text, embeddings)):
         if not emb:
@@ -757,10 +944,9 @@ def get_rag_context(persona_id: str, user_id: str, query: str) -> str:
     chunks = _load_persona_chunks(persona_id)
     if not chunks or not (query or "").strip():
         return ""
-    if not OPENAI_API_KEY:
+    if not OLLAMA_URL:
         return ""
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    q_emb = _embed_texts(client, [query.strip()])
+    q_emb = _embed_texts_ollama([query.strip()])
     if not q_emb or not q_emb[0]:
         return ""
     q_vec = q_emb[0]
@@ -878,6 +1064,20 @@ def load_users() -> list[dict]:
 def save_users(users: list[dict]) -> None:
     with open(USERS_FILE, "w") as f:
         json.dump(users, f, indent=2)
+
+
+def _ensure_user_license_key(user_id: str) -> str | None:
+    """Return persisted license_key; generate and save if missing (legacy accounts)."""
+    users = load_users()
+    for i, u in enumerate(users):
+        if u.get("id") == user_id:
+            key = (u.get("license_key") or "").strip()
+            if not key:
+                key = secrets.token_hex(24)
+                users[i]["license_key"] = key
+                save_users(users)
+            return key
+    return None
 
 
 def get_user_by_email(email: str) -> dict | None:
@@ -1032,6 +1232,27 @@ def _mcp_list_tools(url: str, timeout: float = 10.0) -> list[dict]:
         return data.get("result", {}).get("tools", [])
 
 
+def _add_tools_from_mcp_url(mcp_url: str, tools_for_llm: list, tool_name_to_url: dict) -> None:
+    """Append function-style tool defs (Ollama/OpenAI-compatible) from one MCP endpoint."""
+    mcp_url = (mcp_url or "").strip()
+    if not mcp_url:
+        return
+    try:
+        mcp_tools = _mcp_list_tools(mcp_url)
+        for t in mcp_tools:
+            tools_for_llm.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": t.get("inputSchema", {"type": "object", "properties": {}}),
+                },
+            })
+            tool_name_to_url[t["name"]] = mcp_url
+    except Exception as mcp_err:
+        log.warning("MCP list_tools failed %s: %s", mcp_url, mcp_err)
+
+
 def _mcp_execute_tool(url: str, tool_name: str, arguments: dict, timeout: float = 60.0) -> dict:
     """Call remote MCP server to execute a tool (JSON-RPC 2.0). Returns result dict."""
     url = _mcp_normalize_url(url)
@@ -1051,39 +1272,71 @@ def _mcp_execute_tool(url: str, tool_name: str, arguments: dict, timeout: float 
         return data.get("result", {})
 
 
-def _run_with_tools_sync(client, messages: list, tools: list, tool_name_to_url: dict) -> str:
-    """Non-streaming: call OpenAI with tools, handle tool_calls loop, return final text."""
-    from openai import NOT_GIVEN
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        tools=tools if tools else NOT_GIVEN,
-        tool_choice="auto" if tools else NOT_GIVEN,
-    )
-    msg = resp.choices[0].message
-    if not msg.tool_calls:
-        return msg.content or ""
+def _ollama_chat_completions_sync(
+    ollama_url: str,
+    model: str,
+    messages: list,
+    tools: list | None = None,
+    tool_choice: str | None = "auto",
+) -> dict:
+    """POST /v1/chat/completions (OpenAI-compatible). Returns parsed JSON."""
+    url = f"{ollama_url.rstrip('/')}/v1/chat/completions"
+    body: dict = {"model": model, "messages": messages, "stream": False}
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = tool_choice or "auto"
+    body = _ollama_payload_with_keepalive(body)
+    with httpx.Client(timeout=180.0) as h:
+        r = h.post(url, json=body)
+        r.raise_for_status()
+        return r.json()
 
-    # Append assistant message with tool_calls
-    updated = list(messages) + [{
-        "role": "assistant",
-        "content": msg.content,
-        "tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ],
-    }]
 
-    # Execute each tool via MCP
-    for tc in msg.tool_calls:
-        mcp_url = tool_name_to_url.get(tc.function.name)
+def _run_with_tools_ollama_sync(
+    ollama_url: str,
+    model: str,
+    messages: list,
+    tools: list,
+    tool_name_to_url: dict,
+) -> str:
+    """Non-streaming: Ollama chat + tool_calls, MCP execution, one follow-up completion."""
+    data = _ollama_chat_completions_sync(ollama_url, model, messages, tools=tools, tool_choice="auto")
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content = msg.get("content") or ""
+    tool_calls = msg.get("tool_calls") or []
+    if not tool_calls:
+        return content
+
+    def _tc_id(tc):
+        return tc.get("id") or ""
+
+    def _tc_name(tc):
+        fn = tc.get("function") or {}
+        return (fn.get("name") or "").strip()
+
+    def _tc_args(tc):
+        fn = tc.get("function") or {}
+        raw = fn.get("arguments") or "{}"
         try:
-            args = json.loads(tc.function.arguments)
+            return json.loads(raw) if isinstance(raw, str) else (raw or {})
         except Exception:
-            args = {}
+            return {}
+
+    updated = list(messages) + [
+        {
+            "role": "assistant",
+            "content": content or None,
+            "tool_calls": tool_calls,
+        }
+    ]
+
+    for tc in tool_calls:
+        name = _tc_name(tc)
+        mcp_url = tool_name_to_url.get(name)
         try:
             if mcp_url:
-                result = _mcp_execute_tool(mcp_url, tc.function.name, args)
+                result = _mcp_execute_tool(mcp_url, name, _tc_args(tc))
                 parts = result.get("content", [])
                 if parts:
                     content_str = "\n".join(
@@ -1093,14 +1346,15 @@ def _run_with_tools_sync(client, messages: list, tools: list, tool_name_to_url: 
                 else:
                     content_str = json.dumps(result)
             else:
-                content_str = f"Tool '{tc.function.name}' is not available."
+                content_str = f"Tool '{name}' is not available."
         except Exception as e:
             content_str = f"Tool execution error: {e}"
-        updated.append({"role": "tool", "tool_call_id": tc.id, "content": content_str})
+        updated.append({"role": "tool", "tool_call_id": _tc_id(tc), "content": content_str})
 
-    # Final LLM call to generate a natural reply
-    resp2 = client.chat.completions.create(model="gpt-4o-mini", messages=updated)
-    return resp2.choices[0].message.content or ""
+    data2 = _ollama_chat_completions_sync(ollama_url, model, updated, tools=None)
+    choice2 = (data2.get("choices") or [{}])[0]
+    msg2 = choice2.get("message") or {}
+    return (msg2.get("content") or "").strip()
 
 
 def _silent_wav_path(seconds: float = 10.0, sample_rate: int = 16000) -> str:
@@ -1154,6 +1408,7 @@ def signup(body: UserSignup):
         "name": (body.name or "").strip() or email.split("@")[0],
         "password_hash": bcrypt.hashpw(body.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
         "is_admin": False,
+        "license_key": secrets.token_hex(24),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     users = load_users()
@@ -1193,6 +1448,27 @@ def update_me(body: dict, current_user: dict = Depends(get_current_user)):
             u = users[i]
             return {"id": u["id"], "email": u["email"], "name": u["name"], "is_admin": u.get("is_admin", False)}
     raise HTTPException(404, "User not found")
+
+
+@app.get("/api/auth/license-key")
+def get_my_license_key(current_user: dict = Depends(get_current_user)):
+    """License key for running self-hosted capability (MCP) binaries."""
+    key = _ensure_user_license_key(current_user["id"])
+    if not key:
+        raise HTTPException(404, "User not found")
+    return {"license_key": key}
+
+
+@app.post("/api/auth/validate-license")
+def validate_license_key(body: ValidateLicenseBody):
+    """Called by capability binaries to verify a license (no JWT)."""
+    key = (body.license_key or "").strip()
+    if not key:
+        return {"valid": False}
+    for u in load_users():
+        if (u.get("license_key") or "").strip() == key:
+            return {"valid": True, "user_id": u["id"]}
+    return {"valid": False}
 
 
 # ---- Admin dashboard ----
@@ -1238,8 +1514,12 @@ def admin_dashboard(current_user: dict = Depends(get_current_admin)):
 
 @app.get("/api/marketplace")
 def list_marketplace():
-    """List all marketplace listings (public)."""
-    return {"listings": load_listings()}
+    """List marketplace catalog: capabilities (mcp) and knowledge packs only."""
+    items = [
+        l for l in load_listings()
+        if _listing_type(l) in ("mcp", "knowledge_pack")
+    ]
+    return {"listings": items}
 
 
 def _listing_type(l: dict) -> str:
@@ -1249,6 +1529,8 @@ def _listing_type(l: dict) -> str:
 @app.post("/api/admin/marketplace")
 def create_listing(body: ListingCreate, current_user: dict = Depends(get_current_admin)):
     listing_type = (body.listing_type or "integration").strip() or "integration"
+    if listing_type == "mcp":
+        raise HTTPException(400, "Capability (mcp) listings must be created via POST /api/admin/marketplace/mcp")
     if listing_type not in ("integration", "role_pack", "avatar"):
         raise HTTPException(400, "listing_type must be integration, role_pack, or avatar")
     if listing_type == "integration" and not (body.mcp_server_url or "").strip():
@@ -1344,8 +1626,13 @@ async def create_avatar_listing(
         else:
             if voice_ref_text:
                 _cosyvoice_register_speaker(voice_id, str(voice_wav_path), voice_ref_text)
+    listing_id = uuid.uuid4().hex
+    try:
+        (DATA_DIR / f"listing_face_{listing_id}.png").write_bytes(face_bytes)
+    except OSError as e:
+        log.warning("Could not save listing face thumbnail %s: %s", listing_id, e)
     listing = {
-        "id": uuid.uuid4().hex,
+        "id": listing_id,
         "name": name,
         "description": (description or "").strip(),
         "logo_url": ditto_persona.get("preview_url") or "",
@@ -1360,6 +1647,10 @@ async def create_avatar_listing(
         "created_by": current_user["id"],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if ditto_persona.get("ditto_image_url"):
+        listing["ditto_image_url"] = ditto_persona["ditto_image_url"]
+    if ditto_persona.get("ditto_face_mode"):
+        listing["ditto_face_mode"] = ditto_persona["ditto_face_mode"]
     listings = load_listings()
     listings.append(listing)
     save_listings(listings)
@@ -1371,7 +1662,7 @@ async def create_knowledge_pack_listing(
     name: str = Form(...),
     description: str = Form(""),
     price: float = Form(0.0),
-    logo_url: str = Form(""),
+    logo: UploadFile | None = File(None),
     files: list[UploadFile] = File(default=[]),
     current_user: dict = Depends(get_current_admin),
 ):
@@ -1417,7 +1708,7 @@ async def create_knowledge_pack_listing(
         "id": listing_id,
         "name": name,
         "description": (description or "").strip(),
-        "logo_url": (logo_url or "").strip(),
+        "logo_url": "",
         "price": float(price),
         "mcp_server_url": "",
         "listing_type": "knowledge_pack",
@@ -1431,6 +1722,81 @@ async def create_knowledge_pack_listing(
     listings = load_listings()
     listings.append(listing)
     save_listings(listings)
+    if logo and (logo.filename or "").strip():
+        url = await _save_listing_logo_upload(listing_id, logo)
+        listings = load_listings()
+        for i, row in enumerate(listings):
+            if row.get("id") == listing_id:
+                listings[i]["logo_url"] = url
+                listing = dict(listings[i])
+                break
+        save_listings(listings)
+    return listing
+
+
+@app.post("/api/admin/marketplace/mcp")
+async def create_mcp_capability_listing(
+    name: str = Form(...),
+    description: str = Form(""),
+    price: float = Form(0.0),
+    logo: UploadFile | None = File(None),
+    setup_instructions: str = Form(""),
+    required_env_keys: str = Form("[]"),
+    binary: UploadFile = File(...),
+    current_user: dict = Depends(get_current_admin),
+):
+    """Admin: self-hosted capability listing — binary download + per-user MCP URL on personas."""
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    if not binary or not binary.filename:
+        raise HTTPException(400, "binary file is required")
+    try:
+        parsed_keys = json.loads(required_env_keys or "[]")
+        if not isinstance(parsed_keys, list):
+            parsed_keys = []
+    except (json.JSONDecodeError, TypeError):
+        parsed_keys = []
+    env_keys = [str(x).strip() for x in parsed_keys if str(x).strip()]
+    listing_id = uuid.uuid4().hex
+    pack_dir = _mcp_binary_dir(listing_id)
+    if pack_dir.is_dir():
+        shutil.rmtree(pack_dir, ignore_errors=True)
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(binary.filename).name or "binary"
+    if not safe_name or safe_name in (".", ".."):
+        safe_name = "binary"
+    dest_path = pack_dir / safe_name
+    dest_path.write_bytes(await binary.read())
+    listing = {
+        "id": listing_id,
+        "name": name,
+        "description": (description or "").strip(),
+        "logo_url": "",
+        "price": float(price),
+        "mcp_server_url": "",
+        "listing_type": "mcp",
+        "role_prompt": "",
+        "image_id": "",
+        "voice_id": "",
+        "binary_filename": safe_name,
+        "setup_instructions": (setup_instructions or "").strip(),
+        "required_env_keys": env_keys,
+        "created_by": current_user["id"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    listings = load_listings()
+    listings.append(listing)
+    save_listings(listings)
+    if logo and (logo.filename or "").strip():
+        url = await _save_listing_logo_upload(listing_id, logo)
+        listings = load_listings()
+        for i, row in enumerate(listings):
+            if row.get("id") == listing_id:
+                listings[i]["logo_url"] = url
+                listing = dict(listings[i])
+                break
+        save_listings(listings)
     return listing
 
 
@@ -1446,6 +1812,10 @@ def update_listing(listing_id: str, body: ListingUpdate, current_user: dict = De
                     raise HTTPException(400, "Cannot change listing_type of a knowledge pack")
                 if prev_type != "knowledge_pack" and new_t == "knowledge_pack":
                     raise HTTPException(400, "Use POST /api/admin/marketplace/knowledge-pack to create knowledge packs")
+                if prev_type == "mcp" and new_t != "mcp":
+                    raise HTTPException(400, "Cannot change listing_type of a capability (mcp) listing")
+                if prev_type != "mcp" and new_t == "mcp":
+                    raise HTTPException(400, "Use POST /api/admin/marketplace/mcp to create capability listings")
             if body.name is not None:
                 listings[i]["name"] = body.name.strip()
             if body.description is not None:
@@ -1479,15 +1849,111 @@ def delete_listing(listing_id: str, current_user: dict = Depends(get_current_adm
     pack_dir = _kb_pack_dir(listing_id)
     if pack_dir.is_dir():
         shutil.rmtree(pack_dir, ignore_errors=True)
+    mcp_dir = _mcp_binary_dir(listing_id)
+    if mcp_dir.is_dir():
+        shutil.rmtree(mcp_dir, ignore_errors=True)
+    _delete_listing_logo_files(listing_id)
     return {"ok": True}
 
 
-@app.post("/api/marketplace/{listing_id}/purchase")
-def purchase_listing(listing_id: str, current_user: dict = Depends(get_current_user)):
-    """Mock purchase: record that this user owns this listing."""
+@app.get("/api/marketplace/{listing_id}/logo")
+def get_marketplace_listing_logo(listing_id: str):
+    """Public thumbnail for marketplace cards; file stored under DATA_DIR or legacy external URL in listing JSON."""
     listing = get_listing(listing_id)
     if not listing:
         raise HTTPException(404, "Listing not found")
+    path = _listing_logo_disk_path(listing_id)
+    if not path:
+        raise HTTPException(404, "No logo")
+    ext = path.suffix.lower()
+    media = LISTING_LOGO_MEDIA.get(ext, "application/octet-stream")
+    return FileResponse(path, media_type=media)
+
+
+@app.post("/api/admin/marketplace/{listing_id}/logo")
+async def admin_upload_listing_logo(
+    listing_id: str,
+    logo: UploadFile = File(...),
+    current_user: dict = Depends(get_current_admin),
+):
+    listing = get_listing(listing_id)
+    if not listing:
+        raise HTTPException(404, "Listing not found")
+    if _listing_type(listing) not in ("mcp", "knowledge_pack"):
+        raise HTTPException(400, "Logo upload is only for capability or knowledge pack listings")
+    url = await _save_listing_logo_upload(listing_id, logo)
+    listings = load_listings()
+    for i, l in enumerate(listings):
+        if l.get("id") == listing_id:
+            listings[i]["logo_url"] = url
+            save_listings(listings)
+            return listings[i]
+    raise HTTPException(404, "Listing not found")
+
+
+@app.get("/api/marketplace/{listing_id}/binary")
+def download_mcp_binary(
+    listing_id: str,
+    request: Request,
+    token: str | None = Query(None),
+):
+    """Download capability binary; auth via Bearer header or ?token= JWT (for browser download)."""
+    jwt_str = None
+    auth = request.headers.get("Authorization") or ""
+    if auth.startswith("Bearer "):
+        jwt_str = auth[7:].strip()
+    elif token:
+        jwt_str = token.strip()
+    if not jwt_str:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        payload = jwt.decode(jwt_str, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+    user_id = payload.get("sub", "")
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(401, "User not found")
+    listing = get_listing(listing_id)
+    if not listing or _listing_type(listing) != "mcp":
+        raise HTTPException(404, "Listing not found")
+    owned_ids = {l["id"] for l in get_user_purchases(user_id)}
+    if listing_id not in owned_ids:
+        raise HTTPException(403, "Purchase this capability to download")
+    fname = (listing.get("binary_filename") or "").strip()
+    path = _mcp_binary_dir(listing_id) / fname if fname else None
+    if not path or not path.is_file():
+        raise HTTPException(404, "Binary not found")
+    return FileResponse(
+        path,
+        filename=fname,
+        media_type="application/octet-stream",
+    )
+
+
+@app.post("/api/marketplace/{listing_id}/purchase")
+def purchase_listing(
+    listing_id: str,
+    body: PurchaseBody = PurchaseBody(),
+    current_user: dict = Depends(get_current_user),
+):
+    """Purchase a catalog item. Paid listings require payment integration or promo code."""
+    listing = get_listing(listing_id)
+    if not listing:
+        raise HTTPException(404, "Listing not found")
+    ltype = _listing_type(listing)
+    if ltype not in ("mcp", "knowledge_pack"):
+        raise HTTPException(400, "This item is not available in the marketplace")
+    price = float(listing.get("price") or 0)
+    promo = (body.promo_code or "").strip().lower()
+    promo_ok = bool(MARKETPLACE_PROMO_CODE and promo == MARKETPLACE_PROMO_CODE)
+    if price > 0 and not promo_ok:
+        raise HTTPException(
+            400,
+            "Payment or promo code required. Use the promo code to redeem for free during beta.",
+        )
     purchases = load_purchases()
     if any(p["user_id"] == current_user["id"] and p["listing_id"] == listing_id for p in purchases):
         return {"ok": True, "already_owned": True}
@@ -1496,7 +1962,7 @@ def purchase_listing(listing_id: str, current_user: dict = Depends(get_current_u
         "user_id": current_user["id"],
         "listing_id": listing_id,
         "purchased_at": datetime.now(timezone.utc).isoformat(),
-        "mock": True,
+        "mock": price <= 0 or promo_ok,
     })
     save_purchases(purchases)
     return {"ok": True, "already_owned": False}
@@ -1520,7 +1986,26 @@ def get_persona_endpoint(persona_id: str, current_user: dict = Depends(get_curre
     p = get_persona(persona_id, current_user["id"])
     if not p:
         raise HTTPException(404, "Persona not found")
-    return p
+    out = dict(p)
+    out.update(_persona_integration_readiness(p))
+    return out
+
+
+@app.get("/api/internal/ditto-faces/{face_id}")
+def ditto_internal_face_fetch(face_id: str, authorization: str | None = Header(None)):
+    """Local face PNG for streaming Ditto: Ditto container GETs this URL with Bearer DITTO_INTERNAL_FACE_SECRET."""
+    if not DITTO_INTERNAL_FACE_SECRET:
+        raise HTTPException(503, "DITTO_INTERNAL_FACE_SECRET is not set")
+    expected = f"Bearer {DITTO_INTERNAL_FACE_SECRET}"
+    auth = (authorization or "").strip()
+    if len(auth) != len(expected) or not secrets.compare_digest(auth, expected):
+        raise HTTPException(403, "Invalid or missing Authorization")
+    if len(face_id) != 32 or any(c not in "0123456789abcdef" for c in face_id.lower()):
+        raise HTTPException(404, "Not found")
+    path = DITTO_FACES_DIR / f"{face_id.lower()}.png"
+    if not path.is_file():
+        raise HTTPException(404, "Not found")
+    return FileResponse(path, media_type="image/png")
 
 
 @app.get("/api/personas/{persona_id}/ditto-cache")
@@ -1529,15 +2014,14 @@ def persona_ditto_cache_status(persona_id: str, current_user: dict = Depends(get
     p = get_persona(persona_id, current_user["id"])
     if not p:
         raise HTTPException(404, "Persona not found")
+    if _streaming_local_face(p):
+        return {"cached": False}
     image_id = p.get("image_id")
     if not image_id:
         return {"cached": False}
-    url = f"{DITTO_API_URL}/personas/{image_id}/cached"
     try:
-        with httpx.Client(timeout=5.0) as client:
-            r = client.get(url)
-            r.raise_for_status()
-            return r.json()
+        r = _ditto_get_persona_resource(image_id, "cached", timeout=5.0)
+        return r.json()
     except httpx.HTTPError as e:
         log.warning("Ditto ditto-cache check failed: %s", e)
         return {"cached": False}
@@ -1549,15 +2033,15 @@ def persona_prime(persona_id: str, current_user: dict = Depends(get_current_user
     p = get_persona(persona_id, current_user["id"])
     if not p:
         raise HTTPException(404, "Persona not found")
+    if _streaming_local_face(p):
+        return {"ok": True, "skipped": True, "reason": "streaming_ditto_no_rest_prime"}
     image_id = p.get("image_id")
     if not image_id:
         raise HTTPException(400, "Persona has no image_id")
-    url = f"{DITTO_API_URL}/personas/{image_id}/prime"
     try:
-        with httpx.Client(timeout=12.0) as client:
-            r = client.post(url)
-            r.raise_for_status()
-            return r.json()
+        r = _ditto_post_persona_subresource(image_id, "prime", timeout=12.0)
+        r.raise_for_status()
+        return r.json()
     except httpx.HTTPStatusError as e:
         log.warning("Ditto prime failed: %s %s", e.response.status_code, e.response.text)
         raise HTTPException(502, "Ditto prime failed") from e
@@ -1615,15 +2099,16 @@ def get_shared_preview(share_id: str):
     p = get_persona_by_share_id(share_id)
     if not p:
         raise HTTPException(404, "Shared persona not found")
+    pid = (p.get("id") or "").strip()
+    local_face = DATA_DIR / f"face_{pid}.png" if pid else None
+    if local_face and local_face.is_file():
+        return Response(content=local_face.read_bytes(), media_type="image/png")
     image_id = p.get("image_id")
     if not image_id:
         raise HTTPException(404, "No image_id")
-    url = f"{DITTO_API_URL}/personas/{image_id}/preview"
     try:
-        with httpx.Client(timeout=10.0) as client:
-            r = client.get(url)
-            r.raise_for_status()
-            return Response(content=r.content, media_type=r.headers.get("content-type", "image/png"))
+        r = _ditto_get_persona_resource(image_id, "preview", timeout=10.0)
+        return Response(content=r.content, media_type=r.headers.get("content-type", "image/png"))
     except (httpx.ReadTimeout, httpx.ConnectTimeout):
         raise HTTPException(504, "Preview request timed out")
     except httpx.ConnectError:
@@ -1656,12 +2141,12 @@ def get_listing_preview(listing_id: str):
     image_id = (listing.get("image_id") or "").strip()
     if not image_id:
         raise HTTPException(404, "Avatar has no image_id")
-    url = f"{DITTO_API_URL}/personas/{image_id}/preview"
+    lf = DATA_DIR / f"listing_face_{listing_id}.png"
+    if lf.is_file():
+        return Response(content=lf.read_bytes(), media_type="image/png")
     try:
-        with httpx.Client(timeout=10.0) as client:
-            r = client.get(url)
-            r.raise_for_status()
-            return Response(content=r.content, media_type=r.headers.get("content-type", "image/png"))
+        r = _ditto_get_persona_resource(image_id, "preview", timeout=10.0)
+        return Response(content=r.content, media_type=r.headers.get("content-type", "image/png"))
     except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
         log.warning("Ditto preview timeout for image_id=%s: %s", image_id, e)
         raise HTTPException(504, "Preview request timed out")
@@ -1683,15 +2168,15 @@ def get_persona_preview(persona_id: str):
     p = get_persona(persona_id)
     if not p:
         raise HTTPException(404, "Persona not found")
+    local_face = DATA_DIR / f"face_{persona_id}.png"
+    if local_face.is_file():
+        return Response(content=local_face.read_bytes(), media_type="image/png")
     image_id = p.get("image_id")
     if not image_id:
         raise HTTPException(404, "No image_id")
-    url = f"{DITTO_API_URL}/personas/{image_id}/preview"
     try:
-        with httpx.Client(timeout=10.0) as client:
-            r = client.get(url)
-            r.raise_for_status()
-            return Response(content=r.content, media_type=r.headers.get("content-type", "image/png"))
+        r = _ditto_get_persona_resource(image_id, "preview", timeout=10.0)
+        return Response(content=r.content, media_type=r.headers.get("content-type", "image/png"))
     except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
         log.warning("Ditto preview timeout for image_id=%s (persona %s): %s", image_id, persona_id, e)
         raise HTTPException(504, "Preview request timed out")
@@ -1742,6 +2227,22 @@ def update_persona(persona_id: str, body: PersonaUpdate, current_user: dict = De
         if rp_id and rp and _listing_type(rp) != "role_pack":
             rp_id = None
         p["assigned_role_pack_id"] = rp_id
+    if body.assigned_mcp_configs is not None:
+        owned_ids = {l["id"] for l in get_user_purchases(current_user["id"])}
+        out_mcp: dict[str, str] = {}
+        for lid, url in (body.assigned_mcp_configs or {}).items():
+            lid = str(lid).strip()
+            url = (url or "").strip()
+            if not lid or lid not in owned_ids:
+                continue
+            listing = get_listing(lid)
+            if not listing or _listing_type(listing) != "mcp":
+                continue
+            low = url.lower()
+            if not (low.startswith("http://") or low.startswith("https://")):
+                raise HTTPException(400, f"Capability URL must start with http:// or https:// ({lid})")
+            out_mcp[lid] = url
+        p["assigned_mcp_configs"] = out_mcp
     personas = load_personas()
     for i, x in enumerate(personas):
         if x.get("id") == persona_id:
@@ -1901,8 +2402,9 @@ async def upload_persona_document(
     docs = _load_persona_docs(persona_id)
     docs.append({"id": doc_id, "filename": filename, "path": safe_name, "uploaded_at": datetime.now(timezone.utc).isoformat()})
     _save_persona_docs(persona_id, docs)
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _process_document_sync, persona_id, doc_id, path, filename)
+    asyncio.get_running_loop().run_in_executor(
+        None, _process_document_sync, persona_id, doc_id, path, filename
+    )
     return {"id": doc_id, "filename": filename}
 
 
@@ -1972,9 +2474,8 @@ def _append_knowledge_packs_to_persona_kb(
     if not new_jobs:
         return 0
     _save_persona_docs(persona_id, existing)
-    loop = asyncio.get_event_loop()
     for doc_id, path, filename in new_jobs:
-        loop.run_in_executor(None, _process_document_sync, persona_id, doc_id, path, filename)
+        _KB_PROCESS_EXECUTOR.submit(_process_document_sync, persona_id, doc_id, path, filename)
     return len(new_jobs)
 
 
@@ -2027,18 +2528,70 @@ def delete_persona(persona_id: str, current_user: dict = Depends(get_current_use
             f.unlink()
         except OSError:
             log.warning("Could not delete reply video %s", f)
+    face_thumb = DATA_DIR / f"face_{persona_id}.png"
+    if face_thumb.is_file():
+        try:
+            face_thumb.unlink()
+        except OSError:
+            log.warning("Could not delete face file %s", face_thumb)
+    iid = (p.get("image_id") or "").strip().lower()
+    if len(iid) == 32 and all(c in "0123456789abcdef" for c in iid):
+        dfp = DITTO_FACES_DIR / f"{iid}.png"
+        if dfp.is_file():
+            try:
+                dfp.unlink()
+            except OSError:
+                log.warning("Could not delete ditto face file %s", dfp)
     return {"ok": True}
 
 
+def _ditto_create_persona_local_for_streaming(image: bytes, persona_name: str) -> dict:
+    """Save face under DATA_DIR/ditto_faces and return URL Ditto (Docker) can GET from TwynBook + WS auth token."""
+    if not DITTO_FACE_FETCH_BASE_URL or not DITTO_INTERNAL_FACE_SECRET:
+        raise ValueError(
+            "When Ditto has no POST /personas, set DITTO_FACE_FETCH_BASE_URL (URL Ditto uses to reach TwynBook, "
+            "e.g. http://172.17.0.1:8087 on Linux Docker) and DITTO_INTERNAL_FACE_SECRET (shared Bearer secret)."
+        )
+    face_id = uuid.uuid4().hex
+    path = DITTO_FACES_DIR / f"{face_id}.png"
+    path.write_bytes(image)
+    log.info("Saved streaming Ditto face locally %s (%s bytes) name=%s", path, len(image), persona_name)
+    image_url = f"{DITTO_FACE_FETCH_BASE_URL}/api/internal/ditto-faces/{face_id}"
+    return {
+        "image_id": face_id,
+        "persona_name": persona_name,
+        "preview_url": "",
+        "ditto_image_url": image_url,
+        "ditto_face_mode": "ditto_streaming_local",
+    }
+
+
 def _ditto_create_persona(image: bytes, persona_name: str) -> dict:
-    """POST /personas to Ditto; returns {image_id, persona_name, preview_url}."""
-    url = f"{DITTO_API_URL}/personas"
-    with httpx.Client(timeout=60.0) as client:
-        files = {"image": ("face.png", image, "image/png")}
-        data = {"persona_name": persona_name}
-        r = client.post(url, files=files, data=data)
-        r.raise_for_status()
-        return r.json()
+    """POST persona collection on Ditto; returns {image_id, persona_name, preview_url}. Tries /api/personas then /personas unless overridden."""
+    files = {"image": ("face.png", image, "image/png")}
+    data = {"persona_name": persona_name}
+    candidates = _ditto_persona_collection_candidates()
+    if not candidates:
+        raise ValueError("Ditto not configured (empty DITTO_API_URL)")
+    last_r: httpx.Response | None = None
+    for coll in candidates:
+        url = coll.rstrip("/")
+        with httpx.Client(timeout=60.0) as client:
+            last_r = client.post(url, files=files, data=data)
+        if last_r.status_code == 404:
+            continue
+        last_r.raise_for_status()
+        _ditto_mark_persona_collection(coll)
+        return last_r.json()
+    assert last_r is not None
+    if last_r.status_code == 404 and DITTO_FACE_FETCH_BASE_URL and DITTO_INTERNAL_FACE_SECRET:
+        log.info("Ditto has no POST /personas (404); saving face locally for streaming Ditto fetch")
+        return _ditto_create_persona_local_for_streaming(image, persona_name)
+    log.warning(
+        "Ditto POST persona 404 for all bases %s — set DITTO_PERSONAS_BASE_URL or DITTO_FACE_FETCH_BASE_URL + DITTO_INTERNAL_FACE_SECRET for streaming Ditto",
+        candidates,
+    )
+    last_r.raise_for_status()
 
 
 def _wav_to_16k_float32_mono(wav_bytes: bytes) -> bytes:
@@ -2175,11 +2728,18 @@ def _start_tts_stream_to_audio_queue(
     q: "asyncio.Queue[bytes | None]",
     loop: asyncio.AbstractEventLoop,
     video_mode: bool = False,
+    audio_holder: dict | None = None,
 ) -> None:
     """Stream Chatterbox TTS into ffmpeg and push 16kHz float32 chunks into an asyncio queue.
 
     Uses GET /api/tts/pcm when CB_TTS_RAW_PCM=1 (lower latency than WAV container).
-    Pre/post silence pads apply only in video_mode (Ditto clip boundary smoothing).
+    Pre/post silence pads apply only in video_mode, and only after a successful decode (so Ditto never sees pads without audio).
+
+    Root cause (historical glitch): Chatterbox returned HTTP 200 with ~200 KiB s16le PCM while ffmpeg emitted only a few
+    KiB of f32 (~0.05 s). Common causes: (1) x-sample-rate / x-channels headers not matching the actual PCM layout from
+    the TTS server; (2) -fflags nobuffer + low_delay on a raw PCM pipe confusing ffmpeg's reader. We therefore omit
+    low-latency flags for the PCM ffmpeg subprocess. On any decode anomaly we set audio_holder[\"error\"] and send None
+    only — no silent WAV fallback.
     """
     text_clean = (text or "").strip()[:TTS_MAX_CHARS]
     use_pcm = bool(CB_TTS_RAW_PCM and (CHATTERBOX_BASE_URL or "").strip())
@@ -2192,7 +2752,8 @@ def _start_tts_stream_to_audio_queue(
     gain = float(os.environ.get("AUDIO_GAIN", "1.0") or 1.0)
     t0 = time.monotonic()
     ff_base = ["ffmpeg", "-loglevel", "error"]
-    if CB_FFMPEG_LOW_LATENCY:
+    # Raw s16le PCM: do NOT use nobuffer/low_delay — they correlate with truncated decodes on chunked HTTP bodies.
+    if CB_FFMPEG_LOW_LATENCY and not use_pcm:
         ff_base.extend(["-fflags", "nobuffer", "-flags", "low_delay"])
     chunk_sz = CB_HTTP_CHUNK_SIZE
 
@@ -2200,12 +2761,16 @@ def _start_tts_stream_to_audio_queue(
         fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
         fut.result()
 
-    total_out = 0
     total_in = 0
     status_code = None
     content_type = None
     proc: subprocess.Popen | None = None
     reader: threading.Thread | None = None
+    pcm_f32_accum: bytearray = bytearray()
+    ff_stderr = b""
+    proc_ret: int | None = None
+    hdr_sr: str | None = None
+    hdr_ch: str | None = None
 
     def _silence_f32_bytes(ms: int, sr: int = 16000) -> bytes:
         if not ms or ms <= 0:
@@ -2223,8 +2788,6 @@ def _start_tts_stream_to_audio_queue(
                 data = proc.stdout.read(65536)
                 if not data:
                     break
-                nonlocal total_out
-                total_out += len(data)
                 if gain != 1.0:
                     try:
                         arr = np.frombuffer(data, dtype=np.float32)
@@ -2233,7 +2796,7 @@ def _start_tts_stream_to_audio_queue(
                             data = arr.astype(np.float32, copy=False).tobytes()
                     except Exception:
                         pass
-                _put(data)
+                pcm_f32_accum.extend(data)
         except Exception:
             pass
 
@@ -2258,6 +2821,8 @@ def _start_tts_stream_to_audio_queue(
                     raise
                 status_code = r.status_code
                 content_type = r.headers.get("content-type")
+                hdr_sr = r.headers.get("x-sample-rate")
+                hdr_ch = r.headers.get("x-channels")
                 if use_pcm:
                     try:
                         sr_in = int(r.headers.get("x-sample-rate") or "24000")
@@ -2306,10 +2871,6 @@ def _start_tts_stream_to_audio_queue(
                     )
                 reader = threading.Thread(target=_read_stdout, daemon=True)
                 reader.start()
-                if video_mode:
-                    pre = _silence_f32_bytes(DITTO_SILENCE_PRE_MS)
-                    if pre:
-                        _put(pre)
                 try:
                     for chunk in r.iter_bytes(chunk_size=chunk_sz):
                         if not chunk:
@@ -2324,52 +2885,94 @@ def _start_tts_stream_to_audio_queue(
                     except Exception:
                         pass
                     if reader:
-                        reader.join(timeout=5)
+                        reader.join(timeout=30)
                     try:
-                        proc.wait(timeout=10)
+                        proc_ret = int(proc.wait(timeout=30))
                     except Exception:
-                        pass
+                        proc_ret = None
+                    try:
+                        ff_stderr = proc.stderr.read() if proc.stderr else b""
+                    except Exception:
+                        ff_stderr = b""
     except Exception as e:
-        log.warning("Chatterbox TTS stream error: %s", e)
-    finally:
-        if proc is not None:
-            try:
-                err = proc.stderr.read() if proc.stderr else b""
-                if err:
-                    log.warning("TTS ffmpeg stderr: %s", err.decode("utf-8", "replace"))
-            except Exception:
-                pass
-        audio_seconds = total_out / float(16000 * 4) if total_out else 0.0
-        total_s = time.monotonic() - t0
-        rtf = (total_s / audio_seconds) if audio_seconds > 0 else None
-        rtf_str = f"{rtf:.2f}" if rtf is not None else "n/a"
-        log.info(
-            "TTS stream stats: pcm=%s video_mode=%s status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s audio_s=%.2f total_s=%.2f rtf=%s",
-            use_pcm,
-            video_mode,
-            status_code,
-            content_type,
-            total_in,
-            total_out,
-            len(text_clean),
-            audio_seconds,
-            total_s,
-            rtf_str,
-        )
-        if total_out == 0:
-            try:
-                log.warning("TTS stream produced no audio; falling back to download/wav")
-                wav = _chatterbox_tts_wav(voice_id, text)
-                f32 = _wav_to_16k_float32_mono(wav)
-                if f32:
-                    _put(f32)
-            except Exception:
-                pass
-        if video_mode:
-            post = _silence_f32_bytes(DITTO_SILENCE_POST_MS)
-            if post:
-                _put(post)
+        log.error("Chatterbox TTS stream error: %s", e)
+        if audio_holder is not None:
+            audio_holder["error"] = f"TTS stream failed: {e}"
         _put(None)
+        return
+
+    total_out = len(pcm_f32_accum)
+    audio_seconds = total_out / float(16000 * 4) if total_out else 0.0
+    total_s = time.monotonic() - t0
+    rtf = (total_s / audio_seconds) if audio_seconds > 0 else None
+    rtf_str = f"{rtf:.2f}" if rtf is not None else "n/a"
+    log.info(
+        "TTS stream stats: pcm=%s video_mode=%s status=%s content_type=%s in_bytes=%s out_bytes=%s text_len=%s audio_s=%.2f total_s=%.2f rtf=%s",
+        use_pcm,
+        video_mode,
+        status_code,
+        content_type,
+        total_in,
+        total_out,
+        len(text_clean),
+        audio_seconds,
+        total_s,
+        rtf_str,
+    )
+    if ff_stderr:
+        log.info("TTS ffmpeg stderr: %s", ff_stderr.decode("utf-8", "replace")[:2000])
+
+    # PCM path: trust the byte stream duration from headers + body (text-length heuristics falsely reject
+    # valid clips when TTS is faster than ~18 chars/s). WAV path: keep text-based floor to catch empty/truncated WAVs.
+    ffmpeg_bad = proc is not None and proc_ret not in (0,)
+    decode_bad = total_out == 0 or ffmpeg_bad
+    if not decode_bad and total_in > 8000:
+        if use_pcm:
+            try:
+                sr_in = int(hdr_sr or "24000")
+                ch_in = int(hdr_ch or "1")
+            except ValueError:
+                sr_in, ch_in = 24000, 1
+            b_frame = 2 * max(1, ch_in)
+            samples_in = total_in // b_frame
+            dur_pcm = samples_in / float(max(1, sr_in))
+            expected_f32 = int(dur_pcm * 16000 * 4)
+            # Resampler / frame alignment: allow ~18% slack vs implied duration
+            floor_bytes = max(4096, int(expected_f32 * 0.82))
+            if total_out < floor_bytes:
+                decode_bad = True
+        else:
+            min_sec = max(0.35, min(12.0, len(text_clean) * 0.055))
+            min_f32_bytes = int(min_sec * 16000 * 4)
+            if total_out < min_f32_bytes:
+                decode_bad = True
+
+    if decode_bad:
+        min_sec_dbg = max(0.35, min(12.0, len(text_clean) * 0.055))
+        err_txt = (
+            f"TTS decode unusable: pcm={use_pcm} decoded_s={audio_seconds:.4f} min_text_heuristic_s~{min_sec_dbg:.2f} "
+            f"pcm_in_bytes={total_in} f32_out_bytes={total_out} text_len={len(text_clean)} "
+            f"ffmpeg_rc={proc_ret} headers_sample_rate={hdr_sr or 'n/a'} headers_ch={hdr_ch or 'n/a'}. "
+            f"See docstring on _start_tts_stream_to_audio_queue (header/body mismatch vs ffmpeg flags). "
+            f"ffmpeg_stderr={ff_stderr.decode('utf-8', 'replace')[:2000]}"
+        )
+        log.error(err_txt)
+        if audio_holder is not None:
+            audio_holder["error"] = err_txt
+        _put(None)
+        return
+
+    if video_mode:
+        pre = _silence_f32_bytes(DITTO_SILENCE_PRE_MS)
+        if pre:
+            _put(pre)
+    for i in range(0, len(pcm_f32_accum), 65536):
+        _put(bytes(pcm_f32_accum[i : i + 65536]))
+    if video_mode:
+        post = _silence_f32_bytes(DITTO_SILENCE_POST_MS)
+        if post:
+            _put(post)
+    _put(None)
 
 
 def _start_xtts_stream_to_audio_queue(voice_wav_path: str, text: str, q: "asyncio.Queue[bytes | None]", loop: asyncio.AbstractEventLoop) -> None:
@@ -3214,6 +3817,141 @@ def _ensure_greeting_cached(persona: dict) -> Path | None:
         return greet_path
     return _render_f5_greeting_to_file(persona)
 
+
+def _ditto_preview_ok(image_id: str, *, persona_id: str | None = None) -> tuple[bool, str | None]:
+    """Return (True, None) if Ditto returns 200 for this face preview, or a local face thumbnail exists."""
+    if persona_id and (DATA_DIR / f"face_{persona_id}.png").is_file():
+        return True, None
+    if not image_id or not (DITTO_API_URL or "").strip():
+        return False, "ditto_not_configured"
+    try:
+        r = _ditto_get_persona_resource(image_id, "preview", timeout=8.0)
+        if r.status_code == 200:
+            return True, None
+        return False, f"ditto_preview_http_{r.status_code}"
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return False, "ditto_preview_missing"
+        code = e.response.status_code if e.response is not None else 0
+        return False, f"ditto_preview_http_{code}"
+    except httpx.HTTPError:
+        return False, "ditto_unreachable"
+
+
+def _persona_integration_readiness(p: dict, *, rtc_stt_only: bool = False) -> dict:
+    """
+    Verify external dependencies (Ditto face, TTS voice clone, local assets).
+    Returned keys are not persisted on the persona record.
+    """
+    issues: list[str] = []
+    messages: list[str] = []
+
+    if rtc_stt_only:
+        return {
+            "integration_ready": True,
+            "integration_issues": [],
+            "integration_message": "",
+        }
+
+    idle_path = (p.get("idle_video_path") or "").strip()
+    if idle_path and not Path(idle_path).is_file():
+        issues.append("idle_video_missing")
+        messages.append(
+            "The idle-loop video file for this persona is missing on disk. "
+            "Delete this persona and create it again, or restore the file from a backup."
+        )
+
+    image_id = (p.get("image_id") or "").strip()
+    if image_id:
+        ok, reason = _ditto_preview_ok(image_id, persona_id=(p.get("id") or "").strip() or None)
+        if not ok:
+            issues.append(reason or "ditto_preview_bad")
+            if reason == "ditto_preview_missing":
+                messages.append(
+                    "This persona's face is no longer available on the video service (Ditto). "
+                    "Delete this persona and create a new one with a new photo, or re-register the face in Ditto."
+                )
+            elif reason == "ditto_unreachable":
+                messages.append(
+                    "TwynBook could not reach the video service (Ditto) to verify this persona's face. "
+                    "Start Ditto or fix networking, then try again."
+                )
+            elif reason == "ditto_not_configured":
+                messages.append("Ditto is not configured (DITTO_API_URL). Set it on the server or recreate the persona.")
+            else:
+                messages.append(
+                    "The video service did not return a valid preview for this persona's face. "
+                    "Check Ditto logs, then delete and recreate the persona if the problem continues."
+                )
+
+    wav_path = (p.get("voice_wav_path") or "").strip()
+    wav_ok = bool(wav_path and Path(wav_path).is_file())
+
+    if TTS_PROVIDER == "chatterbox":
+        if not (CHATTERBOX_BASE_URL or "").strip():
+            issues.append("chatterbox_not_configured")
+            messages.append("Chatterbox TTS is not configured (set CHATTERBOX_BASE_URL on the server).")
+        else:
+            vid = (p.get("voice_id") or "").strip()
+            if not _chatterbox_voice_exists(vid):
+                if wav_ok:
+                    pass
+                else:
+                    issues.append("chatterbox_voice_missing")
+                    messages.append(
+                        "The cloned voice for this persona is not on the TTS server, and no local voice recording "
+                        "was found to re-clone from. Delete this persona and create a new one, or open Edit persona "
+                        "and upload a voice sample again."
+                    )
+    elif TTS_PROVIDER == "qwen3":
+        if not (QWEN3_TTS_BASE_URL or "").strip():
+            issues.append("qwen3_not_configured")
+            messages.append("Qwen3 TTS is not configured (set QWEN3_TTS_BASE_URL on the server).")
+        else:
+            vid = (p.get("voice_id") or "").strip()
+            if not _qwen3_voice_exists(vid):
+                if wav_ok:
+                    pass
+                else:
+                    issues.append("qwen3_voice_missing")
+                    messages.append(
+                        "The Qwen3 voice for this persona is not registered on the TTS service, and no local voice "
+                        "WAV was found to re-register from. Delete and recreate the persona or re-upload voice on Edit."
+                    )
+    elif TTS_PROVIDER == "cosyvoice":
+        if not wav_ok:
+            issues.append("voice_wav_missing")
+            messages.append(
+                "CosyVoice needs a voice WAV file for this persona. Open Edit persona and upload a voice sample, "
+                "or delete and recreate the persona."
+            )
+    elif TTS_PROVIDER == "xtts":
+        if not (XTTS_BASE_URL or "").strip():
+            issues.append("xtts_not_configured")
+            messages.append("XTTS is not configured (set XTTS_BASE_URL on the server).")
+        elif not wav_ok:
+            issues.append("voice_wav_missing")
+            messages.append(
+                "XTTS needs a voice WAV file for this persona. Upload one on Edit persona or delete and recreate."
+            )
+    elif TTS_PROVIDER == "f5":
+        if not (F5_TTS_BASE_URL or "").strip():
+            issues.append("f5_not_configured")
+            messages.append("F5-TTS is not configured (set F5_TTS_BASE_URL on the server).")
+        elif not wav_ok:
+            issues.append("voice_wav_missing")
+            messages.append(
+                "F5-TTS needs a voice WAV file for this persona. Upload one on Edit persona or delete and recreate."
+            )
+
+    ready = len(issues) == 0
+    return {
+        "integration_ready": ready,
+        "integration_issues": issues,
+        "integration_message": " ".join(messages).strip(),
+    }
+
+
 def _chatterbox_voice_exists(voice_id: str) -> bool:
     """True if this voice_id is registered in Chatterbox (MongoDB)."""
     if not voice_id or not (CHATTERBOX_BASE_URL or "").strip():
@@ -3381,6 +4119,7 @@ def _start_audio_tts_stream_to_queue(
     q: "asyncio.Queue[bytes | None]",
     loop: asyncio.AbstractEventLoop,
     video_mode: bool = False,
+    audio_holder: dict | None = None,
 ) -> None:
     log.info("Audio TTS: provider=%s voice_wav=%s video_mode=%s", TTS_PROVIDER, bool(voice_wav_path), video_mode)
     if TTS_PROVIDER == "xtts" and voice_wav_path and XTTS_BASE_URL:
@@ -3395,7 +4134,7 @@ def _start_audio_tts_stream_to_queue(
     if TTS_PROVIDER == "cosyvoice" and voice_wav_path and (COSYVOICE_USE_TRITON or COSYVOICE_BASE_URL):
         _start_cosyvoice_stream_to_audio_queue(voice_wav_path, voice_ref_text, text, voice_id, q, loop)
         return
-    _start_tts_stream_to_audio_queue(voice_id, text, q, loop, video_mode)
+    _start_tts_stream_to_audio_queue(voice_id, text, q, loop, video_mode, audio_holder)
 
 
 def _start_tts_stream_to_mp4_audio_queue(voice_id: str, text: str, q: "asyncio.Queue[bytes | None]", loop: asyncio.AbstractEventLoop, out: dict | None = None) -> None:
@@ -3584,7 +4323,17 @@ def _chatterbox_clone_voice(audio: bytes, voice_name: str, user_id: str = "twynb
             "voice_description": voice_name,
         }
         r = client.post(url, files=files, data=data)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            body = ""
+            try:
+                body = (e.response.text or "")[:800]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Chatterbox clone failed HTTP {e.response.status_code}: {body or e!s}"
+            ) from e
         out = r.json() if r.content else {}
         return out.get("voice_id") or voice_id
 
@@ -3595,34 +4344,25 @@ def _is_wav_bytes(data: bytes) -> bool:
 
 
 def _chatterbox_tts_wav(voice_id: str, text: str) -> bytes:
-    """TTS WAV: try streaming (GET /api/tts/wav), fallback to download/wav. Truncates to TTS limit."""
+    """TTS WAV via GET /api/tts/wav (single path; no alternate URL fallback)."""
     if not text or not text.strip():
         raise ValueError("TTS text is empty")
     text = text.strip()[:TTS_MAX_CHARS]
     params = {"voice_id": voice_id, "text": text}
     with httpx.Client(timeout=60.0) as client:
-        try:
-            with client.stream("GET", f"{CHATTERBOX_BASE_URL}/api/tts/wav", params=params) as response:
-                response.raise_for_status()
-                chunks: list[bytes] = []
-                for chunk in response.iter_bytes(chunk_size=8192):
-                    if chunk:
-                        chunks.append(chunk)
-                out = b"".join(chunks)
-                if not _is_wav_bytes(out):
-                    log.warning("TTS stream response is not WAV (len=%s, head=%s); using download fallback", len(out), out[:12] if len(out) >= 12 else out)
-                    raise ValueError("Stream response not WAV")
-                log.info("TTS stream OK: %s bytes WAV for text len %s", len(out), len(text))
-                return out
-        except (httpx.HTTPStatusError, httpx.RequestError, ValueError):
-            pass
-        r = client.get(f"{CHATTERBOX_BASE_URL}/api/tts/download/wav", params=params)
-        r.raise_for_status()
-        out = r.content
-        if not _is_wav_bytes(out):
-            raise ValueError(f"TTS download returned non-WAV (len={len(out)}, head={out[:12]!r})")
-        log.info("TTS download OK: %s bytes WAV for text len %s", len(out), len(text))
-        return out
+        with client.stream("GET", f"{CHATTERBOX_BASE_URL}/api/tts/wav", params=params) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            for chunk in response.iter_bytes(chunk_size=8192):
+                if chunk:
+                    chunks.append(chunk)
+            out = b"".join(chunks)
+            if not _is_wav_bytes(out):
+                raise ValueError(
+                    f"TTS /api/tts/wav returned non-WAV (len={len(out)}, head={out[:12]!r})"
+                )
+            log.info("TTS stream OK: %s bytes WAV for text len %s", len(out), len(text))
+            return out
 
 
 @app.post("/api/personas/create")
@@ -3757,8 +4497,7 @@ async def create_persona(
     if role_pack_id and (role_pack_id not in owned or _listing_type(owned.get(role_pack_id) or {}) != "role_pack"):
         role_pack_id = None
 
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(
+    asyncio.get_running_loop().run_in_executor(
         None,
         _create_persona_sync,
         persona_id,
@@ -3807,9 +4546,10 @@ def _create_persona_sync(
 ) -> None:
     """Run in thread: Ditto (or use avatar), Chatterbox (or use avatar), 30s idle video, save. Logs errors; sets creation_status on failure."""
     log.info("Background create: starting persona_id=%s name=%s", persona_id, name)
+    ditto_persona: dict | None = None
     if avatar_image_id and avatar_voice_id:
         image_id = avatar_image_id
-        preview_url = f"{DITTO_API_URL}/personas/{image_id}/preview"
+        preview_url = _ditto_preview_url_for_image(image_id)
         voice_id = avatar_voice_id
         voice_wav_path = None
         voice_ref_text = None
@@ -3830,6 +4570,12 @@ def _create_persona_sync(
                     voice_ref_text = None
         except Exception:
             pass
+        lf = DATA_DIR / f"listing_face_{avatar_image_id}.png"
+        if lf.is_file():
+            try:
+                shutil.copyfile(lf, DATA_DIR / f"face_{persona_id}.png")
+            except OSError as e:
+                log.warning("Could not copy listing face to persona %s: %s", persona_id, e)
         log.info("Background create: using avatar image_id=%s voice_id=%s", image_id, voice_id)
         if TTS_PROVIDER == "cosyvoice" and voice_wav_path:
             if COSYVOICE_USE_TRITON and COSYVOICE_USE_CACHE:
@@ -3845,8 +4591,13 @@ def _create_persona_sync(
             creation_status[persona_id] = {"status": "failed", "error": str(e)}
             return
         image_id = ditto_persona["image_id"]
-        preview_url = ditto_persona.get("preview_url") or f"{DITTO_API_URL}/personas/{image_id}/preview"
+        preview_url = ditto_persona.get("preview_url") or _ditto_preview_url_for_image(image_id)
         log.info("Background create: Ditto OK persona_id=%s image_id=%s", persona_id, image_id)
+        if face_bytes:
+            try:
+                (DATA_DIR / f"face_{persona_id}.png").write_bytes(face_bytes)
+            except OSError as e:
+                log.warning("Could not save local face thumbnail for %s: %s", persona_id, e)
         try:
             voice_wav_path = DATA_DIR / f"voice_{persona_id}.wav"
             if voice_bytes:
@@ -3901,21 +4652,29 @@ def _create_persona_sync(
             else:
                 if voice_ref_text:
                     _cosyvoice_register_speaker(voice_id, str(voice_wav_path), voice_ref_text)
-    # Idle video: 30s silence via POST /generate only (streaming is for chat reply clips)
+    # Idle video: HTTP POST /generate (not available on streaming-only Ditto). Skip when face was registered via file storage.
     idle_path = DATA_DIR / f"idle_{persona_id}.mp4"
     idle_path_resolved = None
-    for attempt in range(2):
-        try:
-            silence_wav = _make_silence_wav(30.0)
-            ditto_generate_post(image_id, silence_wav, str(idle_path))
-            if idle_path.is_file():
-                idle_path_resolved = idle_path
-                log.info("Idle video created (30s) for persona %s", persona_id)
-                break
-        except Exception as e:
-            log.warning("Idle video attempt %s failed for %s: %s", attempt + 1, persona_id, e)
-            if attempt == 0:
-                time.sleep(10)
+    skip_http_generate = bool(ditto_persona and _streaming_local_face(ditto_persona))
+    if not skip_http_generate and avatar_image_id:
+        avl = get_listing(avatar_image_id) or {}
+        if _streaming_local_face(avl):
+            skip_http_generate = True
+    if skip_http_generate:
+        log.info("Skipping Ditto HTTP /generate idle video (streaming Ditto local face) persona_id=%s", persona_id)
+    else:
+        for attempt in range(2):
+            try:
+                silence_wav = _make_silence_wav(30.0)
+                ditto_generate_post(image_id, silence_wav, str(idle_path))
+                if idle_path.is_file():
+                    idle_path_resolved = idle_path
+                    log.info("Idle video created (30s) for persona %s", persona_id)
+                    break
+            except Exception as e:
+                log.warning("Idle video attempt %s failed for %s: %s", attempt + 1, persona_id, e)
+                if attempt == 0:
+                    time.sleep(10)
     persona = {
         "id": persona_id,
         "user_id": user_id,
@@ -3930,7 +4689,19 @@ def _create_persona_sync(
         "conversation": [],
         "assigned_role_pack_id": assigned_role_pack_id or None,
         "assigned_listing_ids": assigned_listing_ids or [],
+        "assigned_mcp_configs": {},
     }
+    if ditto_persona:
+        if ditto_persona.get("ditto_image_url"):
+            persona["ditto_image_url"] = ditto_persona["ditto_image_url"]
+        if ditto_persona.get("ditto_face_mode"):
+            persona["ditto_face_mode"] = ditto_persona["ditto_face_mode"]
+    if avatar_image_id:
+        avlisting = get_listing(avatar_image_id) or {}
+        if (avlisting.get("ditto_image_url") or "").strip():
+            persona["ditto_image_url"] = avlisting["ditto_image_url"].strip()
+        if avlisting.get("ditto_face_mode"):
+            persona["ditto_face_mode"] = avlisting["ditto_face_mode"]
     personas = load_personas()
     personas.append(persona)
     save_personas(personas)
@@ -4035,8 +4806,9 @@ async def ditto_stream_generate(
     audio_queue: asyncio.Queue[bytes | None] | None = None,
     ws_base: str | None = None,
     worker_idx: int | None = None,
+    ditto_image_url: str | None = None,
 ) -> None:
-    """WebSocket to Ditto /stream: send float32 16 kHz mono audio (buffer or queue), receive fMP4, write output_path.
+    """WebSocket to Ditto: legacy ``/stream?image_id=`` or streaming v2 ``/ws/ditto`` + JSON config when ``ditto_image_url`` and ``DITTO_INTERNAL_FACE_SECRET`` are set.
 
     Pass exactly one of ``audio_float32_16k`` (full utterance) or ``audio_queue`` (TTS chunks + trailing None).
     If ``segment_queue`` is set, each binary chunk is forwarded there for live MSE streaming.
@@ -4047,7 +4819,12 @@ async def ditto_stream_generate(
         raise RuntimeError("Ditto stream: no audio bytes to send")
     if ws_base is None or worker_idx is None:
         worker_idx, ws_base = _pick_ditto_worker()
-    ws_url = f"{ws_base}/stream?image_id={image_id}"
+    img_url = (ditto_image_url or "").strip()
+    use_ws_v2 = bool(img_url and DITTO_INTERNAL_FACE_SECRET)
+    if use_ws_v2:
+        ws_url = f"{ws_base.rstrip('/')}/ws/ditto"
+    else:
+        ws_url = f"{ws_base}/stream?image_id={image_id}"
     if audio_float32_16k is not None:
         log.info(
             "Ditto stream: connecting to %s (sending %s bytes, then empty binary for end)",
@@ -4076,6 +4853,14 @@ async def ditto_stream_generate(
                 ping_interval=20, ping_timeout=120,
                 open_timeout=30,
             ) as ws:
+                if use_ws_v2:
+                    cfg = {
+                        "type": "config",
+                        "auth_token": DITTO_INTERNAL_FACE_SECRET,
+                        "avatar_id": image_id,
+                        "image_url": img_url,
+                    }
+                    await ws.send(json.dumps(cfg))
                 ditto_input_ready = asyncio.Event()
                 reader_task = asyncio.create_task(
                     _ditto_stream_reader(
@@ -4182,7 +4967,7 @@ def _stream_ollama_sentences_sync(
     puts each onto sentence_queue. Puts None when done. Returns full assistant text.
     """
     url = f"{ollama_url.rstrip('/')}/v1/chat/completions"
-    payload = {"model": ollama_model, "messages": messages, "stream": True}
+    payload = _ollama_payload_with_keepalive({"model": ollama_model, "messages": messages, "stream": True})
     content = ""
     emitted_up_to = 0
     t0 = time.monotonic()
@@ -4296,64 +5081,6 @@ def _stream_ollama_sentences_sync(
     return content.strip()
 
 
-def _stream_openai_sentences_sync(
-    client: OpenAI,
-    messages: list,
-    sentence_queue: "asyncio.Queue[str | None]",
-    loop: asyncio.AbstractEventLoop,
-    boundary_re: re.Pattern | None = None,
-    split_re: re.Pattern | None = None,
-) -> str:
-    """
-    Synchronous worker (runs in executor).
-    Streams OpenAI tokens, detects completed sentences, and puts each one onto
-    sentence_queue as soon as it is complete. Puts None when done.
-    Returns the full assistant text.
-    """
-    content = ""
-    emitted_up_to = 0
-    t0 = time.monotonic()
-    try:
-        log.info("LLM: starting stream for %s messages", len(messages))
-        # Support both Ollama and OpenAI patterns
-        if client:
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, stream=True)
-            for chunk in resp:
-                if not chunk or not chunk.choices: continue
-                delta = chunk.choices[0].delta.content
-                if delta is None: continue
-                content += delta
-                
-                boundary_re = boundary_re or SENTENCE_BOUNDARY_PERIOD_RE
-                split_re = split_re or SENTENCE_SPLIT_PERIOD_RE
-                # Yield sentences as they form based on provided boundary regex.
-                matches = list(boundary_re.finditer(content[emitted_up_to:]))
-                if matches:
-                    last_match = matches[-1]
-                    sentence_block = content[emitted_up_to : emitted_up_to + last_match.end()]
-                    for s in _chunk_by_sentences(sentence_block, split_re=split_re):
-                        s = s.strip()
-                        if s:
-                            log.info("LLM: sentence yielded (+%.2fs): %s", time.monotonic() - t0, s[:40])
-                            asyncio.run_coroutine_threadsafe(sentence_queue.put(s), loop).result()
-                    emitted_up_to += last_match.end()
-        else:
-            # Placeholder if we used another direct client; currently chat_stream_ws uses 'client'
-            pass
-
-        # Final flush
-        remaining = content[emitted_up_to:].strip()
-        if remaining:
-            log.info("LLM: final sentence yielded (+%.2fs): %s", time.monotonic() - t0, remaining[:40])
-            asyncio.run_coroutine_threadsafe(sentence_queue.put(remaining), loop).result()
-        log.info("LLM: finished in %.2fs, total_len=%d", time.monotonic() - t0, len(content))
-    except Exception as e:
-        log.exception("LLM: worker failed: %s", e)
-    finally:
-        asyncio.run_coroutine_threadsafe(sentence_queue.put(None), loop).result()
-    return content.strip()
-
-
 def _stream_ollama_continuous_sync(
     ollama_url: str,
     ollama_model: str,
@@ -4364,7 +5091,7 @@ def _stream_ollama_continuous_sync(
 ) -> str:
     """Stream Ollama tokens and emit fixed-size chunks (no sentence boundaries)."""
     url = f"{ollama_url.rstrip('/')}/v1/chat/completions"
-    payload = {"model": ollama_model, "messages": messages, "stream": True}
+    payload = _ollama_payload_with_keepalive({"model": ollama_model, "messages": messages, "stream": True})
     content = ""
     emitted_up_to = 0
     t0 = time.monotonic()
@@ -4414,46 +5141,6 @@ def _stream_ollama_continuous_sync(
         log.info("Ollama: finished in %.2fs, total_len=%d", time.monotonic() - t0, len(content))
     except Exception as e:
         log.exception("Ollama: worker failed: %s", e)
-    finally:
-        asyncio.run_coroutine_threadsafe(sentence_queue.put(None), loop).result()
-    return content.strip()
-
-
-def _stream_openai_continuous_sync(
-    client: OpenAI,
-    messages: list,
-    sentence_queue: "asyncio.Queue[str | None]",
-    loop: asyncio.AbstractEventLoop,
-    chunk_chars: int,
-) -> str:
-    """Stream OpenAI tokens and emit fixed-size chunks (no sentence boundaries)."""
-    content = ""
-    emitted_up_to = 0
-    t0 = time.monotonic()
-    chunk_chars = max(20, int(chunk_chars))
-    try:
-        log.info("LLM: starting stream for %s messages", len(messages))
-        resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, stream=True)
-        for chunk in resp:
-            if not chunk or not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta.content
-            if delta is None:
-                continue
-            content += delta
-            while len(content) - emitted_up_to >= chunk_chars:
-                segment = content[emitted_up_to : emitted_up_to + chunk_chars]
-                if segment.strip():
-                    log.info("LLM: chunk yielded (+%.2fs): %s", time.monotonic() - t0, segment[:40])
-                    asyncio.run_coroutine_threadsafe(sentence_queue.put(segment), loop).result()
-                emitted_up_to += chunk_chars
-        remaining = content[emitted_up_to:]
-        if remaining.strip():
-            log.info("LLM: final chunk yielded (+%.2fs): %s", time.monotonic() - t0, remaining[:40])
-            asyncio.run_coroutine_threadsafe(sentence_queue.put(remaining), loop).result()
-        log.info("LLM: finished in %.2fs, total_len=%d", time.monotonic() - t0, len(content))
-    except Exception as e:
-        log.exception("LLM: worker failed: %s", e)
     finally:
         asyncio.run_coroutine_threadsafe(sentence_queue.put(None), loop).result()
     return content.strip()
@@ -4540,16 +5227,16 @@ webrtc_managers: dict[str, IdleMotionManager] = {}
 async def _run_chat_stream(ctx: dict):
     """
     Shared pipeline: yields ('event', name, data), ('binary', clip_index, bytes), or ('keepalive',).
-    ctx: p, client, messages, persona_id, reply_id, loop, voice_id, image_id, t_request, message
+    ctx: p, messages, persona_id, reply_id, loop, voice_id, image_id, t_request, message, ollama_url, ollama_model, mode, ...
     """
     p = ctx["p"]
-    client = ctx["client"]
     messages = ctx["messages"]
     persona_id = ctx["persona_id"]
     reply_id = ctx["reply_id"]
     loop = ctx["loop"]
     voice_id = ctx["voice_id"]
     image_id = ctx["image_id"]
+    ditto_image_url = (ctx.get("ditto_image_url") or p.get("ditto_image_url") or "").strip()
     t_request = ctx["t_request"]
     message = ctx["message"]
 
@@ -4563,109 +5250,94 @@ async def _run_chat_stream(ctx: dict):
     ollama_url = ctx.get("ollama_url") or ""
     ollama_model = ctx.get("ollama_model") or OLLAMA_MODEL
     use_ollama = bool(ollama_url)
+    if not use_ollama:
+        raise RuntimeError("Set OLLAMA_URL for chat (local Ollama)")
 
-    # Tool support: only when not using Ollama (implement Ollama tools later)
     tools_for_llm: list[dict] = []
     tool_name_to_url: dict[str, str] = {}
-    if not use_ollama:
-        assigned_ids = p.get("assigned_listing_ids") or []
-        if assigned_ids:
-            for listing in load_listings():
-                if listing.get("id") in assigned_ids and _listing_type(listing) == "integration":
-                    mcp_url = (listing.get("mcp_server_url") or "").strip()
-                    if mcp_url:
-                        try:
-                            mcp_tools = await loop.run_in_executor(None, _mcp_list_tools, mcp_url)
-                            for t in mcp_tools:
-                                tools_for_llm.append({
-                                    "type": "function",
-                                    "function": {
-                                        "name": t["name"],
-                                        "description": t.get("description", ""),
-                                        "parameters": t.get("inputSchema", {"type": "object", "properties": {}}),
-                                    },
-                                })
-                                tool_name_to_url[t["name"]] = mcp_url
-                        except Exception as mcp_err:
-                            log.warning("MCP list_tools failed %s: %s", mcp_url, mcp_err)
-        if tools_for_llm:
-            tool_descs = "; ".join(
-                f"{t['function']['name']}: {t['function'].get('description', '') or 'No description'}"
-                for t in tools_for_llm
-            )
-            messages[0]["content"] = (
-                (messages[0].get("content") or "")
-                + f"\n\nYou have access to these tools: {tool_descs}. If the user asks what tools or capabilities you have, describe these tools."
-            )
+    assigned_ids = p.get("assigned_listing_ids") or []
+    if assigned_ids:
+        for listing in load_listings():
+            if listing.get("id") in assigned_ids and _listing_type(listing) == "integration":
+                mcp_url = (listing.get("mcp_server_url") or "").strip()
+                if mcp_url:
+                    await loop.run_in_executor(None, _add_tools_from_mcp_url, mcp_url, tools_for_llm, tool_name_to_url)
+    uid = p.get("user_id")
+    owned_mcp = {x["id"] for x in get_user_purchases(uid)} if uid else set()
+    for lid, user_url in (p.get("assigned_mcp_configs") or {}).items():
+        lid = str(lid).strip()
+        user_url = (user_url or "").strip()
+        if not lid or not user_url or lid not in owned_mcp:
+            continue
+        listing = get_listing(lid)
+        if not listing or _listing_type(listing) != "mcp":
+            continue
+        await loop.run_in_executor(None, _add_tools_from_mcp_url, user_url, tools_for_llm, tool_name_to_url)
+    if tools_for_llm and not OLLAMA_NATIVE_TOOLS:
+        tool_descs = "; ".join(
+            f"{t['function']['name']}: {t['function'].get('description', '') or 'No description'}"
+            for t in tools_for_llm
+        )
+        messages[0]["content"] = (
+            (messages[0].get("content") or "")
+            + f"\n\nYou have access to these tools: {tool_descs}. If the user asks what tools or capabilities you have, describe these tools."
+        )
 
     sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
-    openai_task: asyncio.Task | None = None
+    llm_worker_task: asyncio.Task | None = None
     mode = (ctx.get("mode") or "audio").strip().lower()
-    if mode == "audio":
-        boundary_re = SENTENCE_BOUNDARY_AUDIO_RE
-        split_re = SENTENCE_SPLIT_AUDIO_RE
-    else:
-        boundary_re = SENTENCE_BOUNDARY_PERIOD_RE
-        split_re = SENTENCE_SPLIT_PERIOD_RE
-    if use_ollama:
-        if mode == "audio" and AUDIO_CONTINUOUS:
-            openai_task = asyncio.ensure_future(
-                loop.run_in_executor(
-                    None,
-                    _stream_ollama_continuous_sync,
-                    ollama_url,
-                    ollama_model,
-                    messages,
-                    sentence_queue,
-                    loop,
-                    AUDIO_CHUNK_CHARS,
-                )
-            )
-            log.info("Chat timing: Ollama stream started (continuous, model=%s)", ollama_model)
-        else:
-            openai_task = asyncio.ensure_future(
-                loop.run_in_executor(
-                    None,
-                    _stream_ollama_sentences_sync,
-                    ollama_url,
-                    ollama_model,
-                    messages,
-                    sentence_queue,
-                    loop,
-                    boundary_re,
-                    split_re,
-                    None,
-                    None,
-                )
-            )
-            log.info("Chat timing: Ollama stream started (model=%s)", ollama_model)
-    elif tools_for_llm and client:
+    # Video uses the same Ollama→sentence cadence as audio; only downstream (Ditto vs raw audio) differs.
+    boundary_re = SENTENCE_BOUNDARY_AUDIO_RE
+    split_re = SENTENCE_SPLIT_AUDIO_RE
+    if tools_for_llm and OLLAMA_NATIVE_TOOLS:
         async def _tool_task():
             full = await loop.run_in_executor(
-                None, _run_with_tools_sync, client, messages, tools_for_llm, tool_name_to_url
+                None,
+                _run_with_tools_ollama_sync,
+                ollama_url,
+                ollama_model,
+                messages,
+                tools_for_llm,
+                tool_name_to_url,
             )
             for s in _chunk_by_sentences(full):
                 await sentence_queue.put(s)
             await sentence_queue.put(None)
             return full
-        openai_task = asyncio.ensure_future(_tool_task())
+
+        llm_worker_task = asyncio.ensure_future(_tool_task())
+        log.info("Chat timing: Ollama tool roundtrip (model=%s)", ollama_model)
+    elif mode == "audio" and AUDIO_CONTINUOUS:
+        llm_worker_task = asyncio.ensure_future(
+            loop.run_in_executor(
+                None,
+                _stream_ollama_continuous_sync,
+                ollama_url,
+                ollama_model,
+                messages,
+                sentence_queue,
+                loop,
+                AUDIO_CHUNK_CHARS,
+            )
+        )
+        log.info("Chat timing: Ollama stream started (continuous, model=%s)", ollama_model)
     else:
-        if not client:
-            raise RuntimeError("Set OLLAMA_URL or OPENAI_API_KEY for chat")
-        if mode == "audio" and AUDIO_CONTINUOUS:
-            openai_task = asyncio.ensure_future(
-                loop.run_in_executor(
-                    None, _stream_openai_continuous_sync, client, messages, sentence_queue, loop, AUDIO_CHUNK_CHARS
-                )
+        llm_worker_task = asyncio.ensure_future(
+            loop.run_in_executor(
+                None,
+                _stream_ollama_sentences_sync,
+                ollama_url,
+                ollama_model,
+                messages,
+                sentence_queue,
+                loop,
+                boundary_re,
+                split_re,
+                None,
+                None,
             )
-            log.info("Chat timing: OpenAI stream started (continuous)")
-        else:
-            openai_task = asyncio.ensure_future(
-                loop.run_in_executor(
-                    None, _stream_openai_sentences_sync, client, messages, sentence_queue, loop, boundary_re, split_re
-                )
-            )
-            log.info("Chat timing: OpenAI stream started (stream=True)")
+        )
+        log.info("Chat timing: Ollama stream started (model=%s)", ollama_model)
 
     async def prefetch_clip(idx, bundle):
         """Video: TTS only. Streams float32 chunks into audio_queue (unbounded). Ditto runs in the main loop."""
@@ -4682,10 +5354,11 @@ async def _run_chat_stream(ctx: dict):
             t_tts0 = time.monotonic()
             metrics = {"prefetch_at": t_tts0, "tts_started_at": t_tts0}
             if use_streaming:
+                audio_holder: dict = {}
                 audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
                 tts_thread = threading.Thread(
                     target=_start_audio_tts_stream_to_queue,
-                    args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_to_prefetch, audio_queue, loop, True),
+                    args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_to_prefetch, audio_queue, loop, True, audio_holder),
                     daemon=True,
                 )
                 tts_thread.start()
@@ -4698,6 +5371,7 @@ async def _run_chat_stream(ctx: dict):
                     "audio_queue": audio_queue,
                     "tts_started_at": t_tts0,
                     "tts_thread": tts_thread,
+                    "audio_holder": audio_holder,
                     "metrics": metrics,
                 }
             audio_holder: dict = {}
@@ -4767,37 +5441,54 @@ async def _run_chat_stream(ctx: dict):
             pending_text = None
         else:
             bundle = []
-            if mode == "audio":
-                if AUDIO_CONTINUOUS:
-                    max_sentences = 1
-                    min_chars = 0
-                else:
-                    max_sentences = AUDIO_FIRST_CLIP_SENTENCES if clip_index == 0 else AUDIO_SENTENCES_PER_CLIP
+            if mode == "audio" and AUDIO_CONTINUOUS:
+                max_sentences = 1
+                min_chars = 0
+            elif mode == "video":
+                if VIDEO_CLIP_MIN_CHARS <= 0:
+                    max_sentences = VIDEO_SENTENCES_PER_CLIP
                     min_chars = AUDIO_CLIP_MIN_CHARS
-            elif mode == "video" and clip_index == 0:
-                # First muxed Ditto clip: VIDEO_FIRST_CLIP_SENTENCES (default 2) gives a longer
-                # first clip so Ditto has time to finish clip 1 before clip 0 plays out.
-                max_sentences = VIDEO_FIRST_CLIP_SENTENCES
-                min_chars = AUDIO_CLIP_MIN_CHARS
+                else:
+                    max_sentences = VIDEO_CLIP_MAX_SENTENCES
+                    min_chars = max(1, VIDEO_CLIP_MIN_CHARS)
             else:
-                max_sentences = FIRST_CLIP_SENTENCES if clip_index == 0 else SENTENCES_PER_CLIP
-                min_chars = CLIP_MIN_CHARS
+                max_sentences = AUDIO_FIRST_CLIP_SENTENCES if clip_index == 0 else AUDIO_SENTENCES_PER_CLIP
+                min_chars = AUDIO_CLIP_MIN_CHARS
             current_len = 0
-            while not stream_ended and (len(bundle) < max_sentences or (min_chars and current_len < min_chars)):
+            while not stream_ended:
+                if mode == "video" and VIDEO_CLIP_MIN_CHARS > 0:
+                    if len(bundle) >= max_sentences:
+                        break
+                    if bundle and current_len >= min_chars:
+                        break
+                elif not (len(bundle) < max_sentences or (min_chars and current_len < min_chars)):
+                    break
                 try:
-                    s = await asyncio.wait_for(sentence_queue.get(), timeout=30.0)
+                    s = await asyncio.wait_for(sentence_queue.get(), timeout=CHAT_LLM_QUEUE_TIMEOUT_SEC)
                     if s is None:
                         stream_ended = True
                         break
-                    bundle.append(s)
+                    piece = (s or "").strip()
+                    if not piece:
+                        continue
+                    bundle.append(piece)
                     if current_len:
                         current_len += 1  # space
-                    current_len += len(s)
-                    sentences_log.append(s)
-                    deltas.append(s)
-                    if min_chars and current_len >= min_chars and len(bundle) >= max_sentences:
-                        break
+                    current_len += len(piece)
+                    sentences_log.append(piece)
+                    deltas.append(piece)
+                    if not (mode == "video" and VIDEO_CLIP_MIN_CHARS > 0):
+                        if min_chars and current_len >= min_chars and len(bundle) >= max_sentences:
+                            break
                 except asyncio.TimeoutError:
+                    log.warning(
+                        "Chat pipeline: no LLM sentence within %.0fs (reply_id=%s clip_index=%s, mode=%s). "
+                        "Increase CHAT_LLM_QUEUE_TIMEOUT_SEC if Ollama is slow or CHAT_HISTORY_MAX trims less.",
+                        CHAT_LLM_QUEUE_TIMEOUT_SEC,
+                        reply_id,
+                        clip_index,
+                        mode,
+                    )
                     break
             text = " ".join(bundle) if bundle else None
 
@@ -4806,15 +5497,9 @@ async def _run_chat_stream(ctx: dict):
 
         if mode == "audio":
             head, tail = _split_text(text, None)
-        elif mode == "video" and clip_index == 0:
-            # Cap first utterance like audio-friendly TTFR; env override else AUDIO_CLIP_MAX_CHARS.
-            vcap = FIRST_CLIP_MAX_CHARS if FIRST_CLIP_MAX_CHARS is not None else AUDIO_CLIP_MAX_CHARS
-            head, tail = _split_text(text, vcap)
         else:
-            if clip_index == 0:
-                head, tail = _split_text(text, FIRST_CLIP_MAX_CHARS)
-            else:
-                head, tail = _split_text(text, CLIP_MAX_CHARS)
+            # Video: same per-clip text shaping as audio (no CLIP_MAX_CHARS / FIRST split path).
+            head, tail = _split_text(text, None)
         if tail:
             pending_text = tail
         return {"text": head if head else None, "deltas": deltas}
@@ -4845,7 +5530,7 @@ async def _run_chat_stream(ctx: dict):
                     audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=0 if unbounded else 8)
                     tts_thread = threading.Thread(
                         target=_start_audio_tts_stream_to_queue,
-                        args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_value, audio_queue, loop, False),
+                        args=(voice_id, p.get("voice_wav_path"), p.get("voice_ref_text"), text_value, audio_queue, loop, False, audio_holder),
                         daemon=True,
                     )
                     tts_thread.start()
@@ -5007,6 +5692,7 @@ async def _run_chat_stream(ctx: dict):
                                 audio_queue=audio_queue,
                                 ws_base=ws_base,
                                 worker_idx=worker_idx,
+                                ditto_image_url=ditto_image_url or None,
                             )
                         )
                     video_ditto_task = ditto_fut
@@ -5077,6 +5763,7 @@ async def _run_chat_stream(ctx: dict):
                                                 audio_queue=next_clip.get("audio_queue"),
                                                 ws_base=next_wb,
                                                 worker_idx=next_wi,
+                                                ditto_image_url=ditto_image_url or None,
                                             )
                                         )
                                         lookahead = {
@@ -5151,6 +5838,11 @@ async def _run_chat_stream(ctx: dict):
                         tts_thread.join(timeout=30)
                         if tts_thread.is_alive():
                             log.warning("TTS thread still running after 30s for clip %s", i)
+                    tts_err = (clip_data.get("audio_holder") or {}).get("error")
+                    if tts_err:
+                        log.error("TTS thread reported error for clip %s: %s", i, tts_err)
+                        yield ("event", "error", {"index": i, "error": tts_err})
+                        break
 
                     log.info("Pipeline: clip %s finished yielding (%s segments)", i, segment_count)
                     if metrics:
@@ -5184,6 +5876,7 @@ async def _run_chat_stream(ctx: dict):
                         audio_float32_16k=audio_f32,
                         ws_base=wbase,
                         worker_idx=widx,
+                        ditto_image_url=ditto_image_url or None,
                     )
                     log.info("Pipeline: emitting video_start for clip %s at +%.2fs", i, time.monotonic() - t_start)
                     yield ("event", "video_start", {"index": i})
@@ -5208,14 +5901,14 @@ async def _run_chat_stream(ctx: dict):
             try: await prefetch_task
             except: pass
 
-        if openai_task and not openai_task.done():
-            openai_task.cancel()
+        if llm_worker_task and not llm_worker_task.done():
+            llm_worker_task.cancel()
         
         # Ensure we always try to save whatever we got
         try:
             full_text = ""
-            if openai_task and not openai_task.cancelled():
-                full_text = await openai_task
+            if llm_worker_task and not llm_worker_task.cancelled():
+                full_text = await llm_worker_task
             
             if not full_text:
                 full_text = " ".join(sentences_log)
@@ -5242,15 +5935,7 @@ async def _run_chat_stream(ctx: dict):
 @app.post("/api/personas/{persona_id}/chat")
 async def chat(persona_id: str, message: str = Form(...), current_user: dict = Depends(get_current_user)):
     """
-    Pipelined chat: OpenAI token stream → sentence detection → TTS → Ditto → SSE clip events.
-
-    Pipeline overlap:
-      - OpenAI streams tokens in a background executor thread.
-      - As each sentence completes, TTS starts immediately (also in executor).
-      - As soon as TTS is done for sentence N, Ditto starts immediately.
-      - While Ditto renders clip N, TTS is already running for sentence N+1.
-      - The frontend receives clip N as soon as Ditto finishes, without waiting
-        for subsequent clips to be ready.
+    Pipelined chat: Ollama stream → sentence detection → TTS → Ditto → SSE clip events.
     """
     message = (message or "").strip()
     if not message:
@@ -5259,12 +5944,16 @@ async def chat(persona_id: str, message: str = Form(...), current_user: dict = D
     p = get_persona(persona_id, current_user["id"])
     if not p:
         raise HTTPException(404, "Persona not found")
+    integ = _persona_integration_readiness(p)
+    if not integ["integration_ready"]:
+        raise HTTPException(
+            409,
+            integ["integration_message"] or "This persona is incomplete or its integrations are broken. Delete it and create a new one.",
+        )
 
     use_ollama = bool(OLLAMA_URL)
-    if not use_ollama and not OPENAI_API_KEY:
-        raise HTTPException(503, "Set OLLAMA_URL or OPENAI_API_KEY for chat")
-
-    client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    if not use_ollama:
+        raise HTTPException(503, "Set OLLAMA_URL for chat (local Ollama)")
     about = (p.get("system_prompt") or "").strip() or "You are a helpful assistant."
     system_content = (
         "You are a character in a conversation. The following describes you (the character), not the person you are chatting with. "
@@ -5292,7 +5981,7 @@ async def chat(persona_id: str, message: str = Form(...), current_user: dict = D
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": message})
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     if TTS_PROVIDER == "cosyvoice":
         voice_id = persona_id
     elif TTS_PROVIDER == "qwen3":
@@ -5306,13 +5995,13 @@ async def chat(persona_id: str, message: str = Form(...), current_user: dict = D
 
     ctx = {
         "p": p,
-        "client": client,
         "messages": messages,
         "persona_id": persona_id,
         "reply_id": reply_id,
         "loop": loop,
         "voice_id": voice_id,
         "image_id": image_id,
+        "ditto_image_url": (p.get("ditto_image_url") or "").strip(),
         "t_request": t_request,
         "message": message,
         "ollama_url": OLLAMA_URL if use_ollama else "",
@@ -5363,6 +6052,21 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
         await websocket.send_json({"event": "error", "data": {"error": "Persona not found"}})
         await websocket.close()
         return
+    if not stt_only:
+        integ = _persona_integration_readiness(persona_cached, rtc_stt_only=False)
+        if not integ["integration_ready"]:
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "data": {
+                        "error": integ["integration_message"]
+                        or "This persona is incomplete. Delete it and create a new one.",
+                        "integration_issues": integ.get("integration_issues") or [],
+                    },
+                }
+            )
+            await websocket.close()
+            return
     if TTS_PROVIDER == "chatterbox":
         try:
             persona_cached["voice_id"] = _ensure_chatterbox_voice_id(persona_cached)
@@ -5386,8 +6090,7 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
         except Exception:
             pass
     try:
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, _ensure_greeting_cached, persona_cached)
+        asyncio.get_running_loop().run_in_executor(None, _ensure_greeting_cached, persona_cached)
     except Exception:
         pass
     pc = RTCPeerConnection(RTCConfiguration(_get_ice_servers()))
@@ -5396,6 +6099,8 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
     transcript_dc = {"ch": None}
     remote_candidates: list[RTCIceCandidate] = []
     utterance_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    # Client mic mute: discard frames and reset VAD so partial buffers do not flush as false STT.
+    stt_input_paused = {"paused": False}
 
     connection_ready = asyncio.Event()
 
@@ -5409,6 +6114,19 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
     def on_datachannel(channel):
         if channel.label in ("transcript", "events", "control"):
             transcript_dc["ch"] = channel
+
+            @channel.on("message")
+            def on_dc_message(message):
+                try:
+                    raw = message.decode("utf-8") if isinstance(message, (bytes, bytearray)) else str(message)
+                    data = json.loads(raw)
+                    ev = (data.get("event") or "").strip()
+                    if ev == "mic_pause":
+                        stt_input_paused["paused"] = True
+                    elif ev == "mic_resume":
+                        stt_input_paused["paused"] = False
+                except Exception:
+                    pass
 
     async def send_dc(payload: dict):
         ch = transcript_dc.get("ch")
@@ -5435,7 +6153,19 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
 
     async def process_audio_track(track):
         resampler = AudioResampler(format="s16", layout="mono", rate=16000)
-        vad = _AudioVADBuffer()
+        # Tune via env to reduce false STT (noise/breath → short segments → Whisper hallucinations like "Need help?").
+        _vrms = float(os.environ.get("RTC_VAD_RMS_THRESHOLD", "0.006") or 0.006)
+        _vmin = int(os.environ.get("RTC_VAD_MIN_SPEECH_MS", "800") or 800)
+        _vfb = (os.environ.get("RTC_VAD_ENABLE_SHORT_FALLBACK", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        _silence_ms = int(os.environ.get("RTC_VAD_SILENCE_MS", "700") or 700)
+        _noise_min = int(os.environ.get("RTC_VAD_NOISE_MIN_MS", "400") or 400)
+        vad = _AudioVADBuffer(
+            rms_threshold=_vrms,
+            silence_ms=_silence_ms,
+            min_ms=_vmin,
+            long_silence_ms=int(os.environ.get("RTC_VAD_LONG_SILENCE_MS", "1500") or 1500),
+            noise_min_ms=(_noise_min if _vfb else 999999),
+        )
         await send_dc({"event": "ready"})
         log.info("RTC audio: track receiver started")
         try:
@@ -5473,6 +6203,9 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
                 pcm = f.to_ndarray()
                 if pcm.ndim > 1:
                     pcm = pcm[0]
+                if stt_input_paused["paused"]:
+                    vad._reset()
+                    continue
                 # Pause STT while TTS is speaking (half-duplex) + short cooldown after speech ends.
                 if out_track._speaking or (time.monotonic() - out_track._speaking_ended_at) < 0.3:
                     vad._reset()
@@ -5546,19 +6279,21 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
             if AUDIO_HISTORY_MAX > 0:
                 messages = _trim_messages_for_audio(messages, AUDIO_HISTORY_MAX)
 
-            client = httpx.Client(timeout=60.0)
+            ws_use_ollama = bool(OLLAMA_URL)
+            if not ws_use_ollama:
+                await send_dc({"event": "error", "text": "Set OLLAMA_URL for chat (local Ollama)"})
+                continue
             ctx = {
                 "p": p,
-                "client": client,
                 "messages": messages,
                 "persona_id": persona_id,
                 "reply_id": uuid.uuid4().hex,
-                "loop": asyncio.get_event_loop(),
+                "loop": asyncio.get_running_loop(),
                 "voice_id": (persona_id if TTS_PROVIDER == "cosyvoice" else p["voice_id"]),
                 "image_id": p["image_id"],
                 "t_request": time.monotonic(),
                 "message": text,
-                "ollama_url": OLLAMA_URL,
+                "ollama_url": OLLAMA_URL if ws_use_ollama else "",
                 "ollama_model": OLLAMA_MODEL,
                 "persist": True,
                 "mode": "audio",
@@ -5611,10 +6346,6 @@ async def audio_rtc_ws(websocket: WebSocket, persona_id: str):
                 await send_dc({"event": "error", "text": str(e)})
             finally:
                 out_track.set_speaking(False)
-                try:
-                    client.close()
-                except Exception:
-                    pass
 
     llm_task = asyncio.create_task(run_llm_loop()) if not stt_only else None
 
@@ -5723,6 +6454,20 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
         await websocket.send_json({"event": "error", "data": {"error": "Persona not found"}})
         await websocket.close()
         return
+    integ = _persona_integration_readiness(p)
+    if not integ["integration_ready"]:
+        await websocket.send_json(
+            {
+                "event": "error",
+                "data": {
+                    "error": integ["integration_message"]
+                    or "This persona is incomplete or its integrations are broken. Delete it and create a new one.",
+                    "integration_issues": integ.get("integration_issues") or [],
+                },
+            }
+        )
+        await websocket.close()
+        return
     if TTS_PROVIDER == "chatterbox":
         try:
             p["voice_id"] = _ensure_chatterbox_voice_id(p)
@@ -5735,12 +6480,10 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
             pass
 
     ws_use_ollama = bool(OLLAMA_URL)
-    if not ws_use_ollama and not OPENAI_API_KEY:
-        await websocket.send_json({"event": "error", "data": {"error": "Set OLLAMA_URL or OPENAI_API_KEY for chat"}})
+    if not ws_use_ollama:
+        await websocket.send_json({"event": "error", "data": {"error": "Set OLLAMA_URL for chat (local Ollama)"}})
         await websocket.close()
         return
-
-    client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
     about = (p.get("system_prompt") or "").strip() or "You are a helpful assistant."
     system_content = (
         "You are a character in a conversation. The following describes you (the character), not the person you are chatting with. "
@@ -5778,24 +6521,11 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
             if after < before:
                 log.info("History trimmed for mode=%s: %s -> %s messages", mode, before, after)
 
-    loop = asyncio.get_event_loop()
-    voice_id = (persona_id if TTS_PROVIDER == "cosyvoice" else p["voice_id"])
-    image_id = p["image_id"]
+    loop = asyncio.get_running_loop()
     reply_id = uuid.uuid4().hex
     t_request = time.monotonic()
-    p = get_persona(persona_id, current_user["id"])
-    if not p:
-        await websocket.send_json({"event": "error", "data": {"error": "Persona not found"}})
-        await websocket.close()
-        return
-
-    if not message:
-        log.info("Chat WS: Empty message (Initialization only)")
-        try:
-            while True:
-                await websocket.receive_text()
-        except: pass
-        return
+    voice_id = (persona_id if TTS_PROVIDER == "cosyvoice" else p["voice_id"])
+    image_id = p["image_id"]
 
     log.info(
         "Chat WS: request received persona_id=%s mode=%s webrtc_session_id=%s use_ollama=%s",
@@ -5804,13 +6534,13 @@ async def chat_stream_ws(websocket: WebSocket, persona_id: str, token: str = "")
 
     ctx = {
         "p": p,
-        "client": client,
         "messages": messages,
         "persona_id": persona_id,
         "reply_id": reply_id,
         "loop": loop,
         "voice_id": voice_id,
         "image_id": image_id,
+        "ditto_image_url": (p.get("ditto_image_url") or "").strip(),
         "t_request": t_request,
         "message": message,
         "ollama_url": OLLAMA_URL if ws_use_ollama else "",
@@ -5989,12 +6719,10 @@ async def share_chat_stream_ws(websocket: WebSocket, share_id: str):
             pass
 
     ws_use_ollama = bool(OLLAMA_URL)
-    if not ws_use_ollama and not OPENAI_API_KEY:
-        await websocket.send_json({"event": "error", "data": {"error": "Set OLLAMA_URL or OPENAI_API_KEY for chat"}})
+    if not ws_use_ollama:
+        await websocket.send_json({"event": "error", "data": {"error": "Set OLLAMA_URL for chat (local Ollama)"}})
         await websocket.close()
         return
-
-    client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
     about = (p.get("system_prompt") or "").strip() or "You are a helpful assistant."
     system_content = (
         "You are a character in a conversation. The following describes you (the character), not the person you are chatting with. "
@@ -6006,7 +6734,7 @@ async def share_chat_stream_ws(websocket: WebSocket, share_id: str):
         {"role": "user", "content": message},
     ]
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     voice_id = (p.get("id") if TTS_PROVIDER == "cosyvoice" else p["voice_id"])
     image_id = p["image_id"]
     reply_id = uuid.uuid4().hex
@@ -6019,13 +6747,13 @@ async def share_chat_stream_ws(websocket: WebSocket, share_id: str):
 
     ctx = {
         "p": p,
-        "client": client,
         "messages": messages,
         "persona_id": p.get("id"),
         "reply_id": reply_id,
         "loop": loop,
         "voice_id": voice_id,
         "image_id": image_id,
+        "ditto_image_url": (p.get("ditto_image_url") or "").strip(),
         "t_request": t_request,
         "message": message,
         "ollama_url": OLLAMA_URL if ws_use_ollama else "",

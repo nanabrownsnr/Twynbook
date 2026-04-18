@@ -11,6 +11,9 @@ export default function Home() {
   const [error, setError] = useState(null)
   const [deletingId, setDeletingId] = useState(null)
   const [showAccountMenu, setShowAccountMenu] = useState(false)
+  const [licenseKey, setLicenseKey] = useState(null)
+  const [licenseLoading, setLicenseLoading] = useState(false)
+  const [licenseShown, setLicenseShown] = useState(false)
   // Publish modal state
   const [publishTarget, setPublishTarget] = useState(null) // persona being published
   const [publishPrice, setPublishPrice] = useState('')
@@ -48,6 +51,18 @@ export default function Home() {
   const handleLogout = () => {
     clearSession()
     navigate('/', { replace: true })
+  }
+
+  const loadLicenseKey = () => {
+    setLicenseLoading(true)
+    apiFetch(`${API}/auth/license-key`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => {
+        setLicenseKey(d.license_key || '')
+        setLicenseShown(true)
+      })
+      .catch(() => {})
+      .finally(() => setLicenseLoading(false))
   }
 
   const openPublishModal = (p) => {
@@ -166,6 +181,25 @@ export default function Home() {
                 <div className="account-menu-info">
                   <span className="account-menu-name">{user?.name}</span>
                   <span className="account-menu-email">{user?.email}</span>
+                </div>
+                <div className="account-license-block">
+                  {!licenseShown ? (
+                    <button type="button" className="account-license-show" onClick={loadLicenseKey} disabled={licenseLoading}>
+                      {licenseLoading ? 'Loading…' : 'Show license key'}
+                    </button>
+                  ) : (
+                    <div className="account-license-inner">
+                      <span className="account-license-label">License key</span>
+                      <code className="account-license-value" title={licenseKey || ''}>{licenseKey}</code>
+                      <button
+                        type="button"
+                        className="account-license-copy"
+                        onClick={() => licenseKey && navigator.clipboard?.writeText(licenseKey)}
+                      >
+                        Copy
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <hr className="account-menu-divider" />
                 <button className="account-menu-item account-menu-logout" onClick={handleLogout}>
@@ -335,6 +369,15 @@ export default function Home() {
         .account-menu-info { padding: 0.75rem 1rem; }
         .account-menu-name { display: block; font-weight: 600; color: var(--text-primary); font-size: 0.95rem; margin-bottom: 0.1rem; }
         .account-menu-email { display: block; font-size: 0.8rem; color: var(--text-muted); }
+        .account-license-block { padding: 0 1rem 0.65rem; }
+        .account-license-show { width: 100%; padding: 0.4rem 0.5rem; font-size: 0.8rem; font-weight: 600; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-page); color: var(--primary); cursor: pointer; }
+        .account-license-show:hover:not(:disabled) { border-color: var(--primary); }
+        .account-license-show:disabled { opacity: 0.6; cursor: not-allowed; }
+        .account-license-inner { display: flex; flex-direction: column; gap: 0.35rem; }
+        .account-license-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-muted); }
+        .account-license-value { display: block; font-size: 0.7rem; word-break: break-all; padding: 0.35rem 0.45rem; background: var(--bg-page); border-radius: var(--radius); border: 1px solid var(--border); color: var(--text-primary); max-height: 4.5rem; overflow-y: auto; }
+        .account-license-copy { align-self: flex-start; padding: 0.25rem 0.5rem; font-size: 0.75rem; font-weight: 600; border: none; border-radius: var(--radius); background: var(--primary); color: #fff; cursor: pointer; }
+        .account-license-copy:hover { opacity: 0.92; }
         .account-menu-divider { margin: 0; border: none; border-top: 1px solid var(--border); }
         .account-menu-item { display: block; width: 100%; padding: 0.65rem 1rem; text-align: left; background: none; border: none; cursor: pointer; font-size: 0.9rem; color: var(--text-primary); }
         .account-menu-item:hover { background: var(--bg-page); }
